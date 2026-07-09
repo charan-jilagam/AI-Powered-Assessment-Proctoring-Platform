@@ -1,0 +1,40 @@
+services:
+  database:
+    image: postgres:16
+    container_name: proctoring_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: proctoring_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    container_name: proctoring_backend
+    environment:
+      DATABASE_URL: postgresql://postgres:admin123@database:5432/proctoring_db
+      SECRET_KEY: 798b9c99fd71290645c1f33265317136375e620930a413d653299a774ba3fbe3
+    ports:
+      - "8000:8000"
+    depends_on:
+      database:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    container_name: proctoring_frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:

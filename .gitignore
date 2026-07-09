@@ -1,0 +1,36 @@
+# Secrets — NEVER commit these
+.env
+backend/.env
+frontend/.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Node
+node_modules/
+dist/
+frontend/node_modules/
+frontend/dist/
+
+# AI model files (large binaries — users download these separately)
+*.pt
+*.task
+
+# Logs
+logs/
+*.log
+backend/logs/
+
+# Local data / test artifacts
+test_output.txt
+questions.csv
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
