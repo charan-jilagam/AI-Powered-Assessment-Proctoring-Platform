@@ -20,6 +20,8 @@ from typing import Dict, List, Optional
 
 import httpx
 
+# "judge0" (default, sandboxed, needs Docker) or "local" (no Docker, runs code as a plain subprocess; NOT a sandbox)
+CODE_RUNNER = os.getenv("CODE_RUNNER", "judge0").strip().lower()
 JUDGE0_URL = os.getenv("JUDGE0_URL", "http://judge0-server:2358").rstrip("/")
 # Optional: only needed if you enable AUTHN_HEADER / AUTHN_TOKEN in judge0.conf
 JUDGE0_AUTH_HEADER = os.getenv("JUDGE0_AUTH_HEADER", "X-Auth-Token")
@@ -42,6 +44,10 @@ SUPPORTED_LANGUAGES: Dict[int, str] = {
     62: "Java (OpenJDK 13.0.1)",
     63: "JavaScript (Node.js 12.14.0)",
 }
+
+if CODE_RUNNER == "local":  # only offer languages that are actually installed on this machine
+    from app import local_runner as _local_runner
+    SUPPORTED_LANGUAGES = _local_runner.available_languages()
 
 # Judge0 status ids -> our verdict names (ids 1 and 2 mean "still running")
 STATUS_ACCEPTED = 3
@@ -125,6 +131,10 @@ def execute(source_code: str, language_id: int, stdins: List[str],
     """
     if not stdins:
         return []
+
+    if CODE_RUNNER == "local":  # Docker-free mode, see local_runner.py (NOT a sandbox)
+        from app import local_runner
+        return local_runner.execute(source_code, language_id, stdins, time_limit_seconds, memory_limit_mb)
 
     own_client = client is None
     http = client or httpx.Client(timeout=HTTP_TIMEOUT_SECONDS)

@@ -166,7 +166,7 @@ pytest -v
 
 The suite covers password hashing and salting, JWT generation, signup and login flows, access control on protected routes, and exam scoring — including a test verifying that scoring remains correct when answer options are shuffled.
 
-Coding questions are covered by `tests/test_coding.py` (authoring, access control, hidden-test secrecy, scoring, cleanup) and `tests/test_judge0_client.py` (the Judge0 client). They use a fake Judge0, so no Docker is needed.
+Coding questions are covered by `tests/test_coding.py` (authoring, access control, hidden-test secrecy, scoring, cleanup) and `tests/test_judge0_client.py` (the Judge0 client). They use a fake Judge0, so no Docker is needed. `tests/test_local_runner.py` exercises the Docker-free runner with the real interpreters/compilers installed on the machine (tests for missing toolchains are skipped).
 
 ---
 
@@ -208,6 +208,23 @@ cgroup v2 (recent Ubuntu, Docker Desktop/WSL2) it may fail to start; Judge0's re
 `systemd.unified_cgroup_hierarchy=0` to the kernel command line on Ubuntu 22.04. Judge0 is tested on Linux only.
 More judging capacity: `docker compose --profile judge0 up -d --scale judge0-worker=3`.
 
+**No Docker? Local runner (development / practice only)**
+
+Set `CODE_RUNNER=local` in `backend/.env` and restart the backend. Code is then run directly as a subprocess on the
+machine that runs the backend (Python always; JavaScript, C, C++ and Java only if `node`, `gcc`, `g++`, `javac`/`java`
+are on the PATH, and only installed languages are offered to candidates). Java classes must be named `Main`.
+
+```
+CODE_RUNNER=local
+```
+
+**This is not a sandbox.** Candidate code runs as the same OS user as the backend. The runner strips the
+environment (so `SECRET_KEY`/`DATABASE_URL` are not visible), uses a throw-away directory, enforces a wall-clock
+time limit and an output cap, and on Linux/macOS also CPU, file-size and (for Python/C/C++) memory limits. On
+Windows only the time and output limits apply. A determined candidate can still read files, use the network or
+fork-bomb, so use it for development, demos and trusted practice, not for real exams. For real exams use Judge0,
+or run the whole backend inside a locked-down container/VM.
+
 **Adding problems**
 
 - *When creating an exam* (**Create Exam → Coding Problems**), or later from the exam's **Coding** button on the
@@ -240,6 +257,7 @@ spaces on a line and trailing blank lines; anything else must match exactly.
 |----------|---------|---------|
 | `JUDGE0_URL` | `http://judge0-server:2358` | Where the backend reaches Judge0 (set in `docker-compose.yml`) |
 | `JUDGE0_AUTH_TOKEN` / `JUDGE0_AUTH_HEADER` | empty / `X-Auth-Token` | Only if you enable `AUTHN_TOKEN` in `judge0.conf` |
+| `CODE_RUNNER` | `judge0` | `judge0` (sandboxed, Docker) or `local` (no Docker, **not a sandbox**) |
 | `CODE_EXEC_PER_MINUTE` | `15` | Run/Submit calls allowed per candidate per minute |
 
 When running the backend locally (not in Docker), publish Judge0's port yourself and point `JUDGE0_URL` at it

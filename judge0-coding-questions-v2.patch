@@ -1,0 +1,3625 @@
+diff --git a/README.md b/README.md
+index fc03409..f4dd63f 100644
+--- a/README.md
++++ b/README.md
+@@ -25,6 +25,7 @@ If a candidate switches tabs, exits fullscreen, looks away from the screen, has
+ - Server-locked exam sessions: refreshing won't re-roll questions or pause the timer
+ - Countdown timer with automatic submission when time expires
+ - Duplicate-submission protection
++- **Coding questions**: candidates write and run code in the exam (Python, C++, C, Java, JavaScript); it is executed in a [Judge0](https://github.com/judge0/judge0) sandbox and scored against hidden test cases (see [Coding questions](#coding-questions-judge0))
+ 
+ ### Proctoring — Layer 1: Browser security
+ - Tab-switch detection via the Visibility API
+@@ -62,6 +63,7 @@ Frames are captured every 1.5 seconds, sent to the backend, analysed, and any vi
+ | Auth | JWT tokens, bcrypt password hashing |
+ | Computer vision | MediaPipe (face, gaze, lips), YOLOv8 (objects) |
+ | Audio | Web Audio API — voice-band frequency analysis |
++| Code execution | Judge0 CE (optional, sandboxed, via Docker) |
+ | Infrastructure | Docker, Docker Compose |
+ | Testing | pytest |
+ 
+@@ -164,6 +166,113 @@ pytest -v
+ 
+ The suite covers password hashing and salting, JWT generation, signup and login flows, access control on protected routes, and exam scoring — including a test verifying that scoring remains correct when answer options are shuffled.
+ 
++Coding questions are covered by `tests/test_coding.py` (authoring, access control, hidden-test secrecy, scoring, cleanup) and `tests/test_judge0_client.py` (the Judge0 client). They use a fake Judge0, so no Docker is needed. `tests/test_local_runner.py` exercises the Docker-free runner with the real interpreters/compilers installed on the machine (tests for missing toolchains are skipped).
++
++---
++
++## Coding questions (Judge0)
++
++Exams can contain **coding problems** next to (or instead of) multiple-choice questions. Candidates get an editor
++with sample tests, a **Run** button (sample tests or their own input) and a **Submit solution** button (all tests,
++including hidden ones). Code runs inside [Judge0](https://github.com/judge0/judge0), a sandboxed execution engine.
++
++**How it fits together**
++
++```
++React exam page ──► FastAPI backend ──► Judge0 (judge0-server + judge0-worker, Docker, internal network only)
++                        │
++                        └── PostgreSQL: coding_problems, coding_test_cases, code_submissions
++```
++
++- Judge0 is **not** published to the host; only the backend talks to it. Candidates never see hidden test inputs
++  or expected outputs, only pass/fail per hidden test.
++- Scoring is server-side. Each problem has a point value; the candidate's **best** submission counts, with partial
++  credit rounded down (full points need every test to pass). Coding points are added to the normal exam score, so
++  results, rankings and percentages keep working unchanged.
++- Code can only be run during an active, in-time exam session, and executions are rate-limited per candidate
++  (`CODE_EXEC_PER_MINUTE`, default 15).
++- Admins can review every submitted solution (**Dashboard → Coding → Code submissions**) alongside the proctoring
++  violations.
++
++**Start Judge0** (optional; the rest of the app works without it, coding questions then report that the execution
++service is unavailable):
++
++```bash
++# 1. change the two passwords in judge0.conf
++# 2. start everything including Judge0
++docker compose --profile judge0 up -d
++```
++
++Judge0 needs `privileged` containers and, for the 1.13.x series, a **cgroup v1** host. On hosts that default to
++cgroup v2 (recent Ubuntu, Docker Desktop/WSL2) it may fail to start; Judge0's release notes recommend adding
++`systemd.unified_cgroup_hierarchy=0` to the kernel command line on Ubuntu 22.04. Judge0 is tested on Linux only.
++More judging capacity: `docker compose --profile judge0 up -d --scale judge0-worker=3`.
++
++**No Docker? Local runner (development / practice only)**
++
++Set `CODE_RUNNER=local` in `backend/.env` and restart the backend. Code is then run directly as a subprocess on the
++machine that runs the backend (Python always; JavaScript, C, C++ and Java only if `node`, `gcc`, `g++`, `javac`/`java`
++are on the PATH, and only installed languages are offered to candidates). Java classes must be named `Main`.
++
++```
++CODE_RUNNER=local
++```
++
++**This is not a sandbox.** Candidate code runs as the same OS user as the backend. The runner strips the
++environment (so `SECRET_KEY`/`DATABASE_URL` are not visible), uses a throw-away directory, enforces a wall-clock
++time limit and an output cap, and on Linux/macOS also CPU, file-size and (for Python/C/C++) memory limits. On
++Windows only the time and output limits apply. A determined candidate can still read files, use the network or
++fork-bomb, so use it for development, demos and trusted practice, not for real exams. For real exams use Judge0,
++or run the whole backend inside a locked-down container/VM.
++
++**Adding problems**
++
++- *When creating an exam* (**Create Exam → Coding Problems**), or later from the exam's **Coding** button on the
++  dashboard: fill in the form, or **import from JSON**.
++- A ready-to-use example with three problems is in `backend/sample_coding_problems.json`. Format:
++
++```json
++{
++  "problems": [
++    {
++      "title": "Sum of Two Numbers",
++      "statement": "Read two integers from one line and print their sum.",
++      "input_format": "optional", "output_format": "optional", "constraints": "optional",
++      "points": 10, "time_limit_seconds": 2, "memory_limit_mb": 256,
++      "test_cases": [
++        { "input_data": "3 4\n", "expected_output": "7\n", "is_sample": true },
++        { "input_data": "0 0\n", "expected_output": "0\n", "is_sample": false }
++      ]
++    }
++  ]
++}
++```
++
++Limits: 0.5-15 s time, 16-256 MB memory, up to 50 test cases per problem. Output is compared ignoring trailing
++spaces on a line and trailing blank lines; anything else must match exactly.
++
++**Configuration** (backend environment variables)
++
++| Variable | Default | Meaning |
++|----------|---------|---------|
++| `JUDGE0_URL` | `http://judge0-server:2358` | Where the backend reaches Judge0 (set in `docker-compose.yml`) |
++| `JUDGE0_AUTH_TOKEN` / `JUDGE0_AUTH_HEADER` | empty / `X-Auth-Token` | Only if you enable `AUTHN_TOKEN` in `judge0.conf` |
++| `CODE_RUNNER` | `judge0` | `judge0` (sandboxed, Docker) or `local` (no Docker, **not a sandbox**) |
++| `CODE_EXEC_PER_MINUTE` | `15` | Run/Submit calls allowed per candidate per minute |
++
++When running the backend locally (not in Docker), publish Judge0's port yourself and point `JUDGE0_URL` at it
++(for example `http://localhost:2358`).
++
++**Notes and limits**
++
++- Language ids are Judge0 CE 1.13.x ids, listed in `backend/app/judge0.py` (`SUPPORTED_LANGUAGES`). Check them
++  against `GET /languages` on your Judge0 if you upgrade, and add more there if you like.
++- Each test case is a separate Judge0 run (a compiled language compiles once per test), so judging a problem with
++  many tests takes a few seconds; add workers if many candidates submit at once.
++- The code editor is a plain textarea (no extra dependencies). Copy/paste stays blocked by the proctoring layer.
++- Keyboard layouts that type characters with AltGr (for example `{` or `[` on some European layouts) trip the
++  existing "Alt key" rule in `ExamPage.jsx`; relax it there if you need to support those layouts.
++
+ ---
+ 
+ ## Known limitations
+diff --git a/backend/app/coding.py b/backend/app/coding.py
+new file mode 100644
+index 0000000..fc0d05a
+--- /dev/null
++++ b/backend/app/coding.py
+@@ -0,0 +1,507 @@
++"""
++Coding questions: admin authoring + candidate run/submit, judged by Judge0.
++
++Security model
++- Candidates can only run code for an exam they have an *active, in-time* session
++  for, and only for problems that belong to that exam.
++- Hidden test cases (inputs AND expected outputs) never leave the server. Sample
++  cases are shown to candidates; hidden ones only report pass/fail.
++- Grading is done server-side from stored code submissions, never from a score
++  sent by the browser.
++- Executions are throttled per user (not per IP, so a whole lab behind one NAT
++  isn't locked out together).
++"""
++import json
++import os
++import time
++from collections import defaultdict, deque
++from datetime import datetime, timezone
++from typing import Dict, List, Optional, Tuple
++
++from fastapi import APIRouter, Depends, HTTPException
++from sqlalchemy.orm import Session
++
++from app import audit, auth, judge0, models, schemas
++from app.database import get_db
++
++router = APIRouter(tags=["coding"])
++
++MAX_SOURCE_CHARS = 64_000
++MAX_CUSTOM_INPUT_CHARS = 10_000
++MAX_TEST_CASES = 50
++MAX_TEST_IO_CHARS = 100_000
++EXEC_PER_MINUTE = int(os.getenv("CODE_EXEC_PER_MINUTE", "15"))
++TIME_GRACE_SECONDS = 60  # network/latency slack after the exam timer hits zero
++
++# user_id -> timestamps of recent executions (in-memory; fine for one API process)
++_exec_log: Dict[int, deque] = defaultdict(deque)
++
++
++def reset_throttle() -> None:
++    _exec_log.clear()
++
++
++def _throttle(user_id: int) -> None:
++    now = time.monotonic()
++    recent = _exec_log[user_id]
++    while recent and now - recent[0] > 60:
++        recent.popleft()
++    if len(recent) >= EXEC_PER_MINUTE:
++        raise HTTPException(status_code=429, detail="You are running code too quickly. Please wait a few seconds.")
++    recent.append(now)
++
++
++def _require_admin(user: models.User, action: str) -> None:
++    if user.role != "admin":
++        raise HTTPException(status_code=403, detail=f"Only admins can {action}")
++
++
++# ----------------------------------------------------------------------------
++# authoring helpers (also used by POST /exams/create in main.py)
++# ----------------------------------------------------------------------------
++def validate_problem(p: schemas.CodingProblemCreate) -> None:
++    if not p.title.strip():
++        raise HTTPException(status_code=400, detail="Every coding problem needs a title")
++    if not p.statement.strip():
++        raise HTTPException(status_code=400, detail=f"Coding problem '{p.title}' needs a statement")
++    if not 1 <= p.points <= 1000:
++        raise HTTPException(status_code=400, detail=f"'{p.title}': points must be between 1 and 1000")
++    if not 0.5 <= p.time_limit_seconds <= 15:
++        raise HTTPException(status_code=400, detail=f"'{p.title}': time limit must be between 0.5 and 15 seconds")
++    if not 16 <= p.memory_limit_mb <= 256:
++        raise HTTPException(status_code=400, detail=f"'{p.title}': memory limit must be between 16 and 256 MB")
++    if not p.test_cases:
++        raise HTTPException(status_code=400, detail=f"'{p.title}' needs at least one test case")
++    if len(p.test_cases) > MAX_TEST_CASES:
++        raise HTTPException(status_code=400, detail=f"'{p.title}' has more than {MAX_TEST_CASES} test cases")
++    for i, tc in enumerate(p.test_cases, start=1):
++        if not tc.expected_output.strip():
++            raise HTTPException(status_code=400, detail=f"'{p.title}': test case {i} has an empty expected output")
++        if len(tc.input_data) > MAX_TEST_IO_CHARS or len(tc.expected_output) > MAX_TEST_IO_CHARS:
++            raise HTTPException(status_code=400, detail=f"'{p.title}': test case {i} is too large")
++
++
++def create_problem(db: Session, exam_id: int, p: schemas.CodingProblemCreate) -> models.CodingProblem:
++    """Add a problem and its test cases to the session. The caller commits."""
++    problem = models.CodingProblem(
++        exam_id=exam_id,
++        title=p.title.strip(),
++        statement=p.statement,
++        input_format=p.input_format,
++        output_format=p.output_format,
++        constraints=p.constraints,
++        points=p.points,
++        time_limit_seconds=p.time_limit_seconds,
++        memory_limit_mb=p.memory_limit_mb,
++        test_cases=[
++            models.TestCase(
++                input_data=tc.input_data,
++                expected_output=tc.expected_output,
++                is_sample=tc.is_sample,
++            )
++            for tc in p.test_cases
++        ],
++    )
++    db.add(problem)
++    return problem
++
++
++def admin_view(problem: models.CodingProblem) -> dict:
++    return {
++        "id": problem.id,
++        "exam_id": problem.exam_id,
++        "title": problem.title,
++        "statement": problem.statement,
++        "input_format": problem.input_format,
++        "output_format": problem.output_format,
++        "constraints": problem.constraints,
++        "points": problem.points,
++        "time_limit_seconds": problem.time_limit_seconds,
++        "memory_limit_mb": problem.memory_limit_mb,
++        "test_cases": [
++            {
++                "id": tc.id,
++                "input_data": tc.input_data,
++                "expected_output": tc.expected_output,
++                "is_sample": tc.is_sample,
++            }
++            for tc in problem.test_cases
++        ],
++    }
++
++
++def student_view(problem: models.CodingProblem) -> dict:
++    """What a candidate may see: statement + SAMPLE cases only."""
++    return {
++        "id": problem.id,
++        "title": problem.title,
++        "statement": problem.statement,
++        "input_format": problem.input_format,
++        "output_format": problem.output_format,
++        "constraints": problem.constraints,
++        "points": problem.points,
++        "time_limit_seconds": problem.time_limit_seconds,
++        "memory_limit_mb": problem.memory_limit_mb,
++        "samples": [
++            {"input": tc.input_data, "expected_output": tc.expected_output}
++            for tc in problem.test_cases
++            if tc.is_sample
++        ],
++        "hidden_test_count": sum(1 for tc in problem.test_cases if not tc.is_sample),
++    }
++
++
++def student_problem_views(exam: models.Exam) -> List[dict]:
++    return [student_view(p) for p in exam.coding_problems]
++
++
++# ----------------------------------------------------------------------------
++# scoring + cleanup helpers (used by main.py)
++# ----------------------------------------------------------------------------
++def _best_by_problem(db: Session, exam_id: int, student_id: int) -> Dict[int, models.CodeSubmission]:
++    rows = (
++        db.query(models.CodeSubmission)
++        .filter(models.CodeSubmission.exam_id == exam_id, models.CodeSubmission.student_id == student_id)
++        .order_by(models.CodeSubmission.id)
++        .all()
++    )
++    best: Dict[int, models.CodeSubmission] = {}
++    for row in rows:
++        ratio = (row.passed / row.total) if row.total else 0
++        current = best.get(row.problem_id)
++        current_ratio = (current.passed / current.total) if current and current.total else -1
++        if current is None or ratio >= current_ratio:  # later submission wins ties
++            best[row.problem_id] = row
++    return best
++
++
++def coding_score(db: Session, exam_id: int, student_id: int) -> Tuple[int, int]:
++    """
++    (points earned, points available) from the student's best submission per
++    problem. Partial credit is rounded DOWN, so full points need every test.
++    """
++    problems = db.query(models.CodingProblem).filter(models.CodingProblem.exam_id == exam_id).all()
++    best = _best_by_problem(db, exam_id, student_id)
++    earned = 0
++    for problem in problems:
++        sub = best.get(problem.id)
++        if sub and sub.total:
++            earned += (problem.points * sub.passed) // sub.total
++    return earned, sum(p.points for p in problems)
++
++
++def delete_exam_coding_data(db: Session, exam_id: int) -> None:
++    """Remove all coding data for an exam (call before deleting the exam row)."""
++    db.query(models.CodeSubmission).filter(models.CodeSubmission.exam_id == exam_id).delete()
++    problem_ids = [pid for (pid,) in db.query(models.CodingProblem.id).filter(models.CodingProblem.exam_id == exam_id)]
++    if problem_ids:
++        db.query(models.TestCase).filter(models.TestCase.problem_id.in_(problem_ids)).delete(synchronize_session=False)
++    db.query(models.CodingProblem).filter(models.CodingProblem.exam_id == exam_id).delete()
++
++
++def delete_student_code(db: Session, student_id: int, exam_id: Optional[int] = None) -> None:
++    q = db.query(models.CodeSubmission).filter(models.CodeSubmission.student_id == student_id)
++    if exam_id is not None:
++        q = q.filter(models.CodeSubmission.exam_id == exam_id)
++    q.delete()
++
++
++# ----------------------------------------------------------------------------
++# candidate helpers
++# ----------------------------------------------------------------------------
++def _elapsed_seconds(started_at: datetime) -> float:
++    """Seconds since the exam session started, correct for aware (Postgres) and naive (SQLite, UTC) values."""
++    if started_at.tzinfo is None:
++        started_at = started_at.replace(tzinfo=timezone.utc)
++    return (datetime.now(timezone.utc) - started_at).total_seconds()
++
++
++def _student_problem(db: Session, exam_id: int, problem_id: int, user: models.User) -> models.CodingProblem:
++    exam = db.get(models.Exam, exam_id)
++    if not exam:
++        raise HTTPException(status_code=404, detail="Exam not found")
++
++    session = db.query(models.ExamSession).filter(
++        models.ExamSession.exam_id == exam_id,
++        models.ExamSession.student_id == user.id,
++    ).first()
++    if not session:
++        raise HTTPException(status_code=400, detail="Start the exam before running code")
++    if session.status != "in_progress":
++        raise HTTPException(status_code=403, detail="This exam session is no longer active")
++
++    if _elapsed_seconds(session.started_at) > exam.duration_minutes * 60 + TIME_GRACE_SECONDS:
++        raise HTTPException(status_code=400, detail="Time is up for this exam")
++
++    problem = db.query(models.CodingProblem).filter(
++        models.CodingProblem.id == problem_id,
++        models.CodingProblem.exam_id == exam_id,
++    ).first()
++    if not problem:
++        raise HTTPException(status_code=404, detail="Coding problem not found in this exam")
++    return problem
++
++
++def _check_code(language_id: int, source_code: str) -> None:
++    if language_id not in judge0.SUPPORTED_LANGUAGES:
++        raise HTTPException(status_code=400, detail="Unsupported programming language")
++    if not source_code.strip():
++        raise HTTPException(status_code=400, detail="Write some code first")
++    if len(source_code) > MAX_SOURCE_CHARS:
++        raise HTTPException(status_code=400, detail="Source code is too long")
++
++
++def _unavailable(user: models.User, exc: Exception) -> HTTPException:
++    audit.log_event("JUDGE0_ERROR", user.email, str(exc)[:300])
++    return HTTPException(status_code=503, detail="Code execution service is unavailable right now. Please try again in a moment.")
++
++
++# ----------------------------------------------------------------------------
++# routes: shared
++# ----------------------------------------------------------------------------
++@router.get("/coding/languages")
++def list_languages(current_user: models.User = Depends(auth.get_current_user)):
++    return [{"id": lid, "name": name} for lid, name in judge0.SUPPORTED_LANGUAGES.items()]
++
++
++# ----------------------------------------------------------------------------
++# routes: admin authoring
++# ----------------------------------------------------------------------------
++@router.post("/exams/{exam_id}/coding-problems")
++def add_coding_problem(
++    exam_id: int,
++    problem: schemas.CodingProblemCreate,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    _require_admin(current_user, "add coding problems")
++    if not db.get(models.Exam, exam_id):
++        raise HTTPException(status_code=404, detail="Exam not found")
++    validate_problem(problem)
++
++    created = create_problem(db, exam_id, problem)
++    db.commit()
++    db.refresh(created)
++    audit.log_event("CODING_PROBLEM_ADDED", current_user.email, f"exam_id={exam_id} problem_id={created.id} title='{created.title}'")
++    return admin_view(created)
++
++
++@router.post("/exams/{exam_id}/coding-problems/bulk")
++def add_coding_problems_bulk(
++    exam_id: int,
++    body: schemas.CodingProblemBulkCreate,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    _require_admin(current_user, "add coding problems")
++    if not db.get(models.Exam, exam_id):
++        raise HTTPException(status_code=404, detail="Exam not found")
++    if not body.problems:
++        raise HTTPException(status_code=400, detail="No problems provided")
++    for p in body.problems:  # validate everything first so the import is all-or-nothing
++        validate_problem(p)
++
++    created = [create_problem(db, exam_id, p) for p in body.problems]
++    db.commit()
++    audit.log_event("CODING_PROBLEMS_IMPORTED", current_user.email, f"exam_id={exam_id} count={len(created)}")
++    return {"status": "imported", "count": len(created)}
++
++
++@router.get("/exams/{exam_id}/coding-problems")
++def list_coding_problems(
++    exam_id: int,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    _require_admin(current_user, "view coding problems")
++    problems = (
++        db.query(models.CodingProblem)
++        .filter(models.CodingProblem.exam_id == exam_id)
++        .order_by(models.CodingProblem.id)
++        .all()
++    )
++    return [admin_view(p) for p in problems]
++
++
++@router.delete("/coding-problems/{problem_id}")
++def delete_coding_problem(
++    problem_id: int,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    _require_admin(current_user, "delete coding problems")
++    problem = db.get(models.CodingProblem, problem_id)
++    if not problem:
++        raise HTTPException(status_code=404, detail="Coding problem not found")
++
++    db.query(models.CodeSubmission).filter(models.CodeSubmission.problem_id == problem_id).delete()
++    title, exam_id = problem.title, problem.exam_id
++    db.delete(problem)  # test cases go with it (cascade)
++    db.commit()
++    audit.log_event("CODING_PROBLEM_DELETED", current_user.email, f"exam_id={exam_id} problem_id={problem_id} title='{title}'")
++    return {"status": "deleted", "problem_id": problem_id}
++
++
++@router.get("/exams/{exam_id}/coding-submissions")
++def list_coding_submissions(
++    exam_id: int,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    """Admin review: every graded code submission for the exam, newest first."""
++    _require_admin(current_user, "view code submissions")
++    rows = (
++        db.query(models.CodeSubmission, models.User, models.CodingProblem)
++        .join(models.User, models.User.id == models.CodeSubmission.student_id)
++        .join(models.CodingProblem, models.CodingProblem.id == models.CodeSubmission.problem_id)
++        .filter(models.CodeSubmission.exam_id == exam_id)
++        .order_by(models.CodeSubmission.id.desc())
++        .limit(500)
++        .all()
++    )
++    return [
++        {
++            "id": sub.id,
++            "student_id": user.id,
++            "student_name": user.full_name,
++            "student_email": user.email,
++            "problem_id": problem.id,
++            "problem_title": problem.title,
++            "language": judge0.SUPPORTED_LANGUAGES.get(sub.language_id, str(sub.language_id)),
++            "verdict": sub.verdict,
++            "passed": sub.passed,
++            "total": sub.total,
++            "created_at": sub.created_at,
++            "source_code": sub.source_code,
++        }
++        for sub, user, problem in rows
++    ]
++
++
++# ----------------------------------------------------------------------------
++# routes: candidate run / submit / progress
++# ----------------------------------------------------------------------------
++@router.post("/exams/{exam_id}/coding-problems/{problem_id}/run")
++def run_code(
++    exam_id: int,
++    problem_id: int,
++    body: schemas.CodeRunRequest,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    """Practice run: sample tests (or custom stdin). Not graded, not stored."""
++    problem = _student_problem(db, exam_id, problem_id, current_user)
++    _check_code(body.language_id, body.source_code)
++    if body.custom_input is not None and len(body.custom_input) > MAX_CUSTOM_INPUT_CHARS:
++        raise HTTPException(status_code=400, detail="Custom input is too long")
++
++    samples = [
++        {"input": tc.input_data, "expected": tc.expected_output, "is_sample": True}
++        for tc in problem.test_cases
++        if tc.is_sample
++    ]
++    if body.custom_input is None and not samples:
++        raise HTTPException(status_code=400, detail="This problem has no sample tests - use custom input to try your code")
++
++    _throttle(current_user.id)
++    try:
++        if body.custom_input is not None:
++            result = judge0.run_custom(body.source_code, body.language_id, body.custom_input,
++                                       problem.time_limit_seconds, problem.memory_limit_mb)
++            return {"mode": "custom", **result}
++        result = judge0.judge(body.source_code, body.language_id, samples,
++                              problem.time_limit_seconds, problem.memory_limit_mb)
++        return {"mode": "samples", **result}
++    except judge0.Judge0Error as exc:
++        raise _unavailable(current_user, exc)
++
++
++@router.post("/exams/{exam_id}/coding-problems/{problem_id}/submit")
++def submit_code(
++    exam_id: int,
++    problem_id: int,
++    body: schemas.CodeSubmitRequest,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    """Graded run against ALL tests. The best submission per problem counts."""
++    problem = _student_problem(db, exam_id, problem_id, current_user)
++    _check_code(body.language_id, body.source_code)
++
++    cases = [
++        {"input": tc.input_data, "expected": tc.expected_output, "is_sample": tc.is_sample}
++        for tc in problem.test_cases
++    ]
++    if not cases:
++        raise HTTPException(status_code=400, detail="This problem has no test cases yet")
++
++    _throttle(current_user.id)
++    try:
++        result = judge0.judge(body.source_code, body.language_id, cases,
++                              problem.time_limit_seconds, problem.memory_limit_mb)
++    except judge0.Judge0Error as exc:
++        raise _unavailable(current_user, exc)
++
++    submission = models.CodeSubmission(
++        exam_id=exam_id,
++        problem_id=problem_id,
++        student_id=current_user.id,
++        language_id=body.language_id,
++        source_code=body.source_code,
++        verdict=result["verdict"],
++        passed=result["passed"],
++        total=result["total"],
++        details=json.dumps([
++            {k: c[k] for k in ("label", "passed", "verdict", "time", "memory_kb")}
++            for c in result["cases"]
++        ]),
++    )
++    db.add(submission)
++    db.commit()
++    db.refresh(submission)
++    audit.log_event(
++        "CODE_SUBMITTED", current_user.email,
++        f"exam_id={exam_id} problem_id={problem_id} verdict='{result['verdict']}' passed={result['passed']}/{result['total']}",
++    )
++
++    best = _best_by_problem(db, exam_id, current_user.id).get(problem_id)
++    return {
++        "submission_id": submission.id,
++        **result,
++        "best_passed": best.passed if best else result["passed"],
++        "best_total": best.total if best else result["total"],
++    }
++
++
++@router.get("/exams/{exam_id}/coding-progress")
++def coding_progress(
++    exam_id: int,
++    db: Session = Depends(get_db),
++    current_user: models.User = Depends(auth.get_current_user),
++):
++    """The candidate's own best result + last code per problem (restores state after a refresh)."""
++    best = _best_by_problem(db, exam_id, current_user.id)
++    last_by_problem: Dict[int, models.CodeSubmission] = {}
++    attempts: Dict[int, int] = defaultdict(int)
++    rows = (
++        db.query(models.CodeSubmission)
++        .filter(models.CodeSubmission.exam_id == exam_id, models.CodeSubmission.student_id == current_user.id)
++        .order_by(models.CodeSubmission.id)
++        .all()
++    )
++    for row in rows:
++        last_by_problem[row.problem_id] = row
++        attempts[row.problem_id] += 1
++
++    return [
++        {
++            "problem_id": pid,
++            "best_passed": sub.passed,
++            "best_total": sub.total,
++            "best_verdict": sub.verdict,
++            "attempts": attempts[pid],
++            "last_language_id": last_by_problem[pid].language_id,
++            "last_source_code": last_by_problem[pid].source_code,
++        }
++        for pid, sub in best.items()
++    ]
+diff --git a/backend/app/judge0.py b/backend/app/judge0.py
+new file mode 100644
+index 0000000..589fab4
+--- /dev/null
++++ b/backend/app/judge0.py
+@@ -0,0 +1,317 @@
++"""
++Thin client for the Judge0 CE REST API (https://ce.judge0.com/).
++
++The backend is the ONLY thing that talks to Judge0. Judge0 is not published to
++the host or the internet in docker-compose.yml, so candidates cannot reach it
++directly, and they never see hidden test cases or expected outputs.
++
++Design notes
++- Each test case is sent as its own Judge0 submission (batched, 20 per request),
++  with the test input as stdin.
++- We do NOT send `expected_output` to Judge0. We compare stdout ourselves so the
++  comparison rules live in one place and expected output never leaves our DB.
++- Source code / stdin / stdout travel base64-encoded (`base64_encoded=true`) so
++  non-UTF8 output cannot break the JSON response.
++"""
++import base64
++import os
++import time
++from typing import Dict, List, Optional
++
++import httpx
++
++# "judge0" (default, sandboxed, needs Docker) or "local" (no Docker, runs code as a plain subprocess; NOT a sandbox)
++CODE_RUNNER = os.getenv("CODE_RUNNER", "judge0").strip().lower()
++JUDGE0_URL = os.getenv("JUDGE0_URL", "http://judge0-server:2358").rstrip("/")
++# Optional: only needed if you enable AUTHN_HEADER / AUTHN_TOKEN in judge0.conf
++JUDGE0_AUTH_HEADER = os.getenv("JUDGE0_AUTH_HEADER", "X-Auth-Token")
++JUDGE0_AUTH_TOKEN = os.getenv("JUDGE0_AUTH_TOKEN", "")
++
++BATCH_SIZE = 20            # Judge0's default MAX_SUBMISSION_BATCH_SIZE
++POLL_INTERVAL_SECONDS = 0.5
++POLL_TIMEOUT_SECONDS = 60  # give up waiting for a batch after this long
++HTTP_TIMEOUT_SECONDS = 15
++MAX_OUTPUT_CHARS = 2000    # what we hand back to the browser
++KB_PER_MB = 1000           # Judge0 takes KB and documents 256000 KB as its max, so 256 MB -> 256000
++
++# Languages offered to candidates. IDs are Judge0 CE 1.13.x language ids — check
++# them against `GET {JUDGE0_URL}/languages` if you upgrade Judge0, and add more
++# here if you want (e.g. 100 = Python 3.12.5, 97 = Node.js 20.17.0, 91 = Java 17).
++SUPPORTED_LANGUAGES: Dict[int, str] = {
++    71: "Python (3.8.1)",
++    54: "C++ (GCC 9.2.0)",
++    50: "C (GCC 9.2.0)",
++    62: "Java (OpenJDK 13.0.1)",
++    63: "JavaScript (Node.js 12.14.0)",
++}
++
++if CODE_RUNNER == "local":  # only offer languages that are actually installed on this machine
++    from app import local_runner as _local_runner
++    SUPPORTED_LANGUAGES = _local_runner.available_languages()
++
++# Judge0 status ids -> our verdict names (ids 1 and 2 mean "still running")
++STATUS_ACCEPTED = 3
++STATUS_WRONG_ANSWER = 4   # we never send expected_output, so Judge0 shouldn't emit this; treated as "ran fine"
++STATUS_TLE = 5
++STATUS_COMPILE_ERROR = 6
++_RUNTIME_ERROR_IDS = {7, 8, 9, 10, 11, 12}
++_STILL_RUNNING_IDS = {1, 2}
++
++
++class Judge0Error(Exception):
++    """Judge0 is unreachable, timed out, or returned something unusable."""
++
++
++# ----------------------------------------------------------------------------
++# helpers
++# ----------------------------------------------------------------------------
++def _b64e(text: str) -> str:
++    return base64.b64encode((text or "").encode("utf-8")).decode("ascii")
++
++
++def _b64d(value: Optional[str]) -> str:
++    if not value:
++        return ""
++    try:
++        return base64.b64decode(value).decode("utf-8", errors="replace")
++    except Exception:
++        return ""
++
++
++def _headers() -> Dict[str, str]:
++    headers = {"Content-Type": "application/json"}
++    if JUDGE0_AUTH_TOKEN:
++        headers[JUDGE0_AUTH_HEADER] = JUDGE0_AUTH_TOKEN
++    return headers
++
++
++def normalize_output(text: str) -> str:
++    """Ignore \\r\\n vs \\n, trailing spaces on a line, and trailing blank lines."""
++    lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
++    lines = [line.rstrip() for line in lines]
++    while lines and lines[-1] == "":
++        lines.pop()
++    return "\n".join(lines)
++
++
++def outputs_match(actual: str, expected: str) -> bool:
++    return normalize_output(actual) == normalize_output(expected)
++
++
++def _clip(text: str) -> str:
++    if len(text) <= MAX_OUTPUT_CHARS:
++        return text
++    return text[:MAX_OUTPUT_CHARS] + "\n... [output truncated]"
++
++
++# ----------------------------------------------------------------------------
++# raw execution
++# ----------------------------------------------------------------------------
++def _submission_payload(source_code: str, language_id: int, stdin: str,
++                        time_limit_seconds: float, memory_limit_mb: int) -> dict:
++    cpu = max(0.5, float(time_limit_seconds))
++    return {
++        "source_code": _b64e(source_code),
++        "language_id": language_id,
++        "stdin": _b64e(stdin),
++        "cpu_time_limit": cpu,
++        # wall time must be >= 1s (Judge0 >= 1.13); allow headroom for JVM start-up
++        "wall_time_limit": min(20.0, max(1.0, cpu * 2 + 1)),
++        "memory_limit": int(memory_limit_mb) * KB_PER_MB,
++    }
++
++
++def execute(source_code: str, language_id: int, stdins: List[str],
++            time_limit_seconds: float = 2.0, memory_limit_mb: int = 256,
++            client: Optional[httpx.Client] = None) -> List[dict]:
++    """
++    Run `source_code` once per entry in `stdins` and return one raw result dict
++    per stdin, in order: {status_id, status, stdout, stderr, compile_output,
++    message, time, memory}. Raises Judge0Error if the service is unavailable.
++    """
++    if not stdins:
++        return []
++
++    if CODE_RUNNER == "local":  # Docker-free mode, see local_runner.py (NOT a sandbox)
++        from app import local_runner
++        return local_runner.execute(source_code, language_id, stdins, time_limit_seconds, memory_limit_mb)
++
++    own_client = client is None
++    http = client or httpx.Client(timeout=HTTP_TIMEOUT_SECONDS)
++    results: List[dict] = []
++    try:
++        for start in range(0, len(stdins), BATCH_SIZE):
++            chunk = stdins[start:start + BATCH_SIZE]
++            payload = {"submissions": [
++                _submission_payload(source_code, language_id, s, time_limit_seconds, memory_limit_mb)
++                for s in chunk
++            ]}
++            created = http.post(
++                f"{JUDGE0_URL}/submissions/batch",
++                params={"base64_encoded": "true"},
++                json=payload,
++                headers=_headers(),
++            )
++            created.raise_for_status()
++            items = created.json()
++            if not isinstance(items, list) or len(items) != len(chunk):
++                raise Judge0Error("Judge0 returned an unexpected response to the batch request")
++            rejected = [item for item in items if not isinstance(item, dict) or "token" not in item]
++            if rejected:
++                raise Judge0Error(f"Judge0 rejected the submission: {rejected[0]}")
++            tokens = [item["token"] for item in items]
++            results.extend(_poll(http, tokens))
++    except Judge0Error:
++        raise
++    except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
++        raise Judge0Error(f"Code execution service error: {exc}") from exc
++    finally:
++        if own_client:
++            http.close()
++    return results
++
++
++def _poll(http: httpx.Client, tokens: List[str]) -> List[dict]:
++    deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
++    while True:
++        response = http.get(
++            f"{JUDGE0_URL}/submissions/batch",
++            # no `fields`: Judge0's default set already is stdout,time,memory,stderr,token,compile_output,message,status
++            params={"tokens": ",".join(tokens), "base64_encoded": "true"},
++            headers=_headers(),
++        )
++        response.raise_for_status()
++        by_token = {item["token"]: item for item in response.json()["submissions"]}
++        items = [by_token.get(t) for t in tokens]
++        if all(item is not None and _status_id(item) not in _STILL_RUNNING_IDS for item in items):
++            return [_clean(item) for item in items]
++        if time.monotonic() > deadline:
++            raise Judge0Error("Timed out waiting for the code execution service")
++        time.sleep(POLL_INTERVAL_SECONDS)
++
++
++def _status_id(item: dict) -> Optional[int]:
++    status = item.get("status")
++    return status.get("id") if isinstance(status, dict) else None
++
++
++def _clean(item: dict) -> dict:
++    status = item.get("status") or {}
++    try:
++        seconds = float(item["time"]) if item.get("time") is not None else None
++    except (TypeError, ValueError):
++        seconds = None
++    return {
++        "status_id": _status_id(item),
++        "status": status.get("description") if isinstance(status, dict) else str(status),
++        "stdout": _b64d(item.get("stdout")),
++        "stderr": _b64d(item.get("stderr")),
++        "compile_output": _b64d(item.get("compile_output")),
++        "message": _b64d(item.get("message")),
++        "time": seconds,
++        "memory": item.get("memory"),
++    }
++
++
++# ----------------------------------------------------------------------------
++# judging
++# ----------------------------------------------------------------------------
++def verdict_for(raw: dict, expected_output: Optional[str]) -> str:
++    """Turn one raw Judge0 result into a human-readable verdict."""
++    status_id = raw["status_id"]
++    if status_id == STATUS_COMPILE_ERROR:
++        return "Compilation Error"
++    if status_id == STATUS_TLE:
++        return "Time Limit Exceeded"
++    if status_id in _RUNTIME_ERROR_IDS:
++        return "Runtime Error"
++    if status_id in (STATUS_ACCEPTED, STATUS_WRONG_ANSWER):
++        if expected_output is None:
++            return "Ran Successfully"
++        return "Accepted" if outputs_match(raw["stdout"], expected_output) else "Wrong Answer"
++    # 13 = Internal Error, 14 = Exec Format Error, anything unexpected
++    return raw.get("status") or "Internal Error"
++
++
++def judge(source_code: str, language_id: int, cases: List[dict],
++          time_limit_seconds: float, memory_limit_mb: int,
++          client: Optional[httpx.Client] = None) -> dict:
++    """
++    Judge `source_code` against `cases` (each: {input, expected, is_sample}).
++
++    Returns {verdict, passed, total, compile_output, cases: [...]}. For hidden
++    cases the per-case entry contains NO input/expected/actual output.
++    """
++    raws = execute(source_code, language_id, [c["input"] for c in cases],
++                   time_limit_seconds, memory_limit_mb, client=client)
++
++    out_cases = []
++    passed = 0
++    compile_output = ""
++    first_failure: Optional[str] = None
++    sample_no = hidden_no = 0
++
++    for case, raw in zip(cases, raws):
++        verdict = verdict_for(raw, case["expected"])
++        ok = verdict == "Accepted"
++        passed += 1 if ok else 0
++        if not ok and first_failure is None:
++            first_failure = verdict
++        if verdict == "Compilation Error" and not compile_output:
++            compile_output = _clip(raw["compile_output"])
++
++        if case["is_sample"]:
++            sample_no += 1
++            label = f"Sample {sample_no}"
++        else:
++            hidden_no += 1
++            label = f"Hidden {hidden_no}"
++
++        entry = {
++            "label": label,
++            "is_sample": bool(case["is_sample"]),
++            "passed": ok,
++            "verdict": verdict,
++            "time": raw["time"],
++            "memory_kb": raw["memory"],
++        }
++        if case["is_sample"]:  # samples are public, so show full detail
++            entry.update({
++                "input": _clip(case["input"]),
++                "expected_output": _clip(case["expected"]),
++                "actual_output": _clip(raw["stdout"]),
++                "stderr": _clip(raw["stderr"] or raw["message"]),
++            })
++        out_cases.append(entry)
++
++    total = len(cases)
++    if any(c["verdict"] == "Compilation Error" for c in out_cases):
++        overall = "Compilation Error"
++    elif passed == total and total > 0:
++        overall = "Accepted"
++    else:
++        overall = first_failure or "Wrong Answer"
++
++    return {
++        "verdict": overall,
++        "passed": passed,
++        "total": total,
++        "compile_output": compile_output,
++        "cases": out_cases,
++    }
++
++
++def run_custom(source_code: str, language_id: int, stdin: str,
++               time_limit_seconds: float, memory_limit_mb: int,
++               client: Optional[httpx.Client] = None) -> dict:
++    """Run once against arbitrary stdin (the 'custom input' box). Not graded."""
++    raw = execute(source_code, language_id, [stdin], time_limit_seconds, memory_limit_mb,
++                  client=client)[0]
++    return {
++        "verdict": verdict_for(raw, None),
++        "stdout": _clip(raw["stdout"]),
++        "stderr": _clip(raw["stderr"] or raw["message"]),
++        "compile_output": _clip(raw["compile_output"]),
++        "time": raw["time"],
++        "memory_kb": raw["memory"],
++    }
+diff --git a/backend/app/local_runner.py b/backend/app/local_runner.py
+new file mode 100644
+index 0000000..4da5db3
+--- /dev/null
++++ b/backend/app/local_runner.py
+@@ -0,0 +1,189 @@
++"""
++Docker-free code runner: executes candidate code as a subprocess on the machine
++that runs the backend. Enable with  CODE_RUNNER=local  (see README).
++
++!! THIS IS NOT A SANDBOX !!
++Candidate code runs with the same OS user and file access as the backend. We
++reduce the blast radius (empty environment so secrets in env vars are not
++inherited, throw-away working directory, wall-clock timeout, output cap and, on
++Linux/macOS, CPU / memory / file-size limits) but a determined candidate can still
++read files, use the network or fork-bomb. Use it for development, demos and
++trusted/low-stakes practice. For real exams use Judge0 (CODE_RUNNER=judge0) or
++run the backend inside a locked-down container/VM.
++
++It returns the same raw result dicts as judge0.execute(), so the grading code in
++judge0.py / coding.py is shared and unchanged.
++"""
++import os
++import shutil
++import subprocess
++import sys
++import tempfile
++import time
++from typing import Dict, List, Optional
++
++IS_WINDOWS = os.name == "nt"
++MAX_OUTPUT_BYTES = 1_000_000     # stdout/stderr kept per run
++COMPILE_TIMEOUT_SECONDS = 30
++STARTUP_ALLOWANCE = {71: 0.5, 63: 0.5, 50: 0.5, 54: 0.5, 62: 1.5}  # interpreter / JVM start-up
++
++# Judge0 status ids reused so verdict mapping stays identical
++ACCEPTED, TLE, COMPILE_ERROR, RUNTIME_ERROR, INTERNAL_ERROR = 3, 5, 6, 11, 13
++_STATUS_TEXT = {3: "Accepted", 5: "Time Limit Exceeded", 6: "Compilation Error",
++                11: "Runtime Error (NZEC)", 13: "Internal Error"}
++
++
++def _tool(*names: str) -> Optional[str]:
++    for name in names:
++        path = shutil.which(name)
++        if path:
++            return path
++    return None
++
++
++def _toolchains() -> Dict[int, dict]:
++    """language_id -> how to build/run it, only for toolchains installed on this machine."""
++    chains: Dict[int, dict] = {
++        71: {"name": f"Python ({sys.version.split()[0]})", "file": "main.py",
++             "run": [sys.executable, "-u", "main.py"]},
++    }
++    node = _tool("node", "nodejs")
++    if node:
++        chains[63] = {"name": "JavaScript (Node.js)", "file": "main.js", "run": [node, "main.js"]}
++    gcc = _tool("gcc")
++    if gcc:
++        chains[50] = {"name": "C (GCC)", "file": "main.c", "build": [gcc, "main.c", "-O2", "-o", "main", "-lm"],
++                      "run": [os.path.join(".", "main")]}
++    gpp = _tool("g++")
++    if gpp:
++        chains[54] = {"name": "C++ (GCC)", "file": "main.cpp",
++                      "build": [gpp, "main.cpp", "-O2", "-std=c++17", "-o", "main"],
++                      "run": [os.path.join(".", "main")]}
++    javac, java = _tool("javac"), _tool("java")
++    if javac and java:
++        chains[62] = {"name": "Java (class must be Main)", "file": "Main.java", "build": [javac, "Main.java"],
++                      "run": [java, "-Xshare:auto", "Main"]}
++    if IS_WINDOWS:  # MinGW gcc/g++ append .exe to the output name
++        for lid in (50, 54):
++            if lid in chains:
++                chains[lid]["run"] = [os.path.join(".", "main.exe")]
++    return chains
++
++
++def available_languages() -> Dict[int, str]:
++    return {lid: spec["name"] for lid, spec in _toolchains().items()}
++
++
++def _clean_env() -> Dict[str, str]:
++    """Do NOT hand the backend's environment (SECRET_KEY, DATABASE_URL, ...) to candidate code."""
++    env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"}
++    for key in ("SYSTEMROOT", "SystemRoot", "TEMP", "TMP", "LANG", "LC_ALL", "JAVA_HOME"):
++        if key in os.environ:
++            env[key] = os.environ[key]
++    return env
++
++
++def _limits(cpu_seconds: float, memory_mb: int, language_id: int):
++    """POSIX-only resource limits applied in the child before exec. None on Windows."""
++    if IS_WINDOWS:
++        return None
++    import resource
++
++    def apply():
++        os.setsid()
++        resource.setrlimit(resource.RLIMIT_CPU, (int(cpu_seconds) + 2, int(cpu_seconds) + 3))
++        resource.setrlimit(resource.RLIMIT_FSIZE, (16 * 1024 * 1024, 16 * 1024 * 1024))
++        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
++        if language_id in (71, 50, 54):  # JVM / V8 reserve huge virtual ranges, so address-space caps break them
++            limit = int(memory_mb) * 1024 * 1024 + 64 * 1024 * 1024
++            resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
++    return apply
++
++
++def _kill_tree(proc: subprocess.Popen) -> None:
++    try:
++        if IS_WINDOWS:
++            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
++                           capture_output=True, timeout=10)
++        else:
++            import signal
++            os.killpg(proc.pid, signal.SIGKILL)
++    except Exception:
++        try:
++            proc.kill()
++        except Exception:
++            pass
++
++
++def _read_capped(path: str) -> str:
++    try:
++        with open(path, "rb") as fh:
++            return fh.read(MAX_OUTPUT_BYTES).decode("utf-8", errors="replace")
++    except OSError:
++        return ""
++
++
++def _result(status_id: int, stdout="", stderr="", compile_output="", message="", seconds=None) -> dict:
++    return {"status_id": status_id, "status": _STATUS_TEXT.get(status_id, "Internal Error"),
++            "stdout": stdout, "stderr": stderr, "compile_output": compile_output,
++            "message": message, "time": seconds, "memory": None}
++
++
++def _run_once(spec: dict, workdir: str, stdin: str, language_id: int,
++              time_limit: float, memory_mb: int) -> dict:
++    out_path, err_path = os.path.join(workdir, ".stdout"), os.path.join(workdir, ".stderr")
++    timeout = time_limit + STARTUP_ALLOWANCE.get(language_id, 0.5)
++    started = time.perf_counter()
++    with open(out_path, "wb") as out, open(err_path, "wb") as err:
++        try:
++            proc = subprocess.Popen(
++                spec["run"], cwd=workdir, env=_clean_env(), stdin=subprocess.PIPE, stdout=out, stderr=err,
++                preexec_fn=_limits(time_limit, memory_mb, language_id) if not IS_WINDOWS else None,
++                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if IS_WINDOWS else 0,
++            )
++        except OSError as exc:
++            return _result(INTERNAL_ERROR, message=f"Could not start the program: {exc}")
++        try:
++            proc.communicate(stdin.encode("utf-8"), timeout=timeout)
++        except subprocess.TimeoutExpired:
++            _kill_tree(proc)
++            proc.communicate()
++            return _result(TLE, _read_capped(out_path), _read_capped(err_path), seconds=round(timeout, 3))
++        except (BrokenPipeError, OSError):
++            proc.wait()  # program exited without reading all of its input; that's fine
++    seconds = round(time.perf_counter() - started, 3)
++    stdout, stderr = _read_capped(out_path), _read_capped(err_path)
++    if proc.returncode != 0:
++        return _result(RUNTIME_ERROR, stdout, stderr, message=f"Exited with code {proc.returncode}", seconds=seconds)
++    return _result(ACCEPTED, stdout, stderr, seconds=seconds)
++
++
++def execute(source_code: str, language_id: int, stdins: List[str],
++            time_limit_seconds: float = 2.0, memory_limit_mb: int = 256) -> List[dict]:
++    """Same contract as judge0.execute(): one raw result per stdin, in order."""
++    if not stdins:
++        return []
++    spec = _toolchains().get(language_id)
++    if spec is None:
++        return [_result(INTERNAL_ERROR, message="This language is not installed on the server")] * len(stdins)
++
++    workdir = tempfile.mkdtemp(prefix="proctor-run-")
++    try:
++        with open(os.path.join(workdir, spec["file"]), "w", encoding="utf-8", newline="\n") as fh:
++            fh.write(source_code)
++
++        if "build" in spec:
++            try:
++                build = subprocess.run(spec["build"], cwd=workdir, env=_clean_env(), capture_output=True,
++                                       timeout=COMPILE_TIMEOUT_SECONDS)
++            except subprocess.TimeoutExpired:
++                bad = _result(COMPILE_ERROR, compile_output="Compilation timed out")
++                return [bad] * len(stdins)
++            if build.returncode != 0:
++                text = (build.stderr or build.stdout).decode("utf-8", errors="replace")[:MAX_OUTPUT_BYTES]
++                return [_result(COMPILE_ERROR, compile_output=text)] * len(stdins)
++
++        return [_run_once(spec, workdir, stdin, language_id, float(time_limit_seconds), int(memory_limit_mb))
++                for stdin in stdins]
++    finally:
++        shutil.rmtree(workdir, ignore_errors=True)
+diff --git a/backend/app/main.py b/backend/app/main.py
+index ba79500..1a64ba2 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -42,6 +42,10 @@ app.add_middleware(
+     allow_headers=["*"],
+ )
+ 
++# Coding questions (judged by Judge0) - see app/coding.py
++from app import coding
++app.include_router(coding.router)
++
+ @app.get("/")
+ def home():
+     return {
+@@ -190,6 +194,7 @@ def list_available_exams(
+             "start_time": exam.start_time,
+             "end_time": exam.end_time,
+             "questions": [{}] * questions_shown,  # length = 10 so the card shows "10 questions"
++            "coding_problem_count": len(exam.coding_problems),
+         })
+     return result
+ 
+@@ -231,7 +236,7 @@ def get_exam(
+         all_questions = db.query(models.Question).filter(
+             models.Question.exam_id == exam_id
+         ).all()
+-        if not all_questions:
++        if not all_questions and not exam.coding_problems:
+             raise HTTPException(status_code=400, detail="This exam has no questions")
+ 
+         num_to_pick = min(10, len(all_questions))
+@@ -272,6 +277,7 @@ def get_exam(
+         "start_time": exam.start_time,
+         "end_time": exam.end_time,
+         "questions": questions,
++        "coding_problems": coding.student_problem_views(exam),  # statements + sample tests only
+         "remaining_seconds": remaining_seconds,
+         "session_status": session.status,
+     }
+@@ -332,7 +338,12 @@ def submit_exam(
+         print(f"QID {qid}: submitted='{submitted_text}' | correct='{correct_text}' | match={submitted_text.strip() == correct_text.strip() if (submitted_text and correct_text) else False}")
+         if submitted_text and correct_text and submitted_text.strip() == correct_text.strip():
+             score += 1
+-            
++
++    # Coding problems: score from the student's best server-side graded code submissions
++    coding_earned, coding_total = coding.coding_score(db, exam_id, current_user.id)
++    score += coding_earned
++    total_questions += coding_total
++
+     new_submission = models.Submission(
+         exam_id=exam_id,
+         student_id=current_user.id,
+@@ -581,8 +592,12 @@ def create_exam(
+     if current_user.role != "admin":
+         raise HTTPException(status_code=403, detail="Only admins can create exams")
+ 
+-    if not exam_data.questions:
+-        raise HTTPException(status_code=400, detail="An exam must have at least one question")
++    if not exam_data.questions and not exam_data.coding_problems:
++        raise HTTPException(status_code=400, detail="An exam must have at least one question or coding problem")
++
++    # Validate coding problems up front so a bad one doesn't leave a half-created exam behind
++    for coding_problem in exam_data.coding_problems:
++        coding.validate_problem(coding_problem)
+ 
+     now = datetime.now()
+     new_exam = models.Exam(
+@@ -608,11 +623,19 @@ def create_exam(
+             correct_answer=q.correct_answer.upper(),
+         )
+         db.add(question)
++
++    for coding_problem in exam_data.coding_problems:
++        coding.create_problem(db, new_exam.id, coding_problem)
+     db.commit()
+ 
+-    audit.log_event("EXAM_CREATED", current_user.email, f"exam_id={new_exam.id} title='{new_exam.title}' questions={len(exam_data.questions)}")
++    audit.log_event("EXAM_CREATED", current_user.email, f"exam_id={new_exam.id} title='{new_exam.title}' questions={len(exam_data.questions)} coding_problems={len(exam_data.coding_problems)}")
+ 
+-    return {"id": new_exam.id, "title": new_exam.title, "question_count": len(exam_data.questions)}
++    return {
++        "id": new_exam.id,
++        "title": new_exam.title,
++        "question_count": len(exam_data.questions),
++        "coding_problem_count": len(exam_data.coding_problems),
++    }
+ 
+ 
+ # ----------- UPLOAD CSV TO CREATE EXAM (Admin only) -----------
+@@ -697,6 +720,7 @@ def delete_exam(
+     db.query(models.Violation).filter(models.Violation.exam_id == exam_id).delete()
+     db.query(models.Submission).filter(models.Submission.exam_id == exam_id).delete()
+     db.query(models.ExamSession).filter(models.ExamSession.exam_id == exam_id).delete()
++    coding.delete_exam_coding_data(db, exam_id)
+     db.query(models.Question).filter(models.Question.exam_id == exam_id).delete()
+     db.delete(exam)
+     db.commit()
+@@ -753,6 +777,7 @@ def reset_student_attempt(
+         models.ExamSession.student_id == student_id,
+         models.ExamSession.exam_id == exam_id,
+     ).delete()
++    coding.delete_student_code(db, student_id, exam_id)
+     db.commit()
+ 
+     audit.log_event("ATTEMPT_RESET", current_user.email, f"student_id={student_id} exam_id={exam_id}")
+@@ -803,6 +828,7 @@ def delete_student(
+     db.query(models.Violation).filter(models.Violation.student_id == student_id).delete()
+     db.query(models.Submission).filter(models.Submission.student_id == student_id).delete()
+     db.query(models.ExamSession).filter(models.ExamSession.student_id == student_id).delete()
++    coding.delete_student_code(db, student_id)
+     db.delete(student)
+     db.commit()
+ 
+diff --git a/backend/app/models.py b/backend/app/models.py
+index d742ec0..43c4454 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -1,4 +1,4 @@
+-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey
++from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Boolean, Float
+ from sqlalchemy.sql import func
+ from sqlalchemy.orm import relationship
+ from app.database import Base
+@@ -28,6 +28,12 @@ class Exam(Base):
+     created_at = Column(DateTime(timezone=True), server_default=func.now())
+ 
+     questions = relationship("Question", back_populates="exam", cascade="all, delete-orphan")
++    coding_problems = relationship(
++        "CodingProblem",
++        back_populates="exam",
++        cascade="all, delete-orphan",
++        order_by="CodingProblem.id",
++    )
+ 
+ 
+ class Question(Base):
+@@ -76,4 +82,59 @@ class ExamSession(Base):
+     student_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+     question_data = Column(Text, nullable=False)  # JSON: locked questions + shuffled options
+     started_at = Column(DateTime(timezone=True), server_default=func.now())
+-    status = Column(String, default="in_progress")  # in_progress / submitted / terminated
+\ No newline at end of file
++    status = Column(String, default="in_progress")  # in_progress / submitted / terminated
++
++# ----------------------------------------------------------------------------
++# Coding questions (executed and judged by Judge0)
++# ----------------------------------------------------------------------------
++class CodingProblem(Base):
++    __tablename__ = "coding_problems"
++
++    id = Column(Integer, primary_key=True, index=True)
++    exam_id = Column(Integer, ForeignKey("exams.id"), nullable=False, index=True)
++    title = Column(String, nullable=False)
++    statement = Column(Text, nullable=False)        # plain text / markdown-ish problem statement
++    input_format = Column(Text, nullable=True)
++    output_format = Column(Text, nullable=True)
++    constraints = Column(Text, nullable=True)
++    points = Column(Integer, nullable=False, default=10)   # weight inside the exam score
++    time_limit_seconds = Column(Float, nullable=False, default=2.0)
++    memory_limit_mb = Column(Integer, nullable=False, default=256)
++    created_at = Column(DateTime(timezone=True), server_default=func.now())
++
++    exam = relationship("Exam", back_populates="coding_problems")
++    test_cases = relationship(
++        "TestCase",
++        back_populates="problem",
++        cascade="all, delete-orphan",
++        order_by="TestCase.id",
++    )
++
++
++class TestCase(Base):
++    __tablename__ = "coding_test_cases"
++    __test__ = False  # not a pytest class, despite the name
++
++    id = Column(Integer, primary_key=True, index=True)
++    problem_id = Column(Integer, ForeignKey("coding_problems.id"), nullable=False, index=True)
++    input_data = Column(Text, nullable=False, default="")
++    expected_output = Column(Text, nullable=False)
++    is_sample = Column(Boolean, nullable=False, default=False)  # sample cases are shown to candidates
++
++    problem = relationship("CodingProblem", back_populates="test_cases")
++
++
++class CodeSubmission(Base):
++    __tablename__ = "code_submissions"
++
++    id = Column(Integer, primary_key=True, index=True)
++    exam_id = Column(Integer, ForeignKey("exams.id"), nullable=False, index=True)
++    problem_id = Column(Integer, ForeignKey("coding_problems.id"), nullable=False, index=True)
++    student_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
++    language_id = Column(Integer, nullable=False)
++    source_code = Column(Text, nullable=False)
++    verdict = Column(String, nullable=False)        # Accepted / Wrong Answer / Compilation Error / ...
++    passed = Column(Integer, nullable=False, default=0)
++    total = Column(Integer, nullable=False, default=0)
++    details = Column(Text, nullable=True)           # JSON: per-test verdicts (no hidden data)
++    created_at = Column(DateTime(timezone=True), server_default=func.now())
+diff --git a/backend/app/schemas.py b/backend/app/schemas.py
+index 52806bb..edb8327 100644
+--- a/backend/app/schemas.py
++++ b/backend/app/schemas.py
+@@ -71,8 +71,9 @@ class ExamCreate(BaseModel):
+     duration_minutes: int
+     start_time: datetime | None = None
+     end_time: datetime | None = None
+-    questions: List[QuestionCreate]
+-    
++    questions: List[QuestionCreate] = []
++    coding_problems: List["CodingProblemCreate"] = []
++
+ class ExamResponse(BaseModel):
+     id: int
+     title: str
+@@ -137,4 +138,43 @@ class ViolationWithStudent(BaseModel):
+     student_id: int
+ 
+     class Config:
+-        from_attributes = True
+\ No newline at end of file
++        from_attributes = True
++
++# ----------- CODING PROBLEM SCHEMAS (Judge0) -----------
++
++class TestCaseCreate(BaseModel):
++    __test__ = False  # not a pytest class, despite the name
++
++    input_data: str = ""
++    expected_output: str
++    is_sample: bool = False  # sample cases are visible to candidates; the rest stay hidden
++
++
++class CodingProblemCreate(BaseModel):
++    title: str
++    statement: str
++    input_format: str | None = None
++    output_format: str | None = None
++    constraints: str | None = None
++    points: int = 10
++    time_limit_seconds: float = 2.0
++    memory_limit_mb: int = 256
++    test_cases: List[TestCaseCreate]
++
++
++class CodingProblemBulkCreate(BaseModel):
++    problems: List[CodingProblemCreate]
++
++
++class CodeRunRequest(BaseModel):
++    language_id: int
++    source_code: str
++    custom_input: str | None = None  # if set, run once against this stdin instead of the samples
++
++
++class CodeSubmitRequest(BaseModel):
++    language_id: int
++    source_code: str
++
++
++ExamCreate.model_rebuild()
+diff --git a/backend/sample_coding_problems.json b/backend/sample_coding_problems.json
+new file mode 100644
+index 0000000..5891d0d
+--- /dev/null
++++ b/backend/sample_coding_problems.json
+@@ -0,0 +1,55 @@
++{
++  "problems": [
++    {
++      "title": "Sum of Two Numbers",
++      "statement": "Read two integers from one line and print their sum.",
++      "input_format": "A single line with two integers A and B separated by a space.",
++      "output_format": "A single integer: A + B.",
++      "constraints": "-1000000000 <= A, B <= 1000000000",
++      "points": 10,
++      "time_limit_seconds": 2,
++      "memory_limit_mb": 256,
++      "test_cases": [
++        { "input_data": "3 4\n", "expected_output": "7\n", "is_sample": true },
++        { "input_data": "-10 4\n", "expected_output": "-6\n", "is_sample": true },
++        { "input_data": "0 0\n", "expected_output": "0\n", "is_sample": false },
++        { "input_data": "1000000000 1000000000\n", "expected_output": "2000000000\n", "is_sample": false },
++        { "input_data": "-5 -7\n", "expected_output": "-12\n", "is_sample": false }
++      ]
++    },
++    {
++      "title": "Reverse a Word",
++      "statement": "Read a single word and print it reversed.",
++      "input_format": "One line containing a word of letters and digits (no spaces).",
++      "output_format": "The word written backwards.",
++      "constraints": "1 <= length of the word <= 100",
++      "points": 10,
++      "time_limit_seconds": 2,
++      "memory_limit_mb": 256,
++      "test_cases": [
++        { "input_data": "hello\n", "expected_output": "olleh\n", "is_sample": true },
++        { "input_data": "racecar\n", "expected_output": "racecar\n", "is_sample": true },
++        { "input_data": "a\n", "expected_output": "a\n", "is_sample": false },
++        { "input_data": "ProctorAI\n", "expected_output": "IArotcorP\n", "is_sample": false },
++        { "input_data": "Judge0\n", "expected_output": "0egduJ\n", "is_sample": false }
++      ]
++    },
++    {
++      "title": "Count the Even Numbers",
++      "statement": "You are given N integers. Print how many of them are even.",
++      "input_format": "The first line contains N. The second line contains N integers separated by spaces.",
++      "output_format": "A single integer: the number of even values.",
++      "constraints": "1 <= N <= 100000, -1000000000 <= each value <= 1000000000",
++      "points": 20,
++      "time_limit_seconds": 2,
++      "memory_limit_mb": 256,
++      "test_cases": [
++        { "input_data": "5\n1 2 3 4 6\n", "expected_output": "3\n", "is_sample": true },
++        { "input_data": "3\n7 9 11\n", "expected_output": "0\n", "is_sample": true },
++        { "input_data": "1\n0\n", "expected_output": "1\n", "is_sample": false },
++        { "input_data": "6\n2 4 6 8 10 12\n", "expected_output": "6\n", "is_sample": false },
++        { "input_data": "4\n-2 -3 -4 5\n", "expected_output": "2\n", "is_sample": false }
++      ]
++    }
++  ]
++}
+diff --git a/backend/tests/test_coding.py b/backend/tests/test_coding.py
+new file mode 100644
+index 0000000..5d6e370
+--- /dev/null
++++ b/backend/tests/test_coding.py
+@@ -0,0 +1,549 @@
++"""
++API tests for coding questions. Judge0 is replaced by a fake that "runs" source
++code according to a marker word in it, so the tests need neither Docker nor a
++network, but still exercise routing, auth, scoring, hiding of hidden tests, etc.
++"""
++import json
++import os
++import sys
++from datetime import datetime, timedelta, timezone
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import pytest
++from fastapi.testclient import TestClient
++from sqlalchemy import create_engine
++from sqlalchemy.orm import sessionmaker
++from sqlalchemy.pool import StaticPool
++
++from app.main import app
++from app.database import Base, get_db
++from app import auth, coding, judge0, models
++
++app.state.limiter.enabled = False  # signup/login rate limit is irrelevant here
++
++PYTHON = 71
++PASSWORD_HASH = auth.hash_password("pw123456")  # bcrypt is slow on purpose; hash once, not per test
++
++
++# ---------------------------------------------------------------------------
++# fake Judge0
++# ---------------------------------------------------------------------------
++def _raw(status_id=3, status="Accepted", stdout="", stderr="", compile_output=""):
++    return {"status_id": status_id, "status": status, "stdout": stdout, "stderr": stderr,
++            "compile_output": compile_output, "message": "", "time": 0.01, "memory": 1024}
++
++
++def _sum_of(stdin: str) -> str:
++    return str(sum(int(x) for x in stdin.split())) + "\n"
++
++
++class FakeJudge0:
++    """Behaviour is chosen by a marker word inside the submitted source code."""
++
++    def __init__(self):
++        self.calls = []   # (source_code, [stdins]) per execute() call
++
++    def __call__(self, source_code, language_id, stdins, time_limit_seconds=2.0,
++                 memory_limit_mb=256, client=None):
++        self.calls.append((source_code, list(stdins)))
++        if "DOWN" in source_code:
++            raise judge0.Judge0Error("connection refused")
++        out = []
++        for i, stdin in enumerate(stdins):
++            if "COMPILE_ERROR" in source_code:
++                out.append(_raw(6, "Compilation Error", compile_output="error: boom"))
++            elif "CRASH" in source_code:
++                out.append(_raw(11, "Runtime Error (NZEC)", stderr="Traceback ..."))
++            elif "TLE" in source_code:
++                out.append(_raw(5, "Time Limit Exceeded"))
++            elif "WRONG" in source_code:
++                out.append(_raw(stdout="-1\n"))
++            elif "PARTIAL" in source_code:  # even-numbered tests right, odd-numbered wrong
++                out.append(_raw(stdout=_sum_of(stdin) if i % 2 == 0 else "-1\n"))
++            else:
++                out.append(_raw(stdout=_sum_of(stdin)))
++        return out
++
++
++# ---------------------------------------------------------------------------
++# fixtures
++# ---------------------------------------------------------------------------
++class Env:
++    pass
++
++
++@pytest.fixture()
++def env(monkeypatch):
++    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
++    Base.metadata.create_all(bind=engine)
++    Session = sessionmaker(autocommit=False, autoflush=False, bind=engine)
++
++    def override_get_db():
++        db = Session()
++        try:
++            yield db
++        finally:
++            db.close()
++
++    previous = app.dependency_overrides.get(get_db)
++    app.dependency_overrides[get_db] = override_get_db
++    coding.reset_throttle()
++
++    fake = FakeJudge0()
++    monkeypatch.setattr(judge0, "execute", fake)
++
++    e = Env()
++    e.Session = Session
++    e.client = TestClient(app)
++    e.fake = fake
++
++    def make_user(email, role):
++        db = Session()
++        user = models.User(full_name=email.split("@")[0], email=email,
++                           hashed_password=PASSWORD_HASH, role=role)
++        db.add(user)
++        db.commit()
++        db.refresh(user)
++        uid = user.id
++        db.close()
++        token = auth.create_access_token({"sub": str(uid), "role": role})
++        return uid, {"Authorization": f"Bearer {token}"}
++
++    e.admin_id, e.admin = make_user("admin@test.com", "admin")
++    e.student_id, e.student = make_user("student@test.com", "student")
++    e.student2_id, e.student2 = make_user("student2@test.com", "student")
++    yield e
++
++    if previous is None:
++        app.dependency_overrides.pop(get_db, None)
++    else:
++        app.dependency_overrides[get_db] = previous
++
++
++def sum_problem(points=10, title="Sum of two numbers"):
++    return {
++        "title": title,
++        "statement": "Read two integers and print their sum.",
++        "points": points,
++        "test_cases": [
++            {"input_data": "1 2\n", "expected_output": "3\n", "is_sample": True},
++            {"input_data": "10 20\n", "expected_output": "30\n", "is_sample": True},
++            {"input_data": "-5 5\n", "expected_output": "0\n", "is_sample": False},
++            {"input_data": "1000 2345\n", "expected_output": "3345\n", "is_sample": False},
++        ],
++    }
++
++
++MCQ = {"question_text": "2+2?", "option_a": "3", "option_b": "4", "option_c": "5", "option_d": "6",
++       "correct_answer": "B"}
++
++
++def create_exam(e, problems=(), questions=(), title="Mixed exam", minutes=30):
++    r = e.client.post("/exams/create", headers=e.admin, json={
++        "title": title, "description": "d", "duration_minutes": minutes,
++        "questions": list(questions), "coding_problems": list(problems),
++    })
++    assert r.status_code == 200, r.text
++    return r.json()["id"]
++
++
++def start_exam(e, exam_id, headers=None):
++    r = e.client.get(f"/exams/{exam_id}", headers=headers or e.student)
++    assert r.status_code == 200, r.text
++    return r.json()
++
++
++def problem_id_of(e, exam_id):
++    r = e.client.get(f"/exams/{exam_id}/coding-problems", headers=e.admin)
++    return r.json()[0]["id"]
++
++
++def run_url(exam_id, pid):
++    return f"/exams/{exam_id}/coding-problems/{pid}/run"
++
++
++def submit_url(exam_id, pid):
++    return f"/exams/{exam_id}/coding-problems/{pid}/submit"
++
++
++def count(e, model):
++    db = e.Session()
++    try:
++        return db.query(model).count()
++    finally:
++        db.close()
++
++
++# ---------------------------------------------------------------------------
++# authoring
++# ---------------------------------------------------------------------------
++def test_create_coding_only_exam(env):
++    r = env.client.post("/exams/create", headers=env.admin, json={
++        "title": "Coding round", "duration_minutes": 45, "questions": [], "coding_problems": [sum_problem()],
++    })
++    assert r.status_code == 200
++    assert r.json()["coding_problem_count"] == 1 and r.json()["question_count"] == 0
++
++
++def test_exam_needs_at_least_one_question_or_problem(env):
++    r = env.client.post("/exams/create", headers=env.admin,
++                        json={"title": "Empty", "duration_minutes": 5, "questions": [], "coding_problems": []})
++    assert r.status_code == 400
++
++
++def test_students_cannot_author_problems(env):
++    exam_id = create_exam(env, questions=[MCQ])
++    r = env.client.post(f"/exams/{exam_id}/coding-problems", headers=env.student, json=sum_problem())
++    assert r.status_code == 403
++    assert env.client.get(f"/exams/{exam_id}/coding-problems", headers=env.student).status_code == 403
++    assert env.client.get(f"/exams/{exam_id}/coding-submissions", headers=env.student).status_code == 403
++
++
++@pytest.mark.parametrize("mutate,fragment", [
++    (lambda p: p.update(test_cases=[]), "at least one test case"),
++    (lambda p: p["test_cases"][0].update(expected_output="  "), "empty expected output"),
++    (lambda p: p.update(title="  "), "title"),
++    (lambda p: p.update(points=0), "points"),
++    (lambda p: p.update(time_limit_seconds=99), "time limit"),
++    (lambda p: p.update(memory_limit_mb=512), "memory limit"),
++])
++def test_problem_validation(env, mutate, fragment):
++    exam_id = create_exam(env, questions=[MCQ])
++    p = sum_problem()
++    mutate(p)
++    r = env.client.post(f"/exams/{exam_id}/coding-problems", headers=env.admin, json=p)
++    assert r.status_code == 400 and fragment in r.json()["detail"]
++
++
++def test_bulk_import_is_all_or_nothing(env):
++    exam_id = create_exam(env, questions=[MCQ])
++    bad = sum_problem(title="Bad")
++    bad["test_cases"] = []
++    r = env.client.post(f"/exams/{exam_id}/coding-problems/bulk", headers=env.admin,
++                        json={"problems": [sum_problem(title="Good"), bad]})
++    assert r.status_code == 400
++    assert count(env, models.CodingProblem) == 0
++
++    r = env.client.post(f"/exams/{exam_id}/coding-problems/bulk", headers=env.admin,
++                        json={"problems": [sum_problem(title="A"), sum_problem(title="B")]})
++    assert r.status_code == 200 and r.json()["count"] == 2
++
++
++def test_add_and_delete_problem_on_existing_exam(env):
++    exam_id = create_exam(env, questions=[MCQ])
++    r = env.client.post(f"/exams/{exam_id}/coding-problems", headers=env.admin, json=sum_problem())
++    assert r.status_code == 200
++    pid = r.json()["id"]
++    assert len(r.json()["test_cases"]) == 4
++
++    assert env.client.delete(f"/coding-problems/{pid}", headers=env.admin).status_code == 200
++    assert count(env, models.CodingProblem) == 0 and count(env, models.TestCase) == 0
++
++
++def test_unknown_exam_404(env):
++    r = env.client.post("/exams/999/coding-problems", headers=env.admin, json=sum_problem())
++    assert r.status_code == 404
++
++
++# ---------------------------------------------------------------------------
++# what candidates can see
++# ---------------------------------------------------------------------------
++def test_candidate_sees_samples_but_never_hidden_tests(env):
++    exam_id = create_exam(env, problems=[sum_problem()], questions=[MCQ])
++    data = start_exam(env, exam_id)
++
++    problem = data["coding_problems"][0]
++    assert [s["input"] for s in problem["samples"]] == ["1 2\n", "10 20\n"]
++    assert problem["hidden_test_count"] == 2
++    blob = json.dumps(data)
++    assert "3345" not in blob and "2345" not in blob   # hidden expected output / input
++
++
++def test_coding_only_exam_can_be_started(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    data = start_exam(env, exam_id)
++    assert data["questions"] == [] and len(data["coding_problems"]) == 1
++
++
++def test_available_exams_report_coding_count(env):
++    create_exam(env, problems=[sum_problem(), sum_problem(title="Two")])
++    r = env.client.get("/exams/available", headers=env.student)
++    assert r.json()[0]["coding_problem_count"] == 2
++
++
++def test_languages_endpoint(env):
++    r = env.client.get("/coding/languages", headers=env.student)
++    assert r.status_code == 200
++    assert {l["id"] for l in r.json()} == set(judge0.SUPPORTED_LANGUAGES)
++
++
++# ---------------------------------------------------------------------------
++# run (practice)
++# ---------------------------------------------------------------------------
++def test_run_uses_only_sample_tests(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++
++    r = env.client.post(run_url(exam_id, pid), headers=env.student,
++                        json={"language_id": PYTHON, "source_code": "print(sum(map(int,input().split())))"})
++    assert r.status_code == 200
++    body = r.json()
++    assert body["mode"] == "samples" and body["passed"] == 2 and body["total"] == 2
++    assert env.fake.calls[-1][1] == ["1 2\n", "10 20\n"]      # hidden inputs never executed on 'run'
++    assert count(env, models.CodeSubmission) == 0             # runs are not stored
++
++
++def test_run_with_custom_input(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    r = env.client.post(run_url(exam_id, pid), headers=env.student,
++                        json={"language_id": PYTHON, "source_code": "x", "custom_input": "4 5"})
++    assert r.status_code == 200
++    assert r.json()["mode"] == "custom" and r.json()["stdout"] == "9\n"
++
++
++# ---------------------------------------------------------------------------
++# submit (graded)
++# ---------------------------------------------------------------------------
++def test_submit_accepted_hides_hidden_details(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++
++    r = env.client.post(submit_url(exam_id, pid), headers=env.student,
++                        json={"language_id": PYTHON, "source_code": "ok"})
++    assert r.status_code == 200
++    body = r.json()
++    assert body["verdict"] == "Accepted" and body["passed"] == 4 and body["total"] == 4
++    assert [c["label"] for c in body["cases"]] == ["Sample 1", "Sample 2", "Hidden 1", "Hidden 2"]
++    for case in body["cases"]:
++        if not case["is_sample"]:
++            assert not {"input", "expected_output", "actual_output"} & case.keys()
++    assert "3345" not in json.dumps(body) and "2345" not in json.dumps(body)
++    assert count(env, models.CodeSubmission) == 1
++
++
++@pytest.mark.parametrize("marker,verdict", [
++    ("WRONG", "Wrong Answer"),
++    ("COMPILE_ERROR", "Compilation Error"),
++    ("CRASH", "Runtime Error"),
++    ("TLE", "Time Limit Exceeded"),
++])
++def test_submit_failure_verdicts(env, marker, verdict):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    r = env.client.post(submit_url(exam_id, pid), headers=env.student,
++                        json={"language_id": PYTHON, "source_code": marker})
++    assert r.status_code == 200
++    assert r.json()["verdict"] == verdict and r.json()["passed"] == 0
++    if marker == "COMPILE_ERROR":
++        assert "boom" in r.json()["compile_output"]
++
++
++def test_best_submission_counts_and_progress_restores_code(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    url = submit_url(exam_id, pid)
++
++    env.client.post(url, headers=env.student, json={"language_id": PYTHON, "source_code": "PARTIAL"})
++    best = env.client.post(url, headers=env.student, json={"language_id": PYTHON, "source_code": "ok"}).json()
++    assert best["best_passed"] == 4
++    after_worse = env.client.post(url, headers=env.student, json={"language_id": PYTHON, "source_code": "WRONG"}).json()
++    assert after_worse["passed"] == 0 and after_worse["best_passed"] == 4   # a worse retry can't lower the best
++
++    progress = env.client.get(f"/exams/{exam_id}/coding-progress", headers=env.student).json()
++    assert len(progress) == 1
++    assert progress[0]["best_passed"] == 4 and progress[0]["attempts"] == 3
++    assert progress[0]["last_source_code"] == "WRONG"       # editor restores the *latest* code
++
++
++def test_progress_is_per_student(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    env.client.post(submit_url(exam_id, pid), headers=env.student, json={"language_id": PYTHON, "source_code": "ok"})
++    assert env.client.get(f"/exams/{exam_id}/coding-progress", headers=env.student2).json() == []
++
++
++# ---------------------------------------------------------------------------
++# scoring into the exam result
++# ---------------------------------------------------------------------------
++def test_exam_score_combines_mcq_and_coding(env):
++    exam_id = create_exam(env, problems=[sum_problem(points=10)], questions=[MCQ])
++    pid = problem_id_of(env, exam_id)
++    data = start_exam(env, exam_id)
++    qid = data["questions"][0]["id"]
++
++    # PARTIAL passes tests 0 and 2 of 4 -> floor(10 * 2 / 4) = 5 points
++    env.client.post(submit_url(exam_id, pid), headers=env.student,
++                    json={"language_id": PYTHON, "source_code": "PARTIAL"})
++    r = env.client.post(f"/exams/{exam_id}/submit", headers=env.student, json={"answers": {str(qid): "4"}})
++    assert r.status_code == 200
++    assert r.json()["score"] == 1 + 5
++    assert r.json()["total_questions"] == 1 + 10
++
++
++def test_full_coding_marks_need_every_test(env):
++    exam_id = create_exam(env, problems=[sum_problem(points=10)])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    env.client.post(submit_url(exam_id, pid), headers=env.student, json={"language_id": PYTHON, "source_code": "ok"})
++    r = env.client.post(f"/exams/{exam_id}/submit", headers=env.student, json={"answers": {}})
++    assert (r.json()["score"], r.json()["total_questions"]) == (10, 10)
++
++
++def test_unattempted_coding_problem_scores_zero_but_counts_in_total(env):
++    exam_id = create_exam(env, problems=[sum_problem(points=10)], questions=[MCQ])
++    data = start_exam(env, exam_id)
++    qid = data["questions"][0]["id"]
++    r = env.client.post(f"/exams/{exam_id}/submit", headers=env.student, json={"answers": {str(qid): "4"}})
++    assert (r.json()["score"], r.json()["total_questions"]) == (1, 11)
++
++
++def test_admin_results_show_combined_score(env):
++    exam_id = create_exam(env, problems=[sum_problem(points=10)])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    env.client.post(submit_url(exam_id, pid), headers=env.student, json={"language_id": PYTHON, "source_code": "ok"})
++    env.client.post(f"/exams/{exam_id}/submit", headers=env.student, json={"answers": {}})
++    results = env.client.get(f"/exams/{exam_id}/results", headers=env.admin).json()["results"]
++    assert results[0]["score"] == 10 and results[0]["percentage"] == 100
++
++
++# ---------------------------------------------------------------------------
++# access control / abuse
++# ---------------------------------------------------------------------------
++def test_cannot_run_before_starting_exam(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    r = env.client.post(run_url(exam_id, pid), headers=env.student, json={"language_id": PYTHON, "source_code": "x"})
++    assert r.status_code == 400
++    assert env.fake.calls == []
++
++
++def test_cannot_run_after_termination_or_submission(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    env.client.post(f"/exams/{exam_id}/terminate", headers=env.student)
++    r = env.client.post(submit_url(exam_id, pid), headers=env.student, json={"language_id": PYTHON, "source_code": "ok"})
++    assert r.status_code == 403
++
++    exam2 = create_exam(env, problems=[sum_problem()], title="Second")
++    pid2 = problem_id_of(env, exam2)
++    start_exam(env, exam2, env.student2)
++    env.client.post(f"/exams/{exam2}/submit", headers=env.student2, json={"answers": {}})
++    r = env.client.post(submit_url(exam2, pid2), headers=env.student2, json={"language_id": PYTHON, "source_code": "ok"})
++    assert r.status_code == 403
++
++
++def test_cannot_submit_code_after_time_is_up(env):
++    exam_id = create_exam(env, problems=[sum_problem()], minutes=10)
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++
++    db = env.Session()
++    session = db.query(models.ExamSession).first()
++    session.started_at = datetime.now(timezone.utc) - timedelta(minutes=15)   # 10 min exam, 15 min ago
++    db.commit()
++    db.close()
++
++    r = env.client.post(submit_url(exam_id, pid), headers=env.student, json={"language_id": PYTHON, "source_code": "ok"})
++    assert r.status_code == 400 and "Time is up" in r.json()["detail"]
++
++
++def test_problem_from_another_exam_is_rejected(env):
++    exam1 = create_exam(env, problems=[sum_problem()], title="One")
++    exam2 = create_exam(env, problems=[sum_problem()], title="Two")
++    start_exam(env, exam1)
++    other_pid = problem_id_of(env, exam2)
++    r = env.client.post(submit_url(exam1, other_pid), headers=env.student, json={"language_id": PYTHON, "source_code": "ok"})
++    assert r.status_code == 404
++
++
++def test_rejects_unsupported_language_and_bad_source(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    url = submit_url(exam_id, pid)
++    assert env.client.post(url, headers=env.student, json={"language_id": 9999, "source_code": "ok"}).status_code == 400
++    assert env.client.post(url, headers=env.student, json={"language_id": PYTHON, "source_code": "   "}).status_code == 400
++    huge = "x" * (coding.MAX_SOURCE_CHARS + 1)
++    assert env.client.post(url, headers=env.student, json={"language_id": PYTHON, "source_code": huge}).status_code == 400
++    assert env.fake.calls == []
++
++
++def test_judge0_down_returns_503_and_stores_nothing(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    r = env.client.post(submit_url(exam_id, pid), headers=env.student, json={"language_id": PYTHON, "source_code": "DOWN"})
++    assert r.status_code == 503
++    assert "connection refused" not in r.text            # internals aren't leaked to the browser
++    assert count(env, models.CodeSubmission) == 0
++
++
++def test_per_user_throttle(env, monkeypatch):
++    monkeypatch.setattr(coding, "EXEC_PER_MINUTE", 2)
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    start_exam(env, exam_id, env.student2)
++    body = {"language_id": PYTHON, "source_code": "ok"}
++
++    assert env.client.post(run_url(exam_id, pid), headers=env.student, json=body).status_code == 200
++    assert env.client.post(run_url(exam_id, pid), headers=env.student, json=body).status_code == 200
++    assert env.client.post(run_url(exam_id, pid), headers=env.student, json=body).status_code == 429
++    # another candidate (even from the same IP) is unaffected
++    assert env.client.post(run_url(exam_id, pid), headers=env.student2, json=body).status_code == 200
++
++
++# ---------------------------------------------------------------------------
++# admin review + cleanup
++# ---------------------------------------------------------------------------
++def test_admin_can_review_code_submissions(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    env.client.post(submit_url(exam_id, pid), headers=env.student, json={"language_id": PYTHON, "source_code": "my solution"})
++    rows = env.client.get(f"/exams/{exam_id}/coding-submissions", headers=env.admin).json()
++    assert len(rows) == 1
++    assert rows[0]["student_email"] == "student@test.com"
++    assert rows[0]["source_code"] == "my solution" and rows[0]["verdict"] == "Accepted"
++    assert rows[0]["language"].startswith("Python")
++
++
++def test_reset_attempt_clears_code_submissions(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    env.client.post(submit_url(exam_id, pid), headers=env.student, json={"language_id": PYTHON, "source_code": "ok"})
++    assert count(env, models.CodeSubmission) == 1
++    r = env.client.post(f"/admin/students/{env.student_id}/reset-attempt?exam_id={exam_id}", headers=env.admin)
++    assert r.status_code == 200
++    assert count(env, models.CodeSubmission) == 0
++
++
++def test_deleting_student_clears_their_code(env):
++    exam_id = create_exam(env, problems=[sum_problem()])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    env.client.post(submit_url(exam_id, pid), headers=env.student, json={"language_id": PYTHON, "source_code": "ok"})
++    assert env.client.delete(f"/admin/students/{env.student_id}", headers=env.admin).status_code == 200
++    assert count(env, models.CodeSubmission) == 0
++
++
++def test_deleting_exam_removes_all_coding_data(env):
++    exam_id = create_exam(env, problems=[sum_problem()], questions=[MCQ])
++    pid = problem_id_of(env, exam_id)
++    start_exam(env, exam_id)
++    env.client.post(submit_url(exam_id, pid), headers=env.student, json={"language_id": PYTHON, "source_code": "ok"})
++
++    assert env.client.delete(f"/exams/{exam_id}", headers=env.admin).status_code == 200
++    for model in (models.CodingProblem, models.TestCase, models.CodeSubmission, models.Exam):
++        assert count(env, model) == 0, model.__name__
+diff --git a/backend/tests/test_judge0_client.py b/backend/tests/test_judge0_client.py
+new file mode 100644
+index 0000000..f6007dc
+--- /dev/null
++++ b/backend/tests/test_judge0_client.py
+@@ -0,0 +1,197 @@
++"""Unit tests for the Judge0 client. No real Judge0 needed: httpx.MockTransport plays its part."""
++import base64
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import httpx
++import pytest
++
++from app import judge0
++
++
++def b64(text: str) -> str:
++    return base64.b64encode(text.encode()).decode()
++
++
++def result(status_id=3, description="Accepted", stdout="", stderr=None, compile_output=None):
++    return {
++        # like real Judge0 (default field set): the id lives inside `status`, there is no top-level status_id
++        "status": {"id": status_id, "description": description},
++        "stdout": b64(stdout) if stdout else None,
++        "stderr": b64(stderr) if stderr else None,
++        "compile_output": b64(compile_output) if compile_output else None,
++        "message": None,
++        "time": "0.012",
++        "memory": 2048,
++    }
++
++
++class FakeJudge0:
++    """Tiny in-memory Judge0: POST /submissions/batch -> tokens; GET polls 'processing' once, then results."""
++
++    def __init__(self, outputs, processing_polls=1):
++        self.outputs = outputs            # one result dict per submission, in creation order
++        self.processing_polls = processing_polls
++        self.posted = []                  # every submission payload received
++        self.post_calls = 0
++        self.polls = 0
++        self.last_headers = None
++
++    def __call__(self, request: httpx.Request) -> httpx.Response:
++        self.last_headers = request.headers
++        if request.method == "POST" and request.url.path == "/submissions/batch":
++            assert request.url.params["base64_encoded"] == "true"
++            body = json.loads(request.content)
++            start = len(self.posted)
++            self.posted.extend(body["submissions"])
++            self.post_calls += 1
++            return httpx.Response(201, json=[{"token": f"t{start + i}"} for i in range(len(body["submissions"]))])
++
++        if request.method == "GET" and request.url.path == "/submissions/batch":
++            self.polls += 1
++            tokens = request.url.params["tokens"].split(",")
++            items = []
++            for token in tokens:
++                item = dict(self.outputs[int(token[1:])])
++                if self.polls <= self.processing_polls:
++                    item = result(status_id=2, description="Processing")
++                item["token"] = token
++                items.append(item)
++            return httpx.Response(200, json={"submissions": items})
++
++        return httpx.Response(404)
++
++
++@pytest.fixture(autouse=True)
++def fast_polling(monkeypatch):
++    monkeypatch.setattr(judge0, "POLL_INTERVAL_SECONDS", 0)
++
++
++def client_for(fake) -> httpx.Client:
++    return httpx.Client(transport=httpx.MockTransport(fake))
++
++
++# ---- transport -------------------------------------------------------------
++
++def test_execute_sends_base64_stdin_limits_and_no_expected_output():
++    fake = FakeJudge0([result(stdout="3\n")])
++    out = judge0.execute("print(1+2)", 71, ["1 2\n"], 2.0, 256, client=client_for(fake))
++
++    sent = fake.posted[0]
++    assert base64.b64decode(sent["source_code"]).decode() == "print(1+2)"
++    assert base64.b64decode(sent["stdin"]).decode() == "1 2\n"
++    assert sent["language_id"] == 71
++    assert sent["cpu_time_limit"] == 2.0
++    assert sent["memory_limit"] == 256000              # Judge0 wants KB; 256000 is its documented max
++    assert sent["wall_time_limit"] >= 1                # Judge0 >= 1.13 requirement
++    assert "expected_output" not in sent               # expected output never leaves our DB
++    assert out[0]["stdout"] == "3\n"
++    assert out[0]["time"] == 0.012
++
++
++def test_execute_polls_until_finished():
++    fake = FakeJudge0([result(stdout="a"), result(stdout="b")], processing_polls=3)
++    out = judge0.execute("x", 71, ["", ""], client=client_for(fake))
++    assert fake.polls == 4
++    assert [r["stdout"] for r in out] == ["a", "b"]
++
++
++def test_execute_splits_large_batches_and_keeps_order():
++    outputs = [result(stdout=str(i)) for i in range(45)]
++    fake = FakeJudge0(outputs, processing_polls=0)
++    out = judge0.execute("x", 71, [str(i) for i in range(45)], client=client_for(fake))
++    assert fake.post_calls == 3                        # 20 + 20 + 5
++    assert [r["stdout"] for r in out] == [str(i) for i in range(45)]
++
++
++def test_http_error_becomes_judge0error():
++    def broken(request):
++        return httpx.Response(500, text="boom")
++    with pytest.raises(judge0.Judge0Error):
++        judge0.execute("x", 71, ["1"], client=client_for(broken))
++
++
++def test_rejected_submission_in_batch_becomes_judge0error():
++    def reject(request):
++        return httpx.Response(201, json=[{"language_id": ["language with id 999 doesn't exist"]}])
++    with pytest.raises(judge0.Judge0Error, match="rejected"):
++        judge0.execute("x", 999, ["1"], client=client_for(reject))
++
++
++def test_connection_error_becomes_judge0error():
++    def refuse(request):
++        raise httpx.ConnectError("refused")
++    with pytest.raises(judge0.Judge0Error):
++        judge0.execute("x", 71, ["1"], client=client_for(refuse))
++
++
++def test_poll_timeout_becomes_judge0error(monkeypatch):
++    monkeypatch.setattr(judge0, "POLL_TIMEOUT_SECONDS", 0)
++    fake = FakeJudge0([result()], processing_polls=10_000)
++    with pytest.raises(judge0.Judge0Error):
++        judge0.execute("x", 71, ["1"], client=client_for(fake))
++
++
++def test_auth_header_sent_when_configured(monkeypatch):
++    monkeypatch.setattr(judge0, "JUDGE0_AUTH_TOKEN", "secret-token")
++    monkeypatch.setattr(judge0, "JUDGE0_AUTH_HEADER", "X-Auth-Token")
++    fake = FakeJudge0([result()], processing_polls=0)
++    judge0.execute("x", 71, ["1"], client=client_for(fake))
++    assert fake.last_headers["x-auth-token"] == "secret-token"
++
++
++# ---- comparison + verdicts -------------------------------------------------
++
++@pytest.mark.parametrize("actual,expected,ok", [
++    ("3\n", "3", True),
++    ("3", "3\n\n", True),
++    ("a b  \r\nc\r\n", "a b\nc", True),          # CRLF + trailing spaces ignored
++    ("1 2", "1  2", False),                       # inner whitespace still matters
++    ("3", "4", False),
++    ("", "x", False),
++])
++def test_outputs_match(actual, expected, ok):
++    assert judge0.outputs_match(actual, expected) is ok
++
++
++@pytest.mark.parametrize("status_id,desc,expected,verdict", [
++    (3, "Accepted", "3", "Accepted"),
++    (3, "Accepted", "4", "Wrong Answer"),
++    (5, "Time Limit Exceeded", "3", "Time Limit Exceeded"),
++    (6, "Compilation Error", "3", "Compilation Error"),
++    (11, "Runtime Error (NZEC)", "3", "Runtime Error"),
++    (7, "Runtime Error (SIGSEGV)", "3", "Runtime Error"),
++    (13, "Internal Error", "3", "Internal Error"),
++])
++def test_verdict_mapping(status_id, desc, expected, verdict):
++    raw = judge0._clean({**result(status_id, desc, stdout="3\n"), "token": "t"})
++    assert raw["status_id"] == status_id
++    assert judge0.verdict_for(raw, expected) == verdict
++
++
++def test_judge_hides_hidden_case_details():
++    cases = [
++        {"input": "1 2\n", "expected": "3\n", "is_sample": True},
++        {"input": "SECRET-INPUT\n", "expected": "SECRET-OUTPUT\n", "is_sample": False},
++    ]
++    fake = FakeJudge0([result(stdout="3\n"), result(stdout="SECRET-OUTPUT\n")], processing_polls=0)
++    out = judge0.judge("x", 71, cases, 2.0, 256, client=client_for(fake))
++
++    assert out["verdict"] == "Accepted" and out["passed"] == 2 and out["total"] == 2
++    sample, hidden = out["cases"]
++    assert sample["label"] == "Sample 1" and sample["input"] == "1 2\n"
++    assert hidden["label"] == "Hidden 1" and hidden["passed"] is True
++    assert not {"input", "expected_output", "actual_output", "stderr"} & hidden.keys()
++    assert "SECRET" not in json.dumps(out)
++
++
++def test_judge_compile_error_is_reported_once():
++    cases = [{"input": "", "expected": "x", "is_sample": False}] * 3
++    fake = FakeJudge0([result(6, "Compilation Error", compile_output="main.cpp:1: error")] * 3, processing_polls=0)
++    out = judge0.judge("x", 54, cases, 2.0, 256, client=client_for(fake))
++    assert out["verdict"] == "Compilation Error"
++    assert out["passed"] == 0
++    assert "error" in out["compile_output"]
+diff --git a/backend/tests/test_local_runner.py b/backend/tests/test_local_runner.py
+new file mode 100644
+index 0000000..b05b705
+--- /dev/null
++++ b/backend/tests/test_local_runner.py
+@@ -0,0 +1,102 @@
++"""Tests for the Docker-free local runner (CODE_RUNNER=local). Uses the real interpreters/compilers on this machine."""
++import os
++import shutil
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++import pytest
++
++from app import judge0, local_runner
++
++PY = 71
++CASES = [
++    {"input": "3 4\n", "expected": "7\n", "is_sample": True},
++    {"input": "-5 -7\n", "expected": "-12\n", "is_sample": False},
++]
++SUM_PY = "a, b = map(int, input().split())\nprint(a + b)\n"
++
++
++@pytest.fixture(autouse=True)
++def local_mode(monkeypatch):
++    monkeypatch.setattr(judge0, "CODE_RUNNER", "local")
++
++
++def test_python_accepted_through_the_shared_judge():
++    out = judge0.judge(SUM_PY, PY, CASES, 2.0, 256)
++    assert out["verdict"] == "Accepted" and out["passed"] == 2 and out["total"] == 2
++    hidden = out["cases"][1]
++    assert "input" not in hidden and "expected_output" not in hidden  # hidden tests stay hidden
++
++
++def test_wrong_answer():
++    out = judge0.judge("print(0)", PY, CASES, 2.0, 256)
++    assert out["verdict"] == "Wrong Answer" and out["passed"] == 0
++
++
++def test_runtime_error_has_stderr_and_verdict():
++    out = judge0.run_custom("raise ValueError('boom')", PY, "", 2.0, 256)
++    assert out["verdict"] == "Runtime Error"
++    assert "boom" in out["stderr"]
++
++
++def test_infinite_loop_is_time_limited():
++    out = judge0.run_custom("while True:\n    pass\n", PY, "", 1.0, 256)
++    assert out["verdict"] == "Time Limit Exceeded"
++
++
++def test_candidate_cannot_see_backend_secrets(monkeypatch):
++    monkeypatch.setenv("SECRET_KEY", "super-secret-value")
++    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pw@db/x")
++    code = "import os\nprint(os.environ.get('SECRET_KEY'), os.environ.get('DATABASE_URL'))\n"
++    out = judge0.run_custom(code, PY, "", 2.0, 256)
++    assert out["stdout"].strip() == "None None"
++
++
++def test_program_that_ignores_stdin_is_fine():
++    out = judge0.run_custom("print('hi')", PY, "x" * 500_000 + "\n", 2.0, 256)
++    assert out["verdict"] == "Ran Successfully" and out["stdout"].strip() == "hi"
++
++
++def test_huge_output_is_capped():
++    out = local_runner.execute("print('a' * 5_000_000)", PY, [""], 2.0, 256)[0]
++    assert len(out["stdout"]) <= local_runner.MAX_OUTPUT_BYTES
++
++
++def test_working_directory_is_removed_afterwards(monkeypatch):
++    seen = []
++    real = local_runner.tempfile.mkdtemp
++    monkeypatch.setattr(local_runner.tempfile, "mkdtemp", lambda **kw: seen.append(real(**kw)) or seen[-1])
++    judge0.run_custom("print(1)", PY, "", 2.0, 256)
++    assert seen and not os.path.exists(seen[0])
++
++
++def test_only_installed_languages_are_offered():
++    langs = local_runner.available_languages()
++    assert PY in langs
++    assert (54 in langs) == bool(shutil.which("g++"))
++
++
++def test_unknown_language_reports_internal_error_not_crash():
++    out = local_runner.execute("x", 999, ["", ""], 1.0, 64)
++    assert [r["status_id"] for r in out] == [13, 13]
++
++
++@pytest.mark.skipif(not shutil.which("g++"), reason="g++ not installed")
++def test_cpp_compile_error_and_success():
++    bad = judge0.judge("int main( {", 54, CASES, 2.0, 256)
++    assert bad["verdict"] == "Compilation Error" and bad["compile_output"]
++    good = judge0.judge("#include <iostream>\nint main(){int a,b;std::cin>>a>>b;std::cout<<a+b<<'\\n';}", 54, CASES, 2.0, 256)
++    assert good["verdict"] == "Accepted"
++
++
++@pytest.mark.skipif(not (shutil.which("javac") and shutil.which("java")), reason="JDK not installed")
++def test_java_main_class():
++    code = "import java.util.*;\npublic class Main { public static void main(String[] a){ Scanner s=new Scanner(System.in); System.out.println(s.nextInt()+s.nextInt()); } }"
++    assert judge0.judge(code, 62, CASES, 2.0, 256)["verdict"] == "Accepted"
++
++
++@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
++def test_node():
++    code = "const [a,b]=require('fs').readFileSync(0,'utf8').trim().split(/\\s+/).map(Number);console.log(a+b)"
++    assert judge0.judge(code, 63, CASES, 2.0, 256)["verdict"] == "Accepted"
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 843280e..2d681e1 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -22,6 +22,8 @@ services:
+     environment:
+       DATABASE_URL: postgresql://postgres:admin123@database:5432/proctoring_db
+       SECRET_KEY: 798b9c99fd71290645c1f33265317136375e620930a413d653299a774ba3fbe3
++      # Coding questions: where the Judge0 server is (only reachable if started with --profile judge0)
++      JUDGE0_URL: http://judge0-server:2358
+     ports:
+       - "8000:8000"
+     depends_on:
+@@ -36,5 +38,56 @@ services:
+     depends_on:
+       - backend
+ 
++  # ---------------------------------------------------------------------------
++  # Judge0: sandboxed code execution for coding questions. OPTIONAL - start with
++  #   docker compose --profile judge0 up -d
++  # Plain `docker compose up -d` still runs everything else; coding questions
++  # then report "execution service unavailable" instead of running code.
++  # Judge0 is deliberately NOT published to the host: only the backend can reach it.
++  # Settings live in judge0.conf (change the two passwords in it!).
++  # ---------------------------------------------------------------------------
++  judge0-server:
++    image: judge0/judge0:1.13.1
++    container_name: judge0_server
++    profiles: ["judge0"]
++    volumes:
++      - ./judge0.conf:/judge0.conf:ro
++    privileged: true   # required by Judge0's isolate sandbox
++    restart: always
++    depends_on:
++      - judge0-db
++      - judge0-redis
++
++  judge0-worker:
++    image: judge0/judge0:1.13.1
++    container_name: judge0_worker
++    profiles: ["judge0"]
++    command: ["./scripts/workers"]
++    volumes:
++      - ./judge0.conf:/judge0.conf:ro
++    privileged: true
++    restart: always
++    depends_on:
++      - judge0-db
++      - judge0-redis
++
++  judge0-db:
++    image: postgres:16.2
++    container_name: judge0_db
++    profiles: ["judge0"]
++    env_file: judge0.conf
++    volumes:
++      - judge0_data:/var/lib/postgresql/data/
++    restart: always
++
++  judge0-redis:
++    image: redis:7.2.4
++    container_name: judge0_redis
++    profiles: ["judge0"]
++    command: ["bash", "-c", 'docker-entrypoint.sh --appendonly no --requirepass "$$REDIS_PASSWORD"']
++    env_file: judge0.conf
++    restart: always
++
+ volumes:
+-  postgres_data:
+\ No newline at end of file
++  postgres_data:
++  judge0_data:
+\ No newline at end of file
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index d0ea77d..5dd1116 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -8,6 +8,7 @@ import { getToken } from "./utils/api";
+ import AdminResults from "./pages/AdminResults";
+ import CreateExam from "./pages/CreateExam";
+ import ManageStudents from "./pages/ManageStudents";
++import AdminCoding from "./pages/AdminCoding";
+ 
+ // This component protects routes - only lets logged-in users through
+ function ProtectedRoute({ children }) {
+@@ -64,6 +65,14 @@ function App() {
+             </ProtectedRoute>
+           }
+         />
++        <Route
++          path="/admin/exam/:examId/coding"
++          element={
++            <ProtectedRoute>
++              <AdminCoding />
++            </ProtectedRoute>
++          }
++        />
+         <Route
+           path="/admin/create-exam"
+           element={
+diff --git a/frontend/src/components/CodingProblemForm.jsx b/frontend/src/components/CodingProblemForm.jsx
+new file mode 100644
+index 0000000..45bfe07
+--- /dev/null
++++ b/frontend/src/components/CodingProblemForm.jsx
+@@ -0,0 +1,122 @@
++// Form for authoring one coding problem (used by CreateExam and AdminCoding).
++
++function CodingProblemForm({ problem, onChange, onRemove, index }) {
++  function set(field, value) {
++    onChange({ ...problem, [field]: value });
++  }
++
++  function setTest(i, field, value) {
++    const tests = problem.test_cases.map((t, j) => (j === i ? { ...t, [field]: value } : t));
++    onChange({ ...problem, test_cases: tests });
++  }
++
++  function addTest(isSample) {
++    onChange({
++      ...problem,
++      test_cases: [...problem.test_cases, { input_data: "", expected_output: "", is_sample: isSample }],
++    });
++  }
++
++  function removeTest(i) {
++    onChange({ ...problem, test_cases: problem.test_cases.filter((_, j) => j !== i) });
++  }
++
++  return (
++    <div style={styles.block}>
++      <div style={styles.header}>
++        <span style={styles.num}>Coding problem {index + 1}</span>
++        {onRemove && (
++          <button type="button" onClick={onRemove} style={styles.removeBtn}>
++            Remove
++          </button>
++        )}
++      </div>
++
++      <label style={styles.label}>Title</label>
++      <input value={problem.title} onChange={(e) => set("title", e.target.value)} style={styles.input} placeholder="e.g. Sum of two numbers" />
++
++      <label style={styles.label}>Statement</label>
++      <textarea value={problem.statement} onChange={(e) => set("statement", e.target.value)} style={styles.textarea} rows={5} placeholder="Describe the task. Candidates read stdin and print to stdout." />
++
++      <div style={styles.grid2}>
++        <div>
++          <label style={styles.label}>Input format (optional)</label>
++          <textarea value={problem.input_format} onChange={(e) => set("input_format", e.target.value)} style={styles.textarea} rows={2} />
++        </div>
++        <div>
++          <label style={styles.label}>Output format (optional)</label>
++          <textarea value={problem.output_format} onChange={(e) => set("output_format", e.target.value)} style={styles.textarea} rows={2} />
++        </div>
++      </div>
++
++      <label style={styles.label}>Constraints (optional)</label>
++      <input value={problem.constraints} onChange={(e) => set("constraints", e.target.value)} style={styles.input} placeholder="e.g. 1 <= N <= 100000" />
++
++      <div style={styles.grid3}>
++        <div>
++          <label style={styles.label}>Points</label>
++          <input type="number" min="1" value={problem.points} onChange={(e) => set("points", e.target.value)} style={styles.input} />
++        </div>
++        <div>
++          <label style={styles.label}>Time limit (s)</label>
++          <input type="number" min="0.5" max="15" step="0.5" value={problem.time_limit_seconds} onChange={(e) => set("time_limit_seconds", e.target.value)} style={styles.input} />
++        </div>
++        <div>
++          <label style={styles.label}>Memory (MB)</label>
++          <input type="number" min="16" max="256" value={problem.memory_limit_mb} onChange={(e) => set("memory_limit_mb", e.target.value)} style={styles.input} />
++        </div>
++      </div>
++
++      <div style={styles.testsHeader}>Test cases ({problem.test_cases.length})</div>
++      <p style={styles.hint}>Sample tests are shown to candidates. Hidden tests are never shown, only pass/fail.</p>
++      {problem.test_cases.map((t, i) => (
++        <div key={i} style={styles.testRow}>
++          <div style={styles.testTop}>
++            <label style={styles.sampleCheck}>
++              <input type="checkbox" checked={t.is_sample} onChange={(e) => setTest(i, "is_sample", e.target.checked)} style={{ marginRight: "6px" }} />
++              Sample (visible to candidates)
++            </label>
++            {problem.test_cases.length > 1 && (
++              <button type="button" onClick={() => removeTest(i)} style={styles.removeBtn}>
++                Remove
++              </button>
++            )}
++          </div>
++          <div style={styles.grid2}>
++            <textarea value={t.input_data} onChange={(e) => setTest(i, "input_data", e.target.value)} style={styles.mono} rows={3} placeholder="Input (stdin)" />
++            <textarea value={t.expected_output} onChange={(e) => setTest(i, "expected_output", e.target.value)} style={styles.mono} rows={3} placeholder="Expected output (stdout)" />
++          </div>
++        </div>
++      ))}
++      <div style={styles.addRow}>
++        <button type="button" onClick={() => addTest(true)} style={styles.addBtn}>+ Sample test</button>
++        <button type="button" onClick={() => addTest(false)} style={styles.addBtn}>+ Hidden test</button>
++      </div>
++    </div>
++  );
++}
++
++const mono = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
++const field = { width: "100%", padding: "10px 12px", borderRadius: "8px", border: "1px solid #1E293B", background: "#0A0E1A", color: "#E2E8F0", fontSize: "14px", boxSizing: "border-box", fontFamily: "Inter, sans-serif", outline: "none" };
++
++const styles = {
++  block: { padding: "16px", background: "#0A0E1A", borderRadius: "10px", marginBottom: "16px", border: "1px solid #1C2438" },
++  header: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" },
++  num: { fontSize: "13px", fontWeight: "700", color: "#22D3EE" },
++  removeBtn: { background: "transparent", border: "none", color: "#EF4444", fontSize: "12px", fontWeight: "600", cursor: "pointer" },
++  label: { display: "block", fontSize: "12px", fontWeight: "600", color: "#94A3B8", margin: "12px 0 6px" },
++  input: field,
++  textarea: { ...field, resize: "vertical" },
++  mono: { ...field, fontFamily: mono, fontSize: "13px", resize: "vertical" },
++  grid2: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" },
++  grid3: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "10px" },
++  testsHeader: { fontSize: "14px", fontWeight: "700", color: "#F8FAFC", margin: "20px 0 4px" },
++  hint: { fontSize: "12px", color: "#64748B", margin: "0 0 10px" },
++  testRow: { padding: "10px", background: "#0F1524", border: "1px solid #1C2438", borderRadius: "8px", marginBottom: "10px" },
++  testTop: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "8px" },
++  sampleCheck: { display: "flex", alignItems: "center", fontSize: "12px", color: "#94A3B8", cursor: "pointer" },
++  addRow: { display: "flex", gap: "10px" },
++  addBtn: { flex: 1, padding: "10px", background: "#0D2540", color: "#22D3EE", border: "1px dashed #1E4E7A", borderRadius: "8px", fontSize: "13px", fontWeight: "600", cursor: "pointer" },
++};
++
++export default CodingProblemForm;
+diff --git a/frontend/src/components/CodingProblems.jsx b/frontend/src/components/CodingProblems.jsx
+new file mode 100644
+index 0000000..867bff7
+--- /dev/null
++++ b/frontend/src/components/CodingProblems.jsx
+@@ -0,0 +1,395 @@
++import { useEffect, useState } from "react";
++import { apiCall } from "../utils/api";
++
++// Starter code per Judge0 language id. Programs read stdin and print to stdout.
++const TEMPLATES = {
++  71: "import sys\n\n\ndef main():\n    data = sys.stdin.read().split()\n    # your code here\n\n\nmain()\n",
++  54: "#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n    ios::sync_with_stdio(false);\n    cin.tie(nullptr);\n    // your code here\n    return 0;\n}\n",
++  50: "#include <stdio.h>\n\nint main(void) {\n    // your code here\n    return 0;\n}\n",
++  62: "import java.util.*;\n\npublic class Main {\n    public static void main(String[] args) {\n        Scanner sc = new Scanner(System.in);\n        // your code here\n    }\n}\n",
++  63: 'const lines = require("fs").readFileSync("/dev/stdin", "utf8").split("\\n");\n// your code here\n',
++};
++
++// Used only if GET /coding/languages fails
++const FALLBACK_LANGUAGES = [
++  { id: 71, name: "Python (3.8.1)" },
++  { id: 54, name: "C++ (GCC 9.2.0)" },
++  { id: 50, name: "C (GCC 9.2.0)" },
++  { id: 62, name: "Java (OpenJDK 13.0.1)" },
++  { id: 63, name: "JavaScript (Node.js 12.14.0)" },
++];
++
++const DEFAULT_LANGUAGE = 71;
++
++function draftKey(examId, problemId) {
++  return `proctorai-code-${examId}-${problemId}`;
++}
++
++// sessionStorage can throw (private mode, blocked storage) - it's only a convenience
++function loadDraft(examId, problemId) {
++  try {
++    const raw = sessionStorage.getItem(draftKey(examId, problemId));
++    return raw ? JSON.parse(raw) : null;
++  } catch {
++    return null;
++  }
++}
++
++function saveDraft(examId, problemId, draft) {
++  try {
++    sessionStorage.setItem(draftKey(examId, problemId), JSON.stringify(draft));
++  } catch {
++    /* ignore */
++  }
++}
++
++function CodingProblems({ examId, problems }) {
++  const [languages, setLanguages] = useState(FALLBACK_LANGUAGES);
++  const [activeId, setActiveId] = useState(problems[0]?.id);
++  const [drafts, setDrafts] = useState({}); // problemId -> { languageId, code }
++  const [results, setResults] = useState({}); // problemId -> result object from the API
++  const [best, setBest] = useState({}); // problemId -> { passed, total, verdict }
++  const [customInput, setCustomInput] = useState({});
++  const [showCustom, setShowCustom] = useState({});
++  const [busy, setBusy] = useState(""); // "" | "run" | "submit"
++  const [error, setError] = useState("");
++
++  // Languages + restore last submitted code / best result after a page refresh
++  useEffect(() => {
++    let cancelled = false;
++    (async () => {
++      try {
++        const langs = await apiCall("/coding/languages", "GET");
++        if (!cancelled && langs.length) setLanguages(langs);
++      } catch {
++        /* fall back to the built-in list */
++      }
++      try {
++        const progress = await apiCall(`/exams/${examId}/coding-progress`, "GET");
++        if (cancelled) return;
++        const restoredDrafts = {};
++        const restoredBest = {};
++        progress.forEach((p) => {
++          restoredDrafts[p.problem_id] = { languageId: p.last_language_id, code: p.last_source_code };
++          restoredBest[p.problem_id] = { passed: p.best_passed, total: p.best_total, verdict: p.best_verdict };
++        });
++        problems.forEach((p) => {
++          const local = loadDraft(examId, p.id); // unsaved edits are newer than the last submit
++          if (local) restoredDrafts[p.id] = local;
++        });
++        setDrafts((prev) => ({ ...restoredDrafts, ...prev }));
++        setBest(restoredBest);
++      } catch {
++        /* nothing submitted yet */
++      }
++    })();
++    return () => {
++      cancelled = true;
++    };
++  }, [examId, problems]);
++
++  const problem = problems.find((p) => p.id === activeId) || problems[0];
++  if (!problem) return null;
++
++  const draft = drafts[problem.id] || { languageId: DEFAULT_LANGUAGE, code: TEMPLATES[DEFAULT_LANGUAGE] };
++  const result = results[problem.id];
++  const bestForProblem = best[problem.id];
++
++  function updateDraft(patch) {
++    const next = { ...draft, ...patch };
++    setDrafts((prev) => ({ ...prev, [problem.id]: next }));
++    saveDraft(examId, problem.id, next);
++  }
++
++  function changeLanguage(newId) {
++    const untouched = Object.values(TEMPLATES).includes(draft.code) || !draft.code.trim();
++    updateDraft({ languageId: newId, code: untouched ? TEMPLATES[newId] || "" : draft.code });
++  }
++
++  function handleTab(e) {
++    if (e.key !== "Tab") return;
++    e.preventDefault();
++    const el = e.target;
++    const start = el.selectionStart;
++    const end = el.selectionEnd;
++    updateDraft({ code: draft.code.slice(0, start) + "    " + draft.code.slice(end) });
++    requestAnimationFrame(() => {
++      el.selectionStart = el.selectionEnd = start + 4;
++    });
++  }
++
++  async function execute(kind) {
++    setBusy(kind);
++    setError("");
++    try {
++      const base = `/exams/${examId}/coding-problems/${problem.id}`;
++      const body = { language_id: draft.languageId, source_code: draft.code };
++      let data;
++      if (kind === "submit") {
++        data = await apiCall(`${base}/submit`, "POST", body);
++        setBest((prev) => ({
++          ...prev,
++          [problem.id]: { passed: data.best_passed, total: data.best_total, verdict: data.verdict },
++        }));
++      } else {
++        if (showCustom[problem.id]) body.custom_input = customInput[problem.id] || "";
++        data = await apiCall(`${base}/run`, "POST", body);
++      }
++      setResults((prev) => ({ ...prev, [problem.id]: { kind, ...data } }));
++    } catch (err) {
++      setError(err.message);
++    } finally {
++      setBusy("");
++    }
++  }
++
++  return (
++    <div style={styles.wrap}>
++      <div style={styles.sectionTitle}>💻 Coding Problems</div>
++      <p style={styles.hint}>
++        Write a program that reads from standard input and prints to standard output. <strong>Run</strong> tries the
++        sample tests; <strong>Submit solution</strong> grades against all tests (including hidden ones) and your best
++        attempt counts. You still need to press <strong>Submit Exam</strong> at the bottom to finish. Copy/paste is
++        disabled during the exam.
++      </p>
++
++      <div style={styles.tabs}>
++        {problems.map((p, i) => {
++          const b = best[p.id];
++          const solved = b && b.total > 0 && b.passed === b.total;
++          return (
++            <button
++              key={p.id}
++              onClick={() => {
++                setActiveId(p.id);
++                setError("");
++              }}
++              style={{ ...styles.tab, ...(p.id === problem.id ? styles.tabActive : {}) }}
++            >
++              {solved ? "✅ " : ""}
++              {i + 1}. {p.title}
++            </button>
++          );
++        })}
++      </div>
++
++      <div style={styles.card}>
++        <div style={styles.problemHeader}>
++          <h3 style={styles.problemTitle}>{problem.title}</h3>
++          <div style={styles.metaRow}>
++            <span style={styles.metaTag}>{problem.points} pts</span>
++            <span style={styles.metaTag}>⏱ {problem.time_limit_seconds}s</span>
++            <span style={styles.metaTag}>🧠 {problem.memory_limit_mb} MB</span>
++            {bestForProblem && (
++              <span style={{ ...styles.metaTag, ...styles.metaBest }}>
++                Best: {bestForProblem.passed}/{bestForProblem.total} tests
++              </span>
++            )}
++          </div>
++        </div>
++
++        <pre style={styles.statement}>{problem.statement}</pre>
++        {problem.input_format && <Section label="Input format" text={problem.input_format} />}
++        {problem.output_format && <Section label="Output format" text={problem.output_format} />}
++        {problem.constraints && <Section label="Constraints" text={problem.constraints} />}
++
++        {problem.samples.map((s, i) => (
++          <div key={i} style={styles.sampleBox}>
++            <div style={styles.sampleCol}>
++              <div style={styles.sampleLabel}>Sample input {i + 1}</div>
++              <pre style={styles.pre}>{s.input}</pre>
++            </div>
++            <div style={styles.sampleCol}>
++              <div style={styles.sampleLabel}>Sample output {i + 1}</div>
++              <pre style={styles.pre}>{s.expected_output}</pre>
++            </div>
++          </div>
++        ))}
++        {problem.hidden_test_count > 0 && (
++          <p style={styles.hint}>+ {problem.hidden_test_count} hidden test{problem.hidden_test_count !== 1 ? "s" : ""} used when you submit.</p>
++        )}
++
++        <div style={styles.editorBar}>
++          <label style={styles.label}>Language</label>
++          <select value={draft.languageId} onChange={(e) => changeLanguage(parseInt(e.target.value))} style={styles.select}>
++            {languages.map((l) => (
++              <option key={l.id} value={l.id}>
++                {l.name}
++              </option>
++            ))}
++          </select>
++        </div>
++
++        <textarea
++          value={draft.code}
++          onChange={(e) => updateDraft({ code: e.target.value })}
++          onKeyDown={handleTab}
++          spellCheck={false}
++          autoCapitalize="off"
++          autoCorrect="off"
++          style={styles.editor}
++          rows={16}
++        />
++
++        <label style={styles.customToggle}>
++          <input
++            type="checkbox"
++            checked={!!showCustom[problem.id]}
++            onChange={(e) => setShowCustom((prev) => ({ ...prev, [problem.id]: e.target.checked }))}
++            style={{ marginRight: "8px" }}
++          />
++          Run with my own input instead of the samples
++        </label>
++        {showCustom[problem.id] && (
++          <textarea
++            value={customInput[problem.id] || ""}
++            onChange={(e) => setCustomInput((prev) => ({ ...prev, [problem.id]: e.target.value }))}
++            placeholder="Custom standard input"
++            style={styles.customInput}
++            rows={4}
++          />
++        )}
++
++        {error && <div style={styles.errorBox}>{error}</div>}
++
++        <div style={styles.btnRow}>
++          <button onClick={() => execute("run")} disabled={!!busy} style={styles.runBtn}>
++            {busy === "run" ? "Running..." : "▶ Run"}
++          </button>
++          <button onClick={() => execute("submit")} disabled={!!busy} style={styles.submitCodeBtn}>
++            {busy === "submit" ? "Judging..." : "Submit solution"}
++          </button>
++        </div>
++
++        {result && <ResultPanel result={result} />}
++      </div>
++    </div>
++  );
++}
++
++function Section({ label, text }) {
++  return (
++    <div style={{ marginBottom: "12px" }}>
++      <div style={styles.sampleLabel}>{label}</div>
++      <pre style={styles.plain}>{text}</pre>
++    </div>
++  );
++}
++
++function VerdictBadge({ verdict, small }) {
++  const ok = verdict === "Accepted" || verdict === "Ran Successfully";
++  const style = ok
++    ? { color: "#6EE7B7", background: "#0C2E22", border: "1px solid #1A5943" }
++    : { color: "#FCA5A5", background: "#2A1215", border: "1px solid #5B2121" };
++  return (
++    <span style={{ ...styles.badge, ...style, ...(small ? styles.badgeSmall : {}) }}>
++      {verdict}
++    </span>
++  );
++}
++
++function ResultPanel({ result }) {
++  const title = result.kind === "submit" ? "Submission result" : result.mode === "custom" ? "Custom run" : "Sample run";
++
++  if (result.mode === "custom") {
++    return (
++      <div style={styles.resultBox}>
++        <div style={styles.resultHeader}>
++          <strong style={{ color: "#E2E8F0" }}>{title}</strong>
++          <VerdictBadge verdict={result.verdict} />
++        </div>
++        {result.compile_output && <Block label="Compiler output" text={result.compile_output} />}
++        <Block label="Output" text={result.stdout} />
++        {result.stderr && <Block label="Errors" text={result.stderr} />}
++      </div>
++    );
++  }
++
++  return (
++    <div style={styles.resultBox}>
++      <div style={styles.resultHeader}>
++        <strong style={{ color: "#E2E8F0" }}>{title}</strong>
++        <span>
++          <span style={styles.passCount}>
++            {result.passed}/{result.total} tests passed
++          </span>{" "}
++          <VerdictBadge verdict={result.verdict} />
++        </span>
++      </div>
++      {result.compile_output && <Block label="Compiler output" text={result.compile_output} />}
++      {result.cases.map((c, i) => (
++        <div key={i} style={styles.caseRow}>
++          <div style={styles.caseTop}>
++            <span style={styles.caseLabel}>{c.label}</span>
++            <span>
++              {c.time != null && <span style={styles.caseTime}>{c.time}s</span>}
++              <VerdictBadge verdict={c.verdict} small />
++            </span>
++          </div>
++          {c.is_sample && !c.passed && c.verdict !== "Compilation Error" && (
++            <div style={styles.caseDetail}>
++              <Block label="Input" text={c.input} />
++              <Block label="Expected" text={c.expected_output} />
++              <Block label="Your output" text={c.actual_output} />
++              {c.stderr && <Block label="Errors" text={c.stderr} />}
++            </div>
++          )}
++        </div>
++      ))}
++    </div>
++  );
++}
++
++function Block({ label, text }) {
++  return (
++    <div style={{ marginTop: "8px" }}>
++      <div style={styles.sampleLabel}>{label}</div>
++      <pre style={styles.pre}>{text === "" ? "(empty)" : text}</pre>
++    </div>
++  );
++}
++
++const mono = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
++
++const styles = {
++  wrap: { marginTop: "36px" },
++  sectionTitle: { fontSize: "20px", fontWeight: "600", color: "#F8FAFC", marginBottom: "8px", fontFamily: "'Space Grotesk', sans-serif" },
++  hint: { fontSize: "13px", color: "#64748B", lineHeight: "1.6", margin: "0 0 16px" },
++  tabs: { display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "16px" },
++  tab: { padding: "9px 14px", borderRadius: "8px", border: "1px solid #1C2438", background: "#0F1524", color: "#94A3B8", fontSize: "13px", fontWeight: "600", cursor: "pointer" },
++  tabActive: { border: "1px solid #22D3EE", background: "#0D2540", color: "#22D3EE" },
++  card: { background: "#0F1524", border: "1px solid #1C2438", borderRadius: "12px", padding: "20px" },
++  problemHeader: { marginBottom: "12px" },
++  problemTitle: { fontSize: "18px", fontWeight: "600", color: "#F8FAFC", margin: "0 0 8px" },
++  metaRow: { display: "flex", gap: "8px", flexWrap: "wrap" },
++  metaTag: { background: "#0A0E1A", color: "#94A3B8", padding: "3px 10px", borderRadius: "20px", fontSize: "12px", border: "1px solid #1C2438" },
++  metaBest: { color: "#6EE7B7", border: "1px solid #1A5943", background: "#0C2E22" },
++  statement: { whiteSpace: "pre-wrap", fontFamily: "Inter, sans-serif", fontSize: "14px", color: "#CBD5E1", lineHeight: "1.7", margin: "0 0 16px" },
++  plain: { whiteSpace: "pre-wrap", fontFamily: "Inter, sans-serif", fontSize: "13px", color: "#CBD5E1", margin: "4px 0 0", lineHeight: "1.6" },
++  sampleBox: { display: "flex", gap: "12px", marginBottom: "12px", flexWrap: "wrap" },
++  sampleCol: { flex: "1 1 240px", minWidth: 0 },
++  sampleLabel: { fontSize: "11px", fontWeight: "700", color: "#64748B", letterSpacing: "0.5px", textTransform: "uppercase", marginBottom: "4px" },
++  pre: { margin: 0, padding: "10px 12px", background: "#0A0E1A", border: "1px solid #1C2438", borderRadius: "8px", fontFamily: mono, fontSize: "13px", color: "#E2E8F0", whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: "220px", overflow: "auto" },
++  editorBar: { display: "flex", alignItems: "center", gap: "12px", margin: "16px 0 8px" },
++  label: { fontSize: "13px", fontWeight: "600", color: "#94A3B8" },
++  select: { padding: "8px 10px", borderRadius: "8px", border: "1px solid #1E293B", background: "#0A0E1A", color: "#E2E8F0", fontSize: "13px" },
++  editor: { width: "100%", boxSizing: "border-box", padding: "12px", borderRadius: "8px", border: "1px solid #1E293B", background: "#070B14", color: "#E2E8F0", fontFamily: mono, fontSize: "13px", lineHeight: "1.55", resize: "vertical", tabSize: 4, outline: "none" },
++  customToggle: { display: "flex", alignItems: "center", fontSize: "13px", color: "#94A3B8", margin: "12px 0 8px", cursor: "pointer" },
++  customInput: { width: "100%", boxSizing: "border-box", padding: "10px 12px", borderRadius: "8px", border: "1px solid #1E293B", background: "#070B14", color: "#E2E8F0", fontFamily: mono, fontSize: "13px", marginBottom: "8px" },
++  errorBox: { background: "#2A1215", color: "#FCA5A5", padding: "10px 12px", borderRadius: "8px", margin: "10px 0", fontSize: "13px", border: "1px solid #5B2121" },
++  btnRow: { display: "flex", gap: "10px", marginTop: "12px" },
++  runBtn: { padding: "11px 22px", background: "#0D2540", color: "#22D3EE", border: "1px solid #1E4E7A", borderRadius: "8px", fontSize: "14px", fontWeight: "600", cursor: "pointer" },
++  submitCodeBtn: { padding: "11px 22px", background: "#22D3EE", color: "#04141C", border: "none", borderRadius: "8px", fontSize: "14px", fontWeight: "600", cursor: "pointer" },
++  resultBox: { marginTop: "16px", background: "#0A0E1A", border: "1px solid #1C2438", borderRadius: "10px", padding: "14px" },
++  resultHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px", marginBottom: "8px" },
++  passCount: { fontSize: "13px", color: "#94A3B8", marginRight: "6px" },
++  badge: { display: "inline-block", padding: "4px 12px", borderRadius: "20px", fontSize: "12px", fontWeight: "700" },
++  badgeSmall: { padding: "2px 9px", fontSize: "11px" },
++  caseRow: { padding: "8px 0", borderTop: "1px solid #1C2438" },
++  caseTop: { display: "flex", justifyContent: "space-between", alignItems: "center" },
++  caseLabel: { fontSize: "13px", fontWeight: "600", color: "#CBD5E1" },
++  caseTime: { fontSize: "11px", color: "#64748B", marginRight: "8px" },
++  caseDetail: { marginTop: "6px" },
++};
++
++export default CodingProblems;
+diff --git a/frontend/src/pages/AdminCoding.jsx b/frontend/src/pages/AdminCoding.jsx
+new file mode 100644
+index 0000000..3453c60
+--- /dev/null
++++ b/frontend/src/pages/AdminCoding.jsx
+@@ -0,0 +1,304 @@
++import { useState, useEffect, useCallback } from "react";
++import { useParams, Link } from "react-router-dom";
++import { apiCall } from "../utils/api";
++import CodingProblemForm from "../components/CodingProblemForm";
++import { emptyProblem, cleanProblem, validateProblem, parseImportedProblems } from "../utils/codingProblems";
++
++function AdminCoding() {
++    const { examId } = useParams();
++    const [tab, setTab] = useState("problems"); // "problems" | "submissions"
++    const [problems, setProblems] = useState([]);
++    const [submissions, setSubmissions] = useState([]);
++    const [loading, setLoading] = useState(true);
++    const [error, setError] = useState("");
++    const [success, setSuccess] = useState("");
++    const [adding, setAdding] = useState(null); // a problem being authored, or null
++    const [saving, setSaving] = useState(false);
++    const [openProblem, setOpenProblem] = useState(null);
++    const [openSubmission, setOpenSubmission] = useState(null);
++
++    const load = useCallback(async () => {
++        setLoading(true);
++        try {
++            const [p, s] = await Promise.all([
++                apiCall(`/exams/${examId}/coding-problems`, "GET"),
++                apiCall(`/exams/${examId}/coding-submissions`, "GET"),
++            ]);
++            setProblems(p);
++            setSubmissions(s);
++        } catch (err) {
++            setError(err.message);
++        } finally {
++            setLoading(false);
++        }
++    }, [examId]);
++
++    useEffect(() => {
++        load();
++    }, [load]);
++
++    async function saveProblem() {
++        setError(""); setSuccess("");
++        const problemError = validateProblem(adding);
++        if (problemError) {
++            setError(problemError);
++            return;
++        }
++        setSaving(true);
++        try {
++            await apiCall(`/exams/${examId}/coding-problems`, "POST", cleanProblem(adding));
++            setSuccess("Problem added.");
++            setAdding(null);
++            await load();
++        } catch (err) {
++            setError(err.message);
++        } finally {
++            setSaving(false);
++        }
++    }
++
++    async function importJson(file) {
++        if (!file) return;
++        setError(""); setSuccess("");
++        try {
++            const parsed = parseImportedProblems(await file.text());
++            const res = await apiCall(`/exams/${examId}/coding-problems/bulk`, "POST", {
++                problems: parsed.map(cleanProblem),
++            });
++            setSuccess(`Imported ${res.count} problem${res.count !== 1 ? "s" : ""}.`);
++            await load();
++        } catch (err) {
++            setError(err.message);
++        }
++    }
++
++    async function deleteProblem(problem) {
++        const confirmed = window.confirm(
++            `Delete "${problem.title}"?\n\nThis also deletes all candidate code submissions for it, which changes their scores. This cannot be undone.`
++        );
++        if (!confirmed) return;
++        try {
++            await apiCall(`/coding-problems/${problem.id}`, "DELETE");
++            await load();
++        } catch (err) {
++            setError(err.message);
++        }
++    }
++
++    return (
++        <div style={styles.page}>
++            <nav style={styles.navbar}>
++                <div style={styles.navBrand}>
++                    <span style={styles.navLogo}>🛡️</span>
++                    <span style={styles.navName}>ProctorAI</span>
++                </div>
++                <Link to="/dashboard" style={styles.backBtn}>← Back to Dashboard</Link>
++            </nav>
++
++            <div style={styles.main}>
++                <div style={styles.eyebrow}>ADMIN CONSOLE · EXAM #{examId}</div>
++                <h1 style={styles.title}>Coding Problems</h1>
++                <p style={styles.subtitle}>
++                    Candidates write code in the exam; it runs in a Judge0 sandbox and is scored against your test cases.
++                </p>
++
++                {error && <div style={styles.errorBox}>{error}</div>}
++                {success && <div style={styles.successBox}>✅ {success}</div>}
++
++                <div style={styles.tabs}>
++                    <button onClick={() => setTab("problems")} style={{ ...styles.tab, ...(tab === "problems" ? styles.tabActive : {}) }}>
++                        Problems ({problems.length})
++                    </button>
++                    <button onClick={() => setTab("submissions")} style={{ ...styles.tab, ...(tab === "submissions" ? styles.tabActive : {}) }}>
++                        Code submissions ({submissions.length})
++                    </button>
++                </div>
++
++                {loading && <div style={styles.muted}>Loading...</div>}
++
++                {!loading && tab === "problems" && (
++                    <>
++                        {!adding && (
++                            <div style={styles.actionRow}>
++                                <button onClick={() => { setAdding(emptyProblem()); setError(""); setSuccess(""); }} style={styles.primaryBtn}>
++                                    + Add problem
++                                </button>
++                                <label style={styles.secondaryBtn}>
++                                    Import from JSON
++                                    <input
++                                        type="file"
++                                        accept=".json,application/json"
++                                        style={{ display: "none" }}
++                                        onChange={(e) => { importJson(e.target.files[0]); e.target.value = ""; }}
++                                    />
++                                </label>
++                            </div>
++                        )}
++
++                        {adding && (
++                            <div style={styles.card}>
++                                <CodingProblemForm problem={adding} onChange={setAdding} index={problems.length} />
++                                <div style={styles.actionRow}>
++                                    <button onClick={saveProblem} disabled={saving} style={styles.primaryBtn}>
++                                        {saving ? "Saving..." : "Save problem"}
++                                    </button>
++                                    <button onClick={() => setAdding(null)} style={styles.secondaryBtn}>Cancel</button>
++                                </div>
++                            </div>
++                        )}
++
++                        {problems.length === 0 && !adding && (
++                            <div style={styles.emptyBox}>No coding problems yet. Add one or import a JSON file.</div>
++                        )}
++
++                        {problems.map((p) => (
++                            <div key={p.id} style={styles.card}>
++                                <div style={styles.rowBetween}>
++                                    <div>
++                                        <div style={styles.problemTitle}>{p.title}</div>
++                                        <div style={styles.metaRow}>
++                                            <span style={styles.metaTag}>{p.points} pts</span>
++                                            <span style={styles.metaTag}>⏱ {p.time_limit_seconds}s</span>
++                                            <span style={styles.metaTag}>🧠 {p.memory_limit_mb} MB</span>
++                                            <span style={styles.metaTag}>
++                                                {p.test_cases.filter((t) => t.is_sample).length} sample · {p.test_cases.filter((t) => !t.is_sample).length} hidden
++                                            </span>
++                                        </div>
++                                    </div>
++                                    <div style={styles.actionRow}>
++                                        <button onClick={() => setOpenProblem(openProblem === p.id ? null : p.id)} style={styles.secondaryBtn}>
++                                            {openProblem === p.id ? "Hide details" : "View details"}
++                                        </button>
++                                        <button onClick={() => deleteProblem(p)} style={styles.deleteBtn}>Delete</button>
++                                    </div>
++                                </div>
++                                {openProblem === p.id && (
++                                    <div style={{ marginTop: "14px" }}>
++                                        <pre style={styles.statement}>{p.statement}</pre>
++                                        {p.test_cases.map((t, i) => (
++                                            <div key={t.id} style={styles.testBox}>
++                                                <div style={styles.testLabel}>
++                                                    Test {i + 1} · {t.is_sample ? "sample" : "hidden"}
++                                                </div>
++                                                <div style={styles.testGrid}>
++                                                    <pre style={styles.pre}>{t.input_data || "(no input)"}</pre>
++                                                    <pre style={styles.pre}>{t.expected_output}</pre>
++                                                </div>
++                                            </div>
++                                        ))}
++                                    </div>
++                                )}
++                            </div>
++                        ))}
++                    </>
++                )}
++
++                {!loading && tab === "submissions" && (
++                    <>
++                        {submissions.length === 0 && <div style={styles.emptyBox}>No code submitted yet.</div>}
++                        {submissions.length > 0 && (
++                            <div style={styles.card}>
++                                <table style={styles.table}>
++                                    <thead>
++                                        <tr>
++                                            {["Candidate", "Problem", "Language", "Verdict", "Tests", "When", ""].map((h) => (
++                                                <th key={h} style={styles.th}>{h}</th>
++                                            ))}
++                                        </tr>
++                                    </thead>
++                                    <tbody>
++                                        {submissions.map((s) => (
++                                            <SubmissionRow
++                                                key={s.id}
++                                                s={s}
++                                                open={openSubmission === s.id}
++                                                onToggle={() => setOpenSubmission(openSubmission === s.id ? null : s.id)}
++                                            />
++                                        ))}
++                                    </tbody>
++                                </table>
++                            </div>
++                        )}
++                    </>
++                )}
++            </div>
++        </div>
++    );
++}
++
++function SubmissionRow({ s, open, onToggle }) {
++    const ok = s.verdict === "Accepted";
++    return (
++        <>
++            <tr>
++                <td style={styles.td}>
++                    <div style={{ color: "#E2E8F0", fontWeight: 600 }}>{s.student_name}</div>
++                    <div style={{ color: "#64748B", fontSize: "12px" }}>{s.student_email}</div>
++                </td>
++                <td style={styles.td}>{s.problem_title}</td>
++                <td style={styles.td}>{s.language}</td>
++                <td style={styles.td}>
++                    <span style={{ ...styles.badge, ...(ok ? styles.badgeOk : styles.badgeBad) }}>{s.verdict}</span>
++                </td>
++                <td style={styles.td}>{s.passed}/{s.total}</td>
++                <td style={styles.td}>{new Date(s.created_at).toLocaleString()}</td>
++                <td style={styles.td}>
++                    <button onClick={onToggle} style={styles.linkBtn}>{open ? "Hide code" : "View code"}</button>
++                </td>
++            </tr>
++            {open && (
++                <tr>
++                    <td colSpan={7} style={{ padding: "0 0 12px" }}>
++                        <pre style={styles.code}>{s.source_code}</pre>
++                    </td>
++                </tr>
++            )}
++        </>
++    );
++}
++
++const mono = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
++
++const styles = {
++    page: { minHeight: "100vh", background: "#0A0E1A", fontFamily: "Inter, sans-serif" },
++    navbar: { background: "#0C1120", borderBottom: "1px solid #1C2438", padding: "0 40px", height: "64px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, zIndex: 100 },
++    navBrand: { display: "flex", alignItems: "center", gap: "10px" },
++    navLogo: { fontSize: "22px" },
++    navName: { fontSize: "18px", fontWeight: "600", color: "#F8FAFC", fontFamily: "'Space Grotesk', sans-serif" },
++    backBtn: { color: "#22D3EE", textDecoration: "none", fontSize: "14px", fontWeight: "500" },
++    main: { maxWidth: "980px", margin: "0 auto", padding: "40px 20px" },
++    eyebrow: { fontFamily: "'Space Grotesk', sans-serif", color: "#334155", fontSize: "11px", letterSpacing: "2px", marginBottom: "10px" },
++    title: { fontSize: "28px", fontWeight: "600", color: "#F8FAFC", margin: "0 0 4px", fontFamily: "'Space Grotesk', sans-serif" },
++    subtitle: { fontSize: "14px", color: "#64748B", marginBottom: "24px" },
++    errorBox: { background: "#2A1215", color: "#FCA5A5", padding: "12px", borderRadius: "10px", marginBottom: "16px", fontSize: "14px", border: "1px solid #5B2121" },
++    successBox: { background: "#0C2E22", color: "#6EE7B7", padding: "12px", borderRadius: "10px", marginBottom: "16px", fontSize: "14px", border: "1px solid #1A5943" },
++    tabs: { display: "flex", gap: "10px", marginBottom: "20px" },
++    tab: { padding: "10px 18px", border: "1px solid #1C2438", borderRadius: "10px", background: "#0F1524", fontSize: "14px", fontWeight: "600", color: "#64748B", cursor: "pointer" },
++    tabActive: { border: "1px solid #22D3EE", background: "#0D2540", color: "#22D3EE" },
++    muted: { color: "#64748B", padding: "30px", textAlign: "center" },
++    actionRow: { display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap", margin: "0 0 16px" },
++    primaryBtn: { padding: "10px 18px", background: "#22D3EE", color: "#04141C", border: "none", borderRadius: "8px", fontSize: "14px", fontWeight: "600", cursor: "pointer" },
++    secondaryBtn: { padding: "10px 18px", background: "#0F1524", color: "#94A3B8", border: "1px solid #1C2438", borderRadius: "8px", fontSize: "14px", fontWeight: "500", cursor: "pointer", display: "inline-block" },
++    deleteBtn: { padding: "10px 16px", background: "transparent", color: "#EF4444", border: "1px solid #5B2121", borderRadius: "8px", fontSize: "14px", fontWeight: "600", cursor: "pointer" },
++    card: { background: "#0F1524", border: "1px solid #1C2438", borderRadius: "14px", padding: "20px", marginBottom: "16px" },
++    emptyBox: { textAlign: "center", padding: "50px 20px", background: "#0F1524", borderRadius: "14px", border: "1px solid #1C2438", color: "#64748B", fontSize: "14px" },
++    rowBetween: { display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: "16px", flexWrap: "wrap" },
++    problemTitle: { fontSize: "16px", fontWeight: "600", color: "#F8FAFC", marginBottom: "8px" },
++    metaRow: { display: "flex", gap: "8px", flexWrap: "wrap" },
++    metaTag: { background: "#0A0E1A", color: "#94A3B8", padding: "3px 10px", borderRadius: "20px", fontSize: "12px", border: "1px solid #1C2438" },
++    statement: { whiteSpace: "pre-wrap", fontFamily: "Inter, sans-serif", fontSize: "13px", color: "#CBD5E1", lineHeight: "1.7", margin: "0 0 12px" },
++    testBox: { marginBottom: "10px" },
++    testLabel: { fontSize: "11px", fontWeight: "700", color: "#64748B", textTransform: "uppercase", letterSpacing: "0.5px", marginBottom: "4px" },
++    testGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px" },
++    pre: { margin: 0, padding: "10px 12px", background: "#0A0E1A", border: "1px solid #1C2438", borderRadius: "8px", fontFamily: mono, fontSize: "12px", color: "#E2E8F0", whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: "180px", overflow: "auto" },
++    table: { width: "100%", borderCollapse: "collapse" },
++    th: { textAlign: "left", fontSize: "11px", color: "#64748B", textTransform: "uppercase", letterSpacing: "0.5px", padding: "8px 10px", borderBottom: "1px solid #1C2438" },
++    td: { padding: "10px", fontSize: "13px", color: "#CBD5E1", borderBottom: "1px solid #1C2438", verticalAlign: "top" },
++    badge: { display: "inline-block", padding: "3px 10px", borderRadius: "20px", fontSize: "11px", fontWeight: "700" },
++    badgeOk: { color: "#6EE7B7", background: "#0C2E22", border: "1px solid #1A5943" },
++    badgeBad: { color: "#FCA5A5", background: "#2A1215", border: "1px solid #5B2121" },
++    linkBtn: { background: "transparent", border: "none", color: "#22D3EE", fontSize: "13px", fontWeight: "600", cursor: "pointer" },
++    code: { margin: 0, padding: "12px", background: "#070B14", border: "1px solid #1C2438", borderRadius: "8px", fontFamily: mono, fontSize: "12px", color: "#E2E8F0", whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: "360px", overflow: "auto" },
++};
++
++export default AdminCoding;
+diff --git a/frontend/src/pages/CreateExam.jsx b/frontend/src/pages/CreateExam.jsx
+index c6c36a6..63dd8de 100644
+--- a/frontend/src/pages/CreateExam.jsx
++++ b/frontend/src/pages/CreateExam.jsx
+@@ -1,6 +1,8 @@
+ import { useState } from "react";
+ import { useNavigate, Link } from "react-router-dom";
+ import { apiCall, getToken } from "../utils/api";
++import CodingProblemForm from "../components/CodingProblemForm";
++import { emptyProblem, cleanProblem, validateProblem, parseImportedProblems } from "../utils/codingProblems";
+ 
+ const API_URL = "http://localhost:8000";
+ 
+@@ -18,6 +20,9 @@ function CreateExam() {
+         { question_text: "", option_a: "", option_b: "", option_c: "", option_d: "", correct_answer: "A" },
+     ]);
+ 
++    // Coding problems (judged by Judge0) - optional
++    const [codingProblems, setCodingProblems] = useState([]);
++
+     // CSV
+     const [csvFile, setCsvFile] = useState(null);
+ 
+@@ -41,6 +46,21 @@ function CreateExam() {
+         setQuestions((prev) => prev.filter((_, i) => i !== index));
+     }
+ 
++    function updateCodingProblem(index, problem) {
++        setCodingProblems((prev) => prev.map((p, i) => (i === index ? problem : p)));
++    }
++
++    async function importCodingJson(file) {
++        if (!file) return;
++        setError("");
++        try {
++            const imported = parseImportedProblems(await file.text());
++            setCodingProblems((prev) => [...prev, ...imported]);
++        } catch (err) {
++            setError(err.message);
++        }
++    }
++
+     async function submitManual() {
+         setError(""); setSuccess(""); setLoading(true);
+ 
+@@ -50,13 +70,31 @@ function CreateExam() {
+             setLoading(false);
+             return;
+         }
++        // A completely empty multiple-choice block is ignored (so coding-only exams are possible)
++        const isBlank = (q) => !q.question_text.trim() && !q.option_a.trim() && !q.option_b.trim() && !q.option_c.trim() && !q.option_d.trim();
++        const filledQuestions = [];
+         for (let i = 0; i < questions.length; i++) {
+             const q = questions[i];
++            if (isBlank(q)) continue;
+             if (!q.question_text.trim() || !q.option_a.trim() || !q.option_b.trim() || !q.option_c.trim() || !q.option_d.trim()) {
+                 setError(`Question ${i + 1} is incomplete. Please fill in the question and all four options.`);
+                 setLoading(false);
+                 return;
+             }
++            filledQuestions.push(q);
++        }
++        for (let i = 0; i < codingProblems.length; i++) {
++            const problemError = validateProblem(codingProblems[i], `Coding problem ${i + 1}`);
++            if (problemError) {
++                setError(problemError);
++                setLoading(false);
++                return;
++            }
++        }
++        if (filledQuestions.length === 0 && codingProblems.length === 0) {
++            setError("Add at least one multiple-choice question or coding problem.");
++            setLoading(false);
++            return;
+         }
+ 
+         try {
+@@ -64,9 +102,11 @@ function CreateExam() {
+                 title,
+                 description,
+                 duration_minutes: parseInt(duration),
+-                questions,
++                questions: filledQuestions,
++                coding_problems: codingProblems.map(cleanProblem),
+             });
+-            setSuccess(`Exam "${res.title}" created with ${res.question_count} questions!`);
++            const codingNote = res.coding_problem_count ? ` and ${res.coding_problem_count} coding problem${res.coding_problem_count !== 1 ? "s" : ""}` : "";
++            setSuccess(`Exam "${res.title}" created with ${res.question_count} questions${codingNote}!`);
+             setTimeout(() => navigate("/dashboard"), 2000);
+         } catch (err) {
+             // Handle both string errors and structured validation errors
+@@ -188,6 +228,38 @@ function CreateExam() {
+                             </div>
+                         ))}
+                         <button onClick={addQuestion} style={styles.addBtn}>+ Add Question</button>
++                    </div>
++                )}
++
++                {/* Coding problems (manual mode) */}
++                {mode === "manual" && (
++                    <div style={styles.card}>
++                        <h3 style={styles.cardTitle}>Coding Problems ({codingProblems.length})</h3>
++                        <p style={styles.csvHint}>
++                            Optional. Candidates write code that is run and scored against your test cases.
++                            You can also add or import problems later from the exam's <strong>Coding</strong> button on the dashboard.
++                        </p>
++                        {codingProblems.map((p, i) => (
++                            <CodingProblemForm
++                                key={i}
++                                index={i}
++                                problem={p}
++                                onChange={(updated) => updateCodingProblem(i, updated)}
++                                onRemove={() => setCodingProblems((prev) => prev.filter((_, j) => j !== i))}
++                            />
++                        ))}
++                        <button onClick={() => setCodingProblems((prev) => [...prev, emptyProblem()])} style={styles.addBtn}>
++                            + Add Coding Problem
++                        </button>
++                        <label style={styles.importBtn}>
++                            Import coding problems from JSON
++                            <input
++                                type="file"
++                                accept=".json,application/json"
++                                style={{ display: "none" }}
++                                onChange={(e) => { importCodingJson(e.target.files[0]); e.target.value = ""; }}
++                            />
++                        </label>
+                         <button onClick={submitManual} disabled={loading} style={styles.submitBtn}>
+                             {loading ? "Creating..." : "Create Exam"}
+                         </button>
+@@ -239,6 +311,7 @@ const styles = {
+     removeBtn: { background: "transparent", border: "none", color: "#EF4444", fontSize: "12px", fontWeight: "600", cursor: "pointer" },
+     optionsGrid: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", margin: "10px 0" },
+     addBtn: { width: "100%", padding: "12px", background: "#0D2540", color: "#22D3EE", border: "1px dashed #1E4E7A", borderRadius: "8px", fontSize: "14px", fontWeight: "600", cursor: "pointer", marginBottom: "16px" },
++    importBtn: { display: "block", textAlign: "center", boxSizing: "border-box", width: "100%", padding: "12px", background: "transparent", color: "#94A3B8", border: "1px solid #1E293B", borderRadius: "8px", fontSize: "14px", fontWeight: "500", cursor: "pointer", marginBottom: "16px" },
+     submitBtn: { width: "100%", padding: "14px", background: "#22D3EE", color: "#04141C", border: "none", borderRadius: "10px", fontSize: "15px", fontWeight: "600", cursor: "pointer", boxShadow: "0 0 20px rgba(34,211,238,0.3)" },
+     csvHint: { fontSize: "13px", color: "#64748B", marginBottom: "16px", lineHeight: "1.6" },
+     fileInput: { width: "100%", padding: "20px", border: "2px dashed #1E293B", borderRadius: "10px", marginBottom: "16px", fontSize: "14px", background: "#0A0E1A", color: "#94A3B8" },
+diff --git a/frontend/src/pages/Dashboard.jsx b/frontend/src/pages/Dashboard.jsx
+index c5cb992..32b3829 100644
+--- a/frontend/src/pages/Dashboard.jsx
++++ b/frontend/src/pages/Dashboard.jsx
+@@ -131,6 +131,9 @@ function Dashboard() {
+                 <div style={styles.examMeta}>
+                   <span style={styles.metaTag}>⏱ {exam.duration_minutes} min</span>
+                   <span style={styles.metaTag}>❓ {exam.questions.length} questions</span>
++                  {exam.coding_problem_count > 0 && (
++                    <span style={styles.metaTag}>💻 {exam.coding_problem_count} coding</span>
++                  )}
+                 </div>
+               </div>
+               <h3 style={styles.examTitle}>{exam.title}</h3>
+@@ -142,6 +145,7 @@ function Dashboard() {
+                 {userRole === "admin" && (
+                   <div style={styles.adminBtnRow}>
+                     <Link to={`/admin/exam/${exam.id}/results`} style={styles.resultsBtn}>Results</Link>
++                    <Link to={`/admin/exam/${exam.id}/coding`} style={styles.codingBtn}>Coding</Link>
+                     <Link to={`/admin/exam/${exam.id}/violations`} style={styles.violationsBtn}>Violations</Link>
+                     <button onClick={() => handleDeleteExam(exam.id, exam.title)} style={styles.deleteBtn}>Delete</button>
+                   </div>
+@@ -262,6 +266,7 @@ const styles = {
+   },
+   adminBtnRow: { display: "flex", gap: "8px", flexWrap: "wrap" },
+   resultsBtn: { padding: "8px 14px", background: "#0D2540", color: "#22D3EE", border: "1px solid #1E4E7A", borderRadius: "8px", textDecoration: "none", fontSize: "13px", fontWeight: "600" },
++  codingBtn: { padding: "8px 14px", background: "#1E1B3A", color: "#C4B5FD", border: "1px solid #4C3F91", borderRadius: "8px", textDecoration: "none", fontSize: "13px", fontWeight: "600" },
+   violationsBtn: { padding: "8px 14px", background: "#2A1215", color: "#FCA5A5", border: "1px solid #5B2121", borderRadius: "8px", textDecoration: "none", fontSize: "13px", fontWeight: "600" },
+   deleteBtn: { padding: "8px 14px", background: "transparent", color: "#64748B", border: "1px solid #1E293B", borderRadius: "8px", fontSize: "13px", fontWeight: "600", cursor: "pointer" },
+   resultsSection: { marginTop: "48px" },
+diff --git a/frontend/src/pages/ExamPage.jsx b/frontend/src/pages/ExamPage.jsx
+index a785f6c..a28c738 100644
+--- a/frontend/src/pages/ExamPage.jsx
++++ b/frontend/src/pages/ExamPage.jsx
+@@ -1,6 +1,7 @@
+ import { useState, useEffect } from "react";
+ import { useParams, useNavigate } from "react-router-dom";
+ import { apiCall } from "../utils/api";
++import CodingProblems from "../components/CodingProblems";
+ 
+ const MAX_LEVEL2_VIOLATIONS = 3;
+ 
+@@ -430,7 +431,8 @@ function ExamPage() {
+                             <p style={styles.termHeading}>Time Limit</p>
+                             <p style={styles.termText}>
+                                 You have {exam.duration_minutes} minutes to complete this exam,
+-                                which contains {exam.questions.length} question{exam.questions.length !== 1 ? "s" : ""}.
++                                which contains {exam.questions.length} question{exam.questions.length !== 1 ? "s" : ""}
++                                {exam.coding_problems?.length > 0 && ` and ${exam.coding_problems.length} coding problem${exam.coding_problems.length !== 1 ? "s" : ""}`}.
+                                 The exam must be completed in one sitting.
+                             </p>
+                         </div>
+@@ -655,6 +657,10 @@ function ExamPage() {
+                     </div>
+                 ))}
+ 
++                {exam.coding_problems?.length > 0 && (
++                    <CodingProblems examId={examId} problems={exam.coding_problems} />
++                )}
++
+                 <button onClick={handleSubmit} disabled={submitting} style={styles.submitBtn}>
+                     {submitting ? "Submitting..." : "Submit Exam"}
+                 </button>
+diff --git a/frontend/src/utils/codingProblems.js b/frontend/src/utils/codingProblems.js
+new file mode 100644
+index 0000000..342114d
+--- /dev/null
++++ b/frontend/src/utils/codingProblems.js
+@@ -0,0 +1,89 @@
++// Helpers for authoring coding problems (used by CreateExam and AdminCoding).
++
++export function emptyProblem() {
++  return {
++    title: "",
++    statement: "",
++    input_format: "",
++    output_format: "",
++    constraints: "",
++    points: 10,
++    time_limit_seconds: 2,
++    memory_limit_mb: 256,
++    test_cases: [
++      { input_data: "", expected_output: "", is_sample: true },
++      { input_data: "", expected_output: "", is_sample: false },
++    ],
++  };
++}
++
++// Form state -> API payload
++export function cleanProblem(p) {
++  const optional = (v) => (v && v.trim() ? v : null);
++  return {
++    title: p.title.trim(),
++    statement: p.statement,
++    input_format: optional(p.input_format),
++    output_format: optional(p.output_format),
++    constraints: optional(p.constraints),
++    points: parseInt(p.points),
++    time_limit_seconds: parseFloat(p.time_limit_seconds),
++    memory_limit_mb: parseInt(p.memory_limit_mb),
++    test_cases: p.test_cases.map((t) => ({
++      input_data: t.input_data,
++      expected_output: t.expected_output,
++      is_sample: !!t.is_sample,
++    })),
++  };
++}
++
++// Returns "" when fine, otherwise a message for the admin
++export function validateProblem(p, label = "Coding problem") {
++  if (!p.title.trim()) return `${label}: please enter a title.`;
++  if (!p.statement.trim()) return `${label}: please enter the problem statement.`;
++  if (!(parseInt(p.points) >= 1)) return `${label}: points must be at least 1.`;
++  const seconds = parseFloat(p.time_limit_seconds);
++  if (!(seconds >= 0.5 && seconds <= 15)) return `${label}: time limit must be between 0.5 and 15 seconds.`;
++  const memory = parseInt(p.memory_limit_mb);
++  if (!(memory >= 16 && memory <= 256)) return `${label}: memory limit must be between 16 and 256 MB.`;
++  if (p.test_cases.length === 0) return `${label}: add at least one test case.`;
++  for (let i = 0; i < p.test_cases.length; i++) {
++    if (!p.test_cases[i].expected_output.trim()) return `${label}: test case ${i + 1} needs an expected output.`;
++  }
++  return "";
++}
++
++// Accepts an array of problems, or { problems: [...] }. Throws an Error with a readable message.
++export function parseImportedProblems(text) {
++  let json;
++  try {
++    json = JSON.parse(text);
++  } catch {
++    throw new Error("That file is not valid JSON.");
++  }
++  const list = Array.isArray(json) ? json : json && Array.isArray(json.problems) ? json.problems : null;
++  if (!list || list.length === 0) throw new Error('Expected a JSON array of problems (or {"problems": [...]}).');
++
++  return list.map((raw, i) => {
++    const label = `Problem ${i + 1}`;
++    const tests = Array.isArray(raw.test_cases) ? raw.test_cases : [];
++    const problem = {
++      title: String(raw.title ?? ""),
++      statement: String(raw.statement ?? ""),
++      input_format: raw.input_format ?? "",
++      output_format: raw.output_format ?? "",
++      constraints: raw.constraints ?? "",
++      points: raw.points ?? 10,
++      time_limit_seconds: raw.time_limit_seconds ?? 2,
++      memory_limit_mb: raw.memory_limit_mb ?? 256,
++      test_cases: tests.map((t) => ({
++        input_data: String(t.input_data ?? t.input ?? ""),
++        expected_output: String(t.expected_output ?? t.output ?? ""),
++        is_sample: !!t.is_sample,
++      })),
++    };
++    const problemError = validateProblem(problem, label);
++    if (problemError) throw new Error(problemError);
++    return problem;
++  });
++}
+diff --git a/judge0.conf b/judge0.conf
+new file mode 100644
+index 0000000..7c2ec5b
+--- /dev/null
++++ b/judge0.conf
+@@ -0,0 +1,30 @@
++# Settings for the Judge0 code-execution engine used by coding questions.
++# Judge0 is NOT published to the host; only the backend container talks to it.
++# Reference of every option: https://github.com/judge0/judge0/blob/master/judge0.conf
++#
++# !! CHANGE BOTH PASSWORDS before using this anywhere real. !!
++
++# Don't phone home (Judge0 telemetry is on by default).
++JUDGE0_TELEMETRY_ENABLE=false
++
++# Service names from docker-compose.yml
++REDIS_HOST=judge0-redis
++REDIS_PASSWORD=change-me-redis
++POSTGRES_HOST=judge0-db
++POSTGRES_DB=judge0
++POSTGRES_USER=judge0
++POSTGRES_PASSWORD=change-me-postgres
++
++# Candidate programs must never reach the network.
++ENABLE_NETWORK=false
++ALLOW_ENABLE_NETWORK=false
++
++# Optional: require a token on every Judge0 call. If you enable this, also set
++# JUDGE0_AUTH_TOKEN (and JUDGE0_AUTH_HEADER if you rename the header) on the backend.
++# AUTHN_HEADER=X-Auth-Token
++# AUTHN_TOKEN=some-long-random-string
++
++# Optional: number of parallel judging workers per worker container
++# (default 2*nproc). You can also run more containers:
++#   docker compose --profile judge0 up -d --scale judge0-worker=3
++# COUNT=4
