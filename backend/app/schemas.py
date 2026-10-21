@@ -71,8 +71,9 @@ class ExamCreate(BaseModel):
     duration_minutes: int
     start_time: datetime | None = None
     end_time: datetime | None = None
-    questions: List[QuestionCreate]
-    
+    questions: List[QuestionCreate] = []
+    coding_problems: List["CodingProblemCreate"] = []
+
 class ExamResponse(BaseModel):
     id: int
     title: str
@@ -138,3 +139,42 @@ class ViolationWithStudent(BaseModel):
 
     class Config:
         from_attributes = True
+
+# ----------- CODING PROBLEM SCHEMAS (Judge0) -----------
+
+class TestCaseCreate(BaseModel):
+    __test__ = False  # not a pytest class, despite the name
+
+    input_data: str = ""
+    expected_output: str
+    is_sample: bool = False  # sample cases are visible to candidates; the rest stay hidden
+
+
+class CodingProblemCreate(BaseModel):
+    title: str
+    statement: str
+    input_format: str | None = None
+    output_format: str | None = None
+    constraints: str | None = None
+    points: int = 10
+    time_limit_seconds: float = 2.0
+    memory_limit_mb: int = 256
+    test_cases: List[TestCaseCreate]
+
+
+class CodingProblemBulkCreate(BaseModel):
+    problems: List[CodingProblemCreate]
+
+
+class CodeRunRequest(BaseModel):
+    language_id: int
+    source_code: str
+    custom_input: str | None = None  # if set, run once against this stdin instead of the samples
+
+
+class CodeSubmitRequest(BaseModel):
+    language_id: int
+    source_code: str
+
+
+ExamCreate.model_rebuild()

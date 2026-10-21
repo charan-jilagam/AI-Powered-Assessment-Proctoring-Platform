@@ -22,6 +22,8 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:admin123@database:5432/proctoring_db
       SECRET_KEY: 798b9c99fd71290645c1f33265317136375e620930a413d653299a774ba3fbe3
+      # Coding questions: where the Judge0 server is (only reachable if started with --profile judge0)
+      JUDGE0_URL: http://judge0-server:2358
     ports:
       - "8000:8000"
     depends_on:
@@ -36,5 +38,56 @@ services:
     depends_on:
       - backend
 
+  # ---------------------------------------------------------------------------
+  # Judge0: sandboxed code execution for coding questions. OPTIONAL - start with
+  #   docker compose --profile judge0 up -d
+  # Plain `docker compose up -d` still runs everything else; coding questions
+  # then report "execution service unavailable" instead of running code.
+  # Judge0 is deliberately NOT published to the host: only the backend can reach it.
+  # Settings live in judge0.conf (change the two passwords in it!).
+  # ---------------------------------------------------------------------------
+  judge0-server:
+    image: judge0/judge0:1.13.1
+    container_name: judge0_server
+    profiles: ["judge0"]
+    volumes:
+      - ./judge0.conf:/judge0.conf:ro
+    privileged: true   # required by Judge0's isolate sandbox
+    restart: always
+    depends_on:
+      - judge0-db
+      - judge0-redis
+
+  judge0-worker:
+    image: judge0/judge0:1.13.1
+    container_name: judge0_worker
+    profiles: ["judge0"]
+    command: ["./scripts/workers"]
+    volumes:
+      - ./judge0.conf:/judge0.conf:ro
+    privileged: true
+    restart: always
+    depends_on:
+      - judge0-db
+      - judge0-redis
+
+  judge0-db:
+    image: postgres:16.2
+    container_name: judge0_db
+    profiles: ["judge0"]
+    env_file: judge0.conf
+    volumes:
+      - judge0_data:/var/lib/postgresql/data/
+    restart: always
+
+  judge0-redis:
+    image: redis:7.2.4
+    container_name: judge0_redis
+    profiles: ["judge0"]
+    command: ["bash", "-c", 'docker-entrypoint.sh --appendonly no --requirepass "$$REDIS_PASSWORD"']
+    env_file: judge0.conf
+    restart: always
+
 volumes:
   postgres_data:
+  judge0_data:

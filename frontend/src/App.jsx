@@ -8,6 +8,7 @@ import { getToken } from "./utils/api";
 import AdminResults from "./pages/AdminResults";
 import CreateExam from "./pages/CreateExam";
 import ManageStudents from "./pages/ManageStudents";
+import AdminCoding from "./pages/AdminCoding";
 
 // This component protects routes - only lets logged-in users through
 function ProtectedRoute({ children }) {
@@ -61,6 +62,14 @@ function App() {
           element={
             <ProtectedRoute>
               <AdminResults />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="/admin/exam/:examId/coding"
+          element={
+            <ProtectedRoute>
+              <AdminCoding />
             </ProtectedRoute>
           }
         />
