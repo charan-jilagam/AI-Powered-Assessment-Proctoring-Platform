@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { apiCall } from "../utils/api";
+import CodingProblems from "../components/CodingProblems";
 
 const MAX_LEVEL2_VIOLATIONS = 3;
 
@@ -430,7 +431,8 @@ function ExamPage() {
                             <p style={styles.termHeading}>Time Limit</p>
                             <p style={styles.termText}>
                                 You have {exam.duration_minutes} minutes to complete this exam,
-                                which contains {exam.questions.length} question{exam.questions.length !== 1 ? "s" : ""}.
+                                which contains {exam.questions.length} question{exam.questions.length !== 1 ? "s" : ""}
+                                {exam.coding_problems?.length > 0 && ` and ${exam.coding_problems.length} coding problem${exam.coding_problems.length !== 1 ? "s" : ""}`}.
                                 The exam must be completed in one sitting.
                             </p>
                         </div>
@@ -654,6 +656,10 @@ function ExamPage() {
                         })}
                     </div>
                 ))}
+
+                {exam.coding_problems?.length > 0 && (
+                    <CodingProblems examId={examId} problems={exam.coding_problems} />
+                )}
 
                 <button onClick={handleSubmit} disabled={submitting} style={styles.submitBtn}>
                     {submitting ? "Submitting..." : "Submit Exam"}

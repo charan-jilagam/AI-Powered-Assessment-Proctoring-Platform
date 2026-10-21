@@ -1,0 +1,55 @@
+{
+  "problems": [
+    {
+      "title": "Sum of Two Numbers",
+      "statement": "Read two integers from one line and print their sum.",
+      "input_format": "A single line with two integers A and B separated by a space.",
+      "output_format": "A single integer: A + B.",
+      "constraints": "-1000000000 <= A, B <= 1000000000",
+      "points": 10,
+      "time_limit_seconds": 2,
+      "memory_limit_mb": 256,
+      "test_cases": [
+        { "input_data": "3 4\n", "expected_output": "7\n", "is_sample": true },
+        { "input_data": "-10 4\n", "expected_output": "-6\n", "is_sample": true },
+        { "input_data": "0 0\n", "expected_output": "0\n", "is_sample": false },
+        { "input_data": "1000000000 1000000000\n", "expected_output": "2000000000\n", "is_sample": false },
+        { "input_data": "-5 -7\n", "expected_output": "-12\n", "is_sample": false }
+      ]
+    },
+    {
+      "title": "Reverse a Word",
+      "statement": "Read a single word and print it reversed.",
+      "input_format": "One line containing a word of letters and digits (no spaces).",
+      "output_format": "The word written backwards.",
+      "constraints": "1 <= length of the word <= 100",
+      "points": 10,
+      "time_limit_seconds": 2,
+      "memory_limit_mb": 256,
+      "test_cases": [
+        { "input_data": "hello\n", "expected_output": "olleh\n", "is_sample": true },
+        { "input_data": "racecar\n", "expected_output": "racecar\n", "is_sample": true },
+        { "input_data": "a\n", "expected_output": "a\n", "is_sample": false },
+        { "input_data": "ProctorAI\n", "expected_output": "IArotcorP\n", "is_sample": false },
+        { "input_data": "Judge0\n", "expected_output": "0egduJ\n", "is_sample": false }
+      ]
+    },
+    {
+      "title": "Count the Even Numbers",
+      "statement": "You are given N integers. Print how many of them are even.",
+      "input_format": "The first line contains N. The second line contains N integers separated by spaces.",
+      "output_format": "A single integer: the number of even values.",
+      "constraints": "1 <= N <= 100000, -1000000000 <= each value <= 1000000000",
+      "points": 20,
+      "time_limit_seconds": 2,
+      "memory_limit_mb": 256,
+      "test_cases": [
+        { "input_data": "5\n1 2 3 4 6\n", "expected_output": "3\n", "is_sample": true },
+        { "input_data": "3\n7 9 11\n", "expected_output": "0\n", "is_sample": true },
+        { "input_data": "1\n0\n", "expected_output": "1\n", "is_sample": false },
+        { "input_data": "6\n2 4 6 8 10 12\n", "expected_output": "6\n", "is_sample": false },
+        { "input_data": "4\n-2 -3 -4 5\n", "expected_output": "2\n", "is_sample": false }
+      ]
+    }
+  ]
+}

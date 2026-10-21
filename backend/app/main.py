@@ -42,6 +42,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Coding questions (judged by Judge0) - see app/coding.py
+from app import coding
+app.include_router(coding.router)
+
 @app.get("/")
 def home():
     return {
@@ -190,6 +194,7 @@ def list_available_exams(
             "start_time": exam.start_time,
             "end_time": exam.end_time,
             "questions": [{}] * questions_shown,  # length = 10 so the card shows "10 questions"
+            "coding_problem_count": len(exam.coding_problems),
         })
     return result
 
@@ -231,7 +236,7 @@ def get_exam(
         all_questions = db.query(models.Question).filter(
             models.Question.exam_id == exam_id
         ).all()
-        if not all_questions:
+        if not all_questions and not exam.coding_problems:
             raise HTTPException(status_code=400, detail="This exam has no questions")
 
         num_to_pick = min(10, len(all_questions))
@@ -272,6 +277,7 @@ def get_exam(
         "start_time": exam.start_time,
         "end_time": exam.end_time,
         "questions": questions,
+        "coding_problems": coding.student_problem_views(exam),  # statements + sample tests only
         "remaining_seconds": remaining_seconds,
         "session_status": session.status,
     }
@@ -332,7 +338,12 @@ def submit_exam(
         print(f"QID {qid}: submitted='{submitted_text}' | correct='{correct_text}' | match={submitted_text.strip() == correct_text.strip() if (submitted_text and correct_text) else False}")
         if submitted_text and correct_text and submitted_text.strip() == correct_text.strip():
             score += 1
-            
+
+    # Coding problems: score from the student's best server-side graded code submissions
+    coding_earned, coding_total = coding.coding_score(db, exam_id, current_user.id)
+    score += coding_earned
+    total_questions += coding_total
+
     new_submission = models.Submission(
         exam_id=exam_id,
         student_id=current_user.id,
@@ -581,8 +592,12 @@ def create_exam(
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="Only admins can create exams")
 
-    if not exam_data.questions:
-        raise HTTPException(status_code=400, detail="An exam must have at least one question")
+    if not exam_data.questions and not exam_data.coding_problems:
+        raise HTTPException(status_code=400, detail="An exam must have at least one question or coding problem")
+
+    # Validate coding problems up front so a bad one doesn't leave a half-created exam behind
+    for coding_problem in exam_data.coding_problems:
+        coding.validate_problem(coding_problem)
 
     now = datetime.now()
     new_exam = models.Exam(
@@ -608,11 +623,19 @@ def create_exam(
             correct_answer=q.correct_answer.upper(),
         )
         db.add(question)
+
+    for coding_problem in exam_data.coding_problems:
+        coding.create_problem(db, new_exam.id, coding_problem)
     db.commit()
 
-    audit.log_event("EXAM_CREATED", current_user.email, f"exam_id={new_exam.id} title='{new_exam.title}' questions={len(exam_data.questions)}")
+    audit.log_event("EXAM_CREATED", current_user.email, f"exam_id={new_exam.id} title='{new_exam.title}' questions={len(exam_data.questions)} coding_problems={len(exam_data.coding_problems)}")
 
-    return {"id": new_exam.id, "title": new_exam.title, "question_count": len(exam_data.questions)}
+    return {
+        "id": new_exam.id,
+        "title": new_exam.title,
+        "question_count": len(exam_data.questions),
+        "coding_problem_count": len(exam_data.coding_problems),
+    }
 
 
 # ----------- UPLOAD CSV TO CREATE EXAM (Admin only) -----------
@@ -697,6 +720,7 @@ def delete_exam(
     db.query(models.Violation).filter(models.Violation.exam_id == exam_id).delete()
     db.query(models.Submission).filter(models.Submission.exam_id == exam_id).delete()
     db.query(models.ExamSession).filter(models.ExamSession.exam_id == exam_id).delete()
+    coding.delete_exam_coding_data(db, exam_id)
     db.query(models.Question).filter(models.Question.exam_id == exam_id).delete()
     db.delete(exam)
     db.commit()
@@ -753,6 +777,7 @@ def reset_student_attempt(
         models.ExamSession.student_id == student_id,
         models.ExamSession.exam_id == exam_id,
     ).delete()
+    coding.delete_student_code(db, student_id, exam_id)
     db.commit()
 
     audit.log_event("ATTEMPT_RESET", current_user.email, f"student_id={student_id} exam_id={exam_id}")
@@ -803,6 +828,7 @@ def delete_student(
     db.query(models.Violation).filter(models.Violation.student_id == student_id).delete()
     db.query(models.Submission).filter(models.Submission.student_id == student_id).delete()
     db.query(models.ExamSession).filter(models.ExamSession.student_id == student_id).delete()
+    coding.delete_student_code(db, student_id)
     db.delete(student)
     db.commit()
 

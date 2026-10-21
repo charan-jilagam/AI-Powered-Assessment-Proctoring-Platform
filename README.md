@@ -25,6 +25,7 @@ If a candidate switches tabs, exits fullscreen, looks away from the screen, has 
 - Server-locked exam sessions: refreshing won't re-roll questions or pause the timer
 - Countdown timer with automatic submission when time expires
 - Duplicate-submission protection
+- **Coding questions**: candidates write and run code in the exam (Python, C++, C, Java, JavaScript); it is executed in a [Judge0](https://github.com/judge0/judge0) sandbox and scored against hidden test cases (see [Coding questions](#coding-questions-judge0))
 
 ### Proctoring — Layer 1: Browser security
 - Tab-switch detection via the Visibility API
@@ -62,6 +63,7 @@ Frames are captured every 1.5 seconds, sent to the backend, analysed, and any vi
 | Auth | JWT tokens, bcrypt password hashing |
 | Computer vision | MediaPipe (face, gaze, lips), YOLOv8 (objects) |
 | Audio | Web Audio API — voice-band frequency analysis |
+| Code execution | Judge0 CE (optional, sandboxed, via Docker) |
 | Infrastructure | Docker, Docker Compose |
 | Testing | pytest |
 
@@ -163,6 +165,95 @@ pytest -v
 ```
 
 The suite covers password hashing and salting, JWT generation, signup and login flows, access control on protected routes, and exam scoring — including a test verifying that scoring remains correct when answer options are shuffled.
+
+Coding questions are covered by `tests/test_coding.py` (authoring, access control, hidden-test secrecy, scoring, cleanup) and `tests/test_judge0_client.py` (the Judge0 client). They use a fake Judge0, so no Docker is needed.
+
+---
+
+## Coding questions (Judge0)
+
+Exams can contain **coding problems** next to (or instead of) multiple-choice questions. Candidates get an editor
+with sample tests, a **Run** button (sample tests or their own input) and a **Submit solution** button (all tests,
+including hidden ones). Code runs inside [Judge0](https://github.com/judge0/judge0), a sandboxed execution engine.
+
+**How it fits together**
+
+```
+React exam page ──► FastAPI backend ──► Judge0 (judge0-server + judge0-worker, Docker, internal network only)
+                        │
+                        └── PostgreSQL: coding_problems, coding_test_cases, code_submissions
+```
+
+- Judge0 is **not** published to the host; only the backend talks to it. Candidates never see hidden test inputs
+  or expected outputs, only pass/fail per hidden test.
+- Scoring is server-side. Each problem has a point value; the candidate's **best** submission counts, with partial
+  credit rounded down (full points need every test to pass). Coding points are added to the normal exam score, so
+  results, rankings and percentages keep working unchanged.
+- Code can only be run during an active, in-time exam session, and executions are rate-limited per candidate
+  (`CODE_EXEC_PER_MINUTE`, default 15).
+- Admins can review every submitted solution (**Dashboard → Coding → Code submissions**) alongside the proctoring
+  violations.
+
+**Start Judge0** (optional; the rest of the app works without it, coding questions then report that the execution
+service is unavailable):
+
+```bash
+# 1. change the two passwords in judge0.conf
+# 2. start everything including Judge0
+docker compose --profile judge0 up -d
+```
+
+Judge0 needs `privileged` containers and, for the 1.13.x series, a **cgroup v1** host. On hosts that default to
+cgroup v2 (recent Ubuntu, Docker Desktop/WSL2) it may fail to start; Judge0's release notes recommend adding
+`systemd.unified_cgroup_hierarchy=0` to the kernel command line on Ubuntu 22.04. Judge0 is tested on Linux only.
+More judging capacity: `docker compose --profile judge0 up -d --scale judge0-worker=3`.
+
+**Adding problems**
+
+- *When creating an exam* (**Create Exam → Coding Problems**), or later from the exam's **Coding** button on the
+  dashboard: fill in the form, or **import from JSON**.
+- A ready-to-use example with three problems is in `backend/sample_coding_problems.json`. Format:
+
+```json
+{
+  "problems": [
+    {
+      "title": "Sum of Two Numbers",
+      "statement": "Read two integers from one line and print their sum.",
+      "input_format": "optional", "output_format": "optional", "constraints": "optional",
+      "points": 10, "time_limit_seconds": 2, "memory_limit_mb": 256,
+      "test_cases": [
+        { "input_data": "3 4\n", "expected_output": "7\n", "is_sample": true },
+        { "input_data": "0 0\n", "expected_output": "0\n", "is_sample": false }
+      ]
+    }
+  ]
+}
+```
+
+Limits: 0.5-15 s time, 16-256 MB memory, up to 50 test cases per problem. Output is compared ignoring trailing
+spaces on a line and trailing blank lines; anything else must match exactly.
+
+**Configuration** (backend environment variables)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `JUDGE0_URL` | `http://judge0-server:2358` | Where the backend reaches Judge0 (set in `docker-compose.yml`) |
+| `JUDGE0_AUTH_TOKEN` / `JUDGE0_AUTH_HEADER` | empty / `X-Auth-Token` | Only if you enable `AUTHN_TOKEN` in `judge0.conf` |
+| `CODE_EXEC_PER_MINUTE` | `15` | Run/Submit calls allowed per candidate per minute |
+
+When running the backend locally (not in Docker), publish Judge0's port yourself and point `JUDGE0_URL` at it
+(for example `http://localhost:2358`).
+
+**Notes and limits**
+
+- Language ids are Judge0 CE 1.13.x ids, listed in `backend/app/judge0.py` (`SUPPORTED_LANGUAGES`). Check them
+  against `GET /languages` on your Judge0 if you upgrade, and add more there if you like.
+- Each test case is a separate Judge0 run (a compiled language compiles once per test), so judging a problem with
+  many tests takes a few seconds; add workers if many candidates submit at once.
+- The code editor is a plain textarea (no extra dependencies). Copy/paste stays blocked by the proctoring layer.
+- Keyboard layouts that type characters with AltGr (for example `{` or `[` on some European layouts) trip the
+  existing "Alt key" rule in `ExamPage.jsx`; relax it there if you need to support those layouts.
 
 ---
 

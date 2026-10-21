@@ -131,6 +131,9 @@ function Dashboard() {
                 <div style={styles.examMeta}>
                   <span style={styles.metaTag}>⏱ {exam.duration_minutes} min</span>
                   <span style={styles.metaTag}>❓ {exam.questions.length} questions</span>
+                  {exam.coding_problem_count > 0 && (
+                    <span style={styles.metaTag}>💻 {exam.coding_problem_count} coding</span>
+                  )}
                 </div>
               </div>
               <h3 style={styles.examTitle}>{exam.title}</h3>
@@ -142,6 +145,7 @@ function Dashboard() {
                 {userRole === "admin" && (
                   <div style={styles.adminBtnRow}>
                     <Link to={`/admin/exam/${exam.id}/results`} style={styles.resultsBtn}>Results</Link>
+                    <Link to={`/admin/exam/${exam.id}/coding`} style={styles.codingBtn}>Coding</Link>
                     <Link to={`/admin/exam/${exam.id}/violations`} style={styles.violationsBtn}>Violations</Link>
                     <button onClick={() => handleDeleteExam(exam.id, exam.title)} style={styles.deleteBtn}>Delete</button>
                   </div>
@@ -262,6 +266,7 @@ const styles = {
   },
   adminBtnRow: { display: "flex", gap: "8px", flexWrap: "wrap" },
   resultsBtn: { padding: "8px 14px", background: "#0D2540", color: "#22D3EE", border: "1px solid #1E4E7A", borderRadius: "8px", textDecoration: "none", fontSize: "13px", fontWeight: "600" },
+  codingBtn: { padding: "8px 14px", background: "#1E1B3A", color: "#C4B5FD", border: "1px solid #4C3F91", borderRadius: "8px", textDecoration: "none", fontSize: "13px", fontWeight: "600" },
   violationsBtn: { padding: "8px 14px", background: "#2A1215", color: "#FCA5A5", border: "1px solid #5B2121", borderRadius: "8px", textDecoration: "none", fontSize: "13px", fontWeight: "600" },
   deleteBtn: { padding: "8px 14px", background: "transparent", color: "#64748B", border: "1px solid #1E293B", borderRadius: "8px", fontSize: "13px", fontWeight: "600", cursor: "pointer" },
   resultsSection: { marginTop: "48px" },
