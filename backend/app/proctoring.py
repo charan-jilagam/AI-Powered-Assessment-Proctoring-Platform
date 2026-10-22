@@ -1,158 +1,183 @@
-import cv2
-import numpy as np
+"""Server-side AI proctoring: face presence, multiple faces, gaze, head pose, lip movement, prohibited objects.
+
+Heavy libraries (OpenCV, MediaPipe, YOLO) are imported lazily on the first frame, never at import time, so the
+API starts fast, tests run without them, and a deployment without the AI extras degrades to "AI unavailable"
+instead of crashing. The decision logic (`interpret_landmarks`) is pure and unit-tested; the model plumbing is thin.
+"""
 import base64
+import logging
 import os
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-from ultralytics import YOLO
+import threading
+from typing import Any, Dict, List, Optional
 
-# Path to the downloaded model
-MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "face_landmarker.task")
+from app.config import settings
 
-# Set up the face landmarker once (reused across frames)
-base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
-options = vision.FaceLandmarkerOptions(
-    base_options=base_options,
-    output_face_blendshapes=False,
-    output_facial_transformation_matrixes=False,
-    num_faces=2,  # detect up to 2 faces to catch "multiple faces" violation
-)
-landmarker = vision.FaceLandmarker.create_from_options(options)
-# Load YOLOv8 model for object detection
-yolo_model = YOLO("yolov8n.pt")
+log = logging.getLogger("proctorai.ai")
 
-# Objects we consider prohibited during an exam (COCO dataset class names)
+_BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))
+FACE_MODEL_PATH = os.getenv("FACE_MODEL_PATH", os.path.join(_BACKEND_DIR, "face_landmarker.task"))
+YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", os.path.join(_BACKEND_DIR, "yolov8n.pt"))
+
+# COCO classes treated as prohibited during an exam
 PROHIBITED_OBJECTS = {
     "cell phone": "Mobile phone detected",
     "book": "Book detected",
-    "laptop": "Secondary laptop detected",
-    "tv": "TV/monitor detected",
-    "remote": "Remote/device detected",
+    "laptop": "Second laptop detected",
+    "tv": "Extra screen detected",
+    "remote": "Remote / device detected",
     "keyboard": "Extra keyboard detected",
     "mouse": "Extra mouse detected",
 }
+OBJECT_CONFIDENCE = 0.5
 
-# Landmark indices
+# MediaPipe face-mesh landmark indices
 LEFT_IRIS = [474, 475, 476, 477]
 RIGHT_IRIS = [469, 470, 471, 472]
 UPPER_LIP = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291]
 LOWER_LIP = [146, 91, 181, 84, 17, 314, 405, 321, 375, 291]
-# Track previous lip distance to detect movement over time
-_previous_lip_distance = {"value": None}
 
-def decode_image(base64_string: str):
+GAZE_LEFT_THRESHOLD = 0.35
+GAZE_RIGHT_THRESHOLD = 0.65
+LIP_OPEN_THRESHOLD = 0.05
+HEAD_YAW_LOW, HEAD_YAW_HIGH = 0.30, 0.70
+DARK_FRAME_MEAN = 18.0
+
+_lock = threading.Lock()
+_state: Dict[str, Any] = {"loaded": False, "error": None, "landmarker": None, "yolo": None, "cv2": None, "np": None, "mp": None}
+
+
+def _mean(values) -> float:
+    values = list(values)
+    return sum(values) / len(values) if values else 0.0
+
+
+def interpret_landmarks(landmarks) -> List[Dict[str, Any]]:
+    """Turn one face's 478 landmarks (objects with .x/.y in 0..1) into proctoring findings."""
+    findings: List[Dict[str, Any]] = []
     try:
-        if "," in base64_string:
-            base64_string = base64_string.split(",")[1]
-        img_bytes = base64.b64decode(base64_string)
-        img_array = np.frombuffer(img_bytes, dtype=np.uint8)
-        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
-        return img
-    except Exception as e:
-        print(f"Image decode error: {e}")
-        return None
+        left_ratio = (_mean(landmarks[i].x for i in LEFT_IRIS) - landmarks[33].x) / ((landmarks[133].x - landmarks[33].x) or 1e-4)
+        right_ratio = (_mean(landmarks[i].x for i in RIGHT_IRIS) - landmarks[362].x) / ((landmarks[263].x - landmarks[362].x) or 1e-4)
+        gaze = (left_ratio + right_ratio) / 2
+        if gaze < GAZE_LEFT_THRESHOLD:
+            findings.append({"code": "LOOKING_AWAY", "detail": "Eyes looking left"})
+        elif gaze > GAZE_RIGHT_THRESHOLD:
+            findings.append({"code": "LOOKING_AWAY", "detail": "Eyes looking right"})
+    except (IndexError, AttributeError, ZeroDivisionError):
+        pass
+
+    try:  # head yaw: where the nose tip sits between the two cheeks
+        span = (landmarks[454].x - landmarks[234].x) or 1e-4
+        yaw = (landmarks[1].x - landmarks[234].x) / span
+        if yaw < HEAD_YAW_LOW or yaw > HEAD_YAW_HIGH:
+            findings.append({"code": "HEAD_TURNED", "detail": "Head turned to the " + ("left" if yaw < HEAD_YAW_LOW else "right")})
+    except (IndexError, AttributeError, ZeroDivisionError):
+        pass
+
+    try:
+        gap = abs(_mean(landmarks[i].y for i in LOWER_LIP) - _mean(landmarks[i].y for i in UPPER_LIP))
+        if gap > LIP_OPEN_THRESHOLD:
+            findings.append({"code": "LIP_MOVEMENT", "detail": "Mouth open - possible speaking"})
+    except (IndexError, AttributeError):
+        pass
+    return findings
 
 
-def analyze_frame(base64_image: str) -> dict:
-    results = {
-        "face_detected": False,
-        "multiple_faces": False,
-        "looking_away": False,
-        "lip_moving": False,
-        "face_count": 0,
-        "gaze_direction": "unknown",
-        "warnings": []
+def _load() -> None:
+    """Import and build the models once. Failure is remembered so we do not retry on every frame."""
+    with _lock:
+        if _state["loaded"]:
+            return
+        _state["loaded"] = True
+        try:
+            import cv2
+            import mediapipe as mp
+            import numpy as np
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+
+            if not os.path.exists(FACE_MODEL_PATH):
+                raise FileNotFoundError(f"face model missing: {FACE_MODEL_PATH}")
+            options = vision.FaceLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL_PATH),
+                output_face_blendshapes=False,
+                output_facial_transformation_matrixes=False,
+                num_faces=3,
+            )
+            _state.update(landmarker=vision.FaceLandmarker.create_from_options(options), cv2=cv2, np=np, mp=mp)
+            try:
+                from ultralytics import YOLO
+                if os.path.exists(YOLO_MODEL_PATH):
+                    _state["yolo"] = YOLO(YOLO_MODEL_PATH)
+                else:
+                    log.warning("YOLO model not found at %s - object detection disabled", YOLO_MODEL_PATH)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Object detection disabled: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - missing libs, missing model, bad install
+            _state["error"] = str(exc)
+            log.warning("AI proctoring unavailable: %s", exc)
+
+
+def status() -> Dict[str, Any]:
+    if not settings.ai_proctoring_enabled:
+        return {"available": False, "reason": "disabled by configuration"}
+    if not _state["loaded"]:
+        _load()
+    return {
+        "available": _state["error"] is None,
+        "reason": _state["error"],
+        "object_detection": _state["yolo"] is not None,
     }
 
-    img = decode_image(base64_image)
-    if img is None:
-        results["warnings"].append("Could not process image")
-        return results
 
-    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_img)
+def _decode(data_url: str):
+    cv2, np = _state["cv2"], _state["np"]
+    if "," in data_url:
+        data_url = data_url.split(",", 1)[1]
+    raw = base64.b64decode(data_url)
+    return cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
 
-    detection = landmarker.detect(mp_image)
 
-    if not detection.face_landmarks:
-        results["warnings"].append("No face detected")
-        return results
-
-    face_count = len(detection.face_landmarks)
-    results["face_count"] = face_count
-    results["face_detected"] = True
-
-    if face_count > 1:
-        results["multiple_faces"] = True
-        results["warnings"].append(f"Multiple faces detected ({face_count})")
-
-    # Use the first face for gaze + lip analysis
-    landmarks = detection.face_landmarks[0]
-
-  # ---- GAZE TRACKING (iris position relative to eye corners) ----
+def analyze_frame(data_url: str, *, detect_objects: bool = True) -> Dict[str, Any]:
+    """Analyse one webcam frame. Never raises: problems come back as available=False / empty findings."""
+    result: Dict[str, Any] = {"available": False, "face_count": 0, "findings": []}
+    if not settings.ai_proctoring_enabled:
+        return result
+    if not _state["loaded"]:
+        _load()
+    if _state["error"] is not None:
+        return result
+    result["available"] = True
     try:
-        # LEFT EYE: corners are landmark 33 (outer) and 133 (inner)
-        left_eye_left = landmarks[33].x
-        left_eye_right = landmarks[133].x
-        left_iris_x = np.mean([landmarks[i].x for i in LEFT_IRIS])
+        img = _decode(data_url)
+        if img is None:
+            result["findings"].append({"code": "CAMERA_COVERED", "detail": "Frame could not be decoded"})
+            return result
+        cv2, np, mp = _state["cv2"], _state["np"], _state["mp"]
+        if float(np.mean(img)) < DARK_FRAME_MEAN:
+            result["findings"].append({"code": "CAMERA_COVERED", "detail": "Camera view is black or covered"})
+            return result
 
-        # RIGHT EYE: corners are landmark 362 (inner) and 263 (outer)
-        right_eye_left = landmarks[362].x
-        right_eye_right = landmarks[263].x
-        right_iris_x = np.mean([landmarks[i].x for i in RIGHT_IRIS])
-
-        # Ratio of iris position within each eye (0 = far left, 1 = far right)
-        left_width = left_eye_right - left_eye_left
-        right_width = right_eye_right - right_eye_left
-
-        left_ratio = (left_iris_x - left_eye_left) / (left_width + 0.0001)
-        right_ratio = (right_iris_x - right_eye_left) / (right_width + 0.0001)
-        avg_ratio = (left_ratio + right_ratio) / 2
-
-        # Tighter thresholds catch eye movement, not just head turn
-        if avg_ratio < 0.35:
-            results["gaze_direction"] = "left"
-            results["looking_away"] = True
-            results["warnings"].append("Eyes looking away (left)")
-        elif avg_ratio > 0.65:
-            results["gaze_direction"] = "right"
-            results["looking_away"] = True
-            results["warnings"].append("Eyes looking away (right)")
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        with _lock:  # the MediaPipe task object is not thread-safe
+            detection = _state["landmarker"].detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+        faces = detection.face_landmarks or []
+        result["face_count"] = len(faces)
+        if not faces:
+            result["findings"].append({"code": "NO_FACE", "detail": "No face visible"})
         else:
-            results["gaze_direction"] = "center"
-    except Exception as e:
-        print(f"Gaze tracking error: {e}")
+            if len(faces) > 1:
+                result["findings"].append({"code": "MULTIPLE_FACES", "detail": f"{len(faces)} faces visible"})
+            result["findings"].extend(interpret_landmarks(faces[0]))
 
-    # ---- LIP MOVEMENT DETECTION ----
-    try:
-        upper_lip_y = np.mean([landmarks[i].y for i in UPPER_LIP])
-        lower_lip_y = np.mean([landmarks[i].y for i in LOWER_LIP])
-        lip_distance = abs(lower_lip_y - upper_lip_y)
-
-        # Only flag if mouth is clearly open (talking with visible mouth movement)
-        if lip_distance > 0.05:  # Adjusted threshold for more sensitivity
-            results["lip_moving"] = True
-            results["warnings"].append("Lip movement detected - possible speaking")
-    except Exception as e:
-        print(f"Lip detection error: {e}")
-       # ---- OBJECT DETECTION (YOLOv8) ----
-    try:
-        if yolo_model is None:
-            return results
-        yolo_results = yolo_model(img, verbose=False)
-        for r in yolo_results:
-            for box in r.boxes:
-                class_id = int(box.cls[0])
-                confidence = float(box.conf[0])
-                class_name = yolo_model.names[class_id]
-
-                # Only flag prohibited objects with decent confidence
-                if class_name in PROHIBITED_OBJECTS and confidence > 0.4:
-                    warning = PROHIBITED_OBJECTS[class_name]
-                    if warning not in results["warnings"]:
-                        results["warnings"].append(warning)
-    except Exception as e:
-        print(f"Object detection error: {e}")
-
-    return results
+        if detect_objects and _state["yolo"] is not None:
+            seen = set()
+            for r in _state["yolo"](img, verbose=False):
+                for box in r.boxes:
+                    name = _state["yolo"].names[int(box.cls[0])]
+                    if name in PROHIBITED_OBJECTS and float(box.conf[0]) >= OBJECT_CONFIDENCE and name not in seen:
+                        seen.add(name)
+                        result["findings"].append({"code": "PROHIBITED_OBJECT", "detail": PROHIBITED_OBJECTS[name]})
+    except Exception as exc:  # noqa: BLE001 - one bad frame must never break an exam
+        log.warning("frame analysis failed: %s", exc)
+        result["findings"] = []
+    return result

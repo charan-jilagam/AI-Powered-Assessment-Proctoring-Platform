@@ -1,298 +1,75 @@
-# ProctorAI
+# ProctorAI — multi-tenant assessment & proctoring platform
 
-**AI-Powered Assessment & Proctoring Platform**
+A SaaS for running proctored online tests. The **platform owner** (super admin) onboards client **organizations**; each organization's **admins** build tests and share an **8-character test code**; **candidates** sign in with only that code, take the test in a locked-down exam room, and admins review scored results with proctoring evidence.
 
-A full-stack technical assessment platform that lets organisations run secure online exams while automatically detecting cheating through two independent layers — browser lockdown and real-time AI monitoring of the candidate's webcam and microphone.
+## Roles
 
-Built with React, FastAPI, and PostgreSQL. Fully containerized, tested, and hardened for production use.
+| Role | Created by | Can do |
+|---|---|---|
+| **Super admin** | `manage.py create-superadmin` / `SUPERADMIN_*` env | Create/suspend organizations, assign plans and per-org limit overrides, create org admins (activation link or temp password), manage plans, platform admins, demo requests, e-mail outbox, platform audit log |
+| **Admin** (client / subscriber) | Super admin | Everything inside their org: tests, question bank, invites, results, review, team, branding, API keys, webhooks, usage |
+| **Reviewer** | Org admin | Read results and evidence, review attempts, no test/team changes |
+| **Candidate** | Self, on joining with a code | Take the test; no password, no account |
 
----
+Data is isolated per organization on every query; see `backend/tests/test_tenancy.py` (44 cross-org probes).
 
-## What it does
+## Feature overview
 
-Companies screening technical candidates need to run exams online, but can't have a human watching every candidate's webcam. ProctorAI solves this: it runs the exam, scores it securely on the server, and simultaneously monitors the candidate for cheating — flagging violations for human review.
+**Platform (super admin):** organizations with trial/active/suspended/cancelled status · plans (seats, active tests, candidates/month, AI proctoring, coding, API, webhooks, evidence retention) with per-org overrides · platform admins · demo-request leads · e-mail outbox · audit log · platform usage dashboard.
 
-If a candidate switches tabs, exits fullscreen, looks away from the screen, has another person appear behind them, pulls out a phone, or starts talking, the system detects it, warns them, and records it in an auditable trail.
+**Test authoring (admin):** single / multiple / true-false / short-text questions · sections · negative marking · per-question marks and difficulty · shuffle questions and options · reusable question bank with tags · CSV import · coding problems (Judge0) with hidden test cases · duplicate test · publish/close/archive · regenerate code.
 
----
+**Access control:** 8-character code and share link `/t/{code}` · optional access password · invite-only mode with per-candidate links · start/end window · max attempts · custom candidate fields · one live session per attempt (a second join ends the first).
 
-## Features
+**Exam room:** server-authoritative timer · autosave with offline backup · resume after refresh/crash · question navigator, flag-for-review · fullscreen lock · live admin messages · auto-submit on time-out (also when the browser is gone, via the sweeper).
 
-### Assessment engine
-- Question bank with randomised selection — each candidate receives a different subset of questions
-- Answer options shuffled per question, with text-based scoring so shuffling can't break grading
-- Server-side scoring (the client is never trusted with grading)
-- Server-locked exam sessions: refreshing won't re-roll questions or pause the timer
-- Countdown timer with automatic submission when time expires
-- Duplicate-submission protection
-- **Coding questions**: candidates write and run code in the exam (Python, C++, C, Java, JavaScript); it is executed in a [Judge0](https://github.com/judge0/judge0) sandbox and scored against hidden test cases (see [Coding questions](#coding-questions-judge0))
+**Proctoring:** tab switch, window blur, fullscreen exit, copy/paste, right-click, shortcuts, devtools, resize, camera/mic loss, voice · webcam snapshots · AI checks (no face, multiple faces, looking away, head turned, lip movement, prohibited objects) with debouncing · severity levels, risk score, optional auto-termination · ID capture · consent.
 
-### Proctoring — Layer 1: Browser security
-- Tab-switch detection via the Visibility API
-- Fullscreen enforcement with exit detection
-- Copy, paste, cut, and right-click blocking
-- Keyboard shortcut blocking (Alt, Meta, F11/F12, DevTools)
-- Graded violation levels: Level 1 (minor, dismissible warning) and Level 2 (serious, blocking modal)
-- Three Level 2 violations automatically terminate the exam, enforced server-side
+**Review & results:** per-test results table, ranking, CSV export · attempt report with answers, timeline and evidence images · confirm/dismiss violations · cleared/suspicious/disqualified decisions with notes · void & allow retake · extend time · live monitor · analytics (score distribution, per-question difficulty) · candidate result page (configurable).
 
-### Proctoring — Layer 2: AI monitoring
-- **Face detection** — verifies a candidate is present; flags multiple faces
-- **Gaze tracking** — detects when the candidate looks away from the screen
-- **Lip movement detection** — flags possible speaking
-- **Object detection** — identifies phones, books, laptops, and other prohibited items
-- **Audio monitoring** — voice-frequency analysis to detect talking, tuned to ignore ambient noise
+**Integrations & ops:** API keys (`X-API-Key`) · HMAC-signed webhooks with SSRF guard · branded candidate pages · e-mail via SMTP · data erasure · evidence retention purge · health endpoints · Alembic migrations · Docker/compose · CI workflow.
 
-Frames are captured every 1.5 seconds, sent to the backend, analysed, and any violation is logged and surfaced as a live alert.
-
-### Admin console
-- Create exams manually or by uploading a CSV question bank
-- Ranked candidate results with scores, percentages, and integrity flags
-- Detailed violation reports grouped per candidate, with severity badges
-- Student management: reset attempts, delete results, remove accounts
-- Structured audit log of logins, submissions, terminations, and admin actions
-
----
-
-## Tech stack
-
-| Layer | Technology |
-|-------|-----------|
-| Frontend | React 19, Vite, React Router |
-| Backend | FastAPI (Python 3.12), Uvicorn |
-| Database | PostgreSQL 16, SQLAlchemy ORM |
-| Auth | JWT tokens, bcrypt password hashing |
-| Computer vision | MediaPipe (face, gaze, lips), YOLOv8 (objects) |
-| Audio | Web Audio API — voice-band frequency analysis |
-| Code execution | Judge0 CE (optional, sandboxed, via Docker) |
-| Infrastructure | Docker, Docker Compose |
-| Testing | pytest |
-
----
-
-## Security & production hardening
-
-This project was deliberately taken beyond "working prototype":
-
-- Secrets (database credentials, JWT signing key) loaded from environment variables, never committed
-- Admin accounts cannot be self-registered — created only by existing admins
-- Exam sessions locked server-side, preventing question re-rolling and timer pausing
-- Submissions validated against the candidate's assigned question set
-- Login rate-limited to block brute-force attempts
-- Authentication errors deliberately generic ("Invalid email or password") to avoid revealing which field was wrong
-- AI analysis is failure-isolated: a bad frame can never crash or interrupt an exam
-- Structured audit logging of all security-relevant events
-
----
-
-## Getting started
-
-### Prerequisites
-- Docker Desktop (for the containerised setup), **or**
-- Python 3.12+, Node.js 20+, and PostgreSQL 16 (for local development)
-
-### 1. Clone the repository
+## Quick start (local, SQLite)
 
 ```bash
-git clone https://github.com/gowthamcgowda22-source/AI-Powered-Assessment-Proctoring-Platform.git
-cd AI-Powered-Assessment-Proctoring-Platform
-```
-
-### 2. Download the AI model files
-
-These are excluded from the repository due to size. Place both in the `backend/` directory:
-
-```bash
-# MediaPipe face landmark model
-curl -o backend/face_landmarker.task https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
-
-# YOLOv8 object detection model
-curl -o backend/yolov8n.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8n.pt
-```
-
-### 3. Create the environment file
-
-Create `backend/.env`:
-
-```
-DATABASE_URL=postgresql://postgres:yourpassword@localhost:5432/proctoring_db
-SECRET_KEY=generate-a-long-random-string-here
-```
-
-Generate a secure key with:
-
-```bash
-python -c "import secrets; print(secrets.token_hex(32))"
-```
-
-### 4a. Run with Docker (recommended)
-
-```bash
-docker compose up -d
-docker compose exec backend python create_tables.py
-docker compose exec backend python create_admin.py
-```
-
-Open **http://localhost:5173**
-
-### 4b. Run locally
-
-**Backend:**
-```bash
+# backend
 cd backend
-python -m venv .venv
-.venv\Scripts\activate      # Windows
+python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-python create_tables.py
-uvicorn app.main:app --reload
+export DATABASE_URL=sqlite:///./dev.db SECRET_KEY=$(python -c "import secrets;print(secrets.token_urlsafe(48))")
+python manage.py create-superadmin --email you@example.com      # prompts for a password
+python manage.py demo-data --password 'ChangeMe12345'           # optional demo org + test, prints the test code
+uvicorn app.main:app --reload --port 8000
+
+# frontend (second terminal)
+cd frontend && npm install && npm run dev                       # http://localhost:5173, proxies /api → :8000
 ```
 
-**Frontend** (in a second terminal):
-```bash
-cd frontend
-npm install
-npm run dev
-```
+Open `http://localhost:5173`: sign in at `/login`, or enter the test code on the home page.
 
-> **Note:** Docker and the local setup use the same ports. Run one or the other, never both simultaneously.
-
----
-
-## Running the tests
+## Production (Docker)
 
 ```bash
-cd backend
-pytest -v
+cp .env.example .env     # set POSTGRES_PASSWORD, SECRET_KEY, FRONTEND_URL, SUPERADMIN_*, SMTP_*
+docker compose up -d --build
 ```
 
-The suite covers password hashing and salting, JWT generation, signup and login flows, access control on protected routes, and exam scoring — including a test verifying that scoring remains correct when answer options are shuffled.
+Production uses PostgreSQL and Alembic (`alembic upgrade head` runs in the backend container). Put it behind HTTPS (TLS terminator/reverse proxy). Set `WITH_AI=true` at build time to include the AI proctoring libraries. See `docs/DEPLOYMENT.md`.
 
-Coding questions are covered by `tests/test_coding.py` (authoring, access control, hidden-test secrecy, scoring, cleanup) and `tests/test_judge0_client.py` (the Judge0 client). They use a fake Judge0, so no Docker is needed. `tests/test_local_runner.py` exercises the Docker-free runner with the real interpreters/compilers installed on the machine (tests for missing toolchains are skipped).
-
----
-
-## Coding questions (Judge0)
-
-Exams can contain **coding problems** next to (or instead of) multiple-choice questions. Candidates get an editor
-with sample tests, a **Run** button (sample tests or their own input) and a **Submit solution** button (all tests,
-including hidden ones). Code runs inside [Judge0](https://github.com/judge0/judge0), a sandboxed execution engine.
-
-**How it fits together**
-
-```
-React exam page ──► FastAPI backend ──► Judge0 (judge0-server + judge0-worker, Docker, internal network only)
-                        │
-                        └── PostgreSQL: coding_problems, coding_test_cases, code_submissions
-```
-
-- Judge0 is **not** published to the host; only the backend talks to it. Candidates never see hidden test inputs
-  or expected outputs, only pass/fail per hidden test.
-- Scoring is server-side. Each problem has a point value; the candidate's **best** submission counts, with partial
-  credit rounded down (full points need every test to pass). Coding points are added to the normal exam score, so
-  results, rankings and percentages keep working unchanged.
-- Code can only be run during an active, in-time exam session, and executions are rate-limited per candidate
-  (`CODE_EXEC_PER_MINUTE`, default 15).
-- Admins can review every submitted solution (**Dashboard → Coding → Code submissions**) alongside the proctoring
-  violations.
-
-**Start Judge0** (optional; the rest of the app works without it, coding questions then report that the execution
-service is unavailable):
+## Tests
 
 ```bash
-# 1. change the two passwords in judge0.conf
-# 2. start everything including Judge0
-docker compose --profile judge0 up -d
+cd backend && pip install -r requirements-dev.txt && pytest -q     # 260 tests
+cd frontend && npm run lint && npm run build
 ```
 
-Judge0 needs `privileged` containers and, for the 1.13.x series, a **cgroup v1** host. On hosts that default to
-cgroup v2 (recent Ubuntu, Docker Desktop/WSL2) it may fail to start; Judge0's release notes recommend adding
-`systemd.unified_cgroup_hierarchy=0` to the kernel command line on Ubuntu 22.04. Judge0 is tested on Linux only.
-More judging capacity: `docker compose --profile judge0 up -d --scale judge0-worker=3`.
+## Documentation
 
-**No Docker? Local runner (development / practice only)**
+- `docs/ARCHITECTURE.md` — data model, auth, attempt lifecycle, proctoring pipeline
+- `docs/DEPLOYMENT.md` — environment variables, `manage.py` CLI, operations checklist
+- `docs/KNOWN_GAPS.md` — what is not built or not verified. **Read this before going live.**
+- Interactive API reference at `/docs` (disabled when `APP_ENV=production`)
 
-Set `CODE_RUNNER=local` in `backend/.env` and restart the backend. Code is then run directly as a subprocess on the
-machine that runs the backend (Python always; JavaScript, C, C++ and Java only if `node`, `gcc`, `g++`, `javac`/`java`
-are on the PATH, and only installed languages are offered to candidates). Java classes must be named `Main`.
+## Honest status
 
-```
-CODE_RUNNER=local
-```
-
-**This is not a sandbox.** Candidate code runs as the same OS user as the backend. The runner strips the
-environment (so `SECRET_KEY`/`DATABASE_URL` are not visible), uses a throw-away directory, enforces a wall-clock
-time limit and an output cap, and on Linux/macOS also CPU, file-size and (for Python/C/C++) memory limits. On
-Windows only the time and output limits apply. A determined candidate can still read files, use the network or
-fork-bomb, so use it for development, demos and trusted practice, not for real exams. For real exams use Judge0,
-or run the whole backend inside a locked-down container/VM.
-
-**Adding problems**
-
-- *When creating an exam* (**Create Exam → Coding Problems**), or later from the exam's **Coding** button on the
-  dashboard: fill in the form, or **import from JSON**.
-- A ready-to-use example with three problems is in `backend/sample_coding_problems.json`. Format:
-
-```json
-{
-  "problems": [
-    {
-      "title": "Sum of Two Numbers",
-      "statement": "Read two integers from one line and print their sum.",
-      "input_format": "optional", "output_format": "optional", "constraints": "optional",
-      "points": 10, "time_limit_seconds": 2, "memory_limit_mb": 256,
-      "test_cases": [
-        { "input_data": "3 4\n", "expected_output": "7\n", "is_sample": true },
-        { "input_data": "0 0\n", "expected_output": "0\n", "is_sample": false }
-      ]
-    }
-  ]
-}
-```
-
-Limits: 0.5-15 s time, 16-256 MB memory, up to 50 test cases per problem. Output is compared ignoring trailing
-spaces on a line and trailing blank lines; anything else must match exactly.
-
-**Configuration** (backend environment variables)
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `JUDGE0_URL` | `http://judge0-server:2358` | Where the backend reaches Judge0 (set in `docker-compose.yml`) |
-| `JUDGE0_AUTH_TOKEN` / `JUDGE0_AUTH_HEADER` | empty / `X-Auth-Token` | Only if you enable `AUTHN_TOKEN` in `judge0.conf` |
-| `CODE_RUNNER` | `judge0` | `judge0` (sandboxed, Docker) or `local` (no Docker, **not a sandbox**) |
-| `CODE_EXEC_PER_MINUTE` | `15` | Run/Submit calls allowed per candidate per minute |
-
-When running the backend locally (not in Docker), publish Judge0's port yourself and point `JUDGE0_URL` at it
-(for example `http://localhost:2358`).
-
-**Notes and limits**
-
-- Language ids are Judge0 CE 1.13.x ids, listed in `backend/app/judge0.py` (`SUPPORTED_LANGUAGES`). Check them
-  against `GET /languages` on your Judge0 if you upgrade, and add more there if you like.
-- Each test case is a separate Judge0 run (a compiled language compiles once per test), so judging a problem with
-  many tests takes a few seconds; add workers if many candidates submit at once.
-- The code editor is a plain textarea (no extra dependencies). Copy/paste stays blocked by the proctoring layer.
-- Keyboard layouts that type characters with AltGr (for example `{` or `[` on some European layouts) trip the
-  existing "Alt key" rule in `ExamPage.jsx`; relax it there if you need to support those layouts.
-
----
-
-## Known limitations
-
-Deployed AI that affects people's opportunities deserves honesty about its accuracy. These limitations are inherent to the problem, not implementation defects — commercial proctoring systems face the same constraints:
-
-- **Gaze tracking** works well but is not perfectly accurate. True eye-tracking varies with camera angle, lighting, and individual eye shape; high precision would require per-user calibration.
-- **Audio detection** distinguishes speech from ambient noise using voice-band frequency analysis, but a whisper and background noise occupy overlapping ranges. Thresholds are a tuned compromise.
-- **Lip movement detection** flags an open or moving mouth, but cannot confirm speech from a single frame.
-
-For this reason, AI-detected flags are presented to administrators as **advisory signals for human review**, not as automatic proof of misconduct. The admin interface states this explicitly. Only browser-security violations — which are deterministic — trigger automatic exam termination.
-
----
-
-## Deployment notes
-
-The backend loads PyTorch, MediaPipe, and YOLOv8, requiring roughly **2 GB of RAM**. Free hosting tiers typically provide 256–512 MB, which is insufficient. Production deployment requires a server with adequate memory.
-
----
-
-## Licence
-
-MIT
+Verified by automated tests and a browser smoke test: tenancy isolation, roles, plan limits, candidate lifecycle, server-side proctoring rules, results/review, webhooks, mail outbox, and the main staff and candidate screens. **Not verified here:** real AI models on real webcams, real SMTP delivery, a real Judge0 instance, PostgreSQL migrations, the Docker build. **Not implemented:** online payments/billing (plans are assigned manually by the super admin). Details in `docs/KNOWN_GAPS.md`.

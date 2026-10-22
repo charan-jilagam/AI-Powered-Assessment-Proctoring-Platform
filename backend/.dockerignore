@@ -1,9 +1,7 @@
-.venv/
-venv/
-__pycache__/
+__pycache__
 *.pyc
-.pytest_cache/
-tests/
-logs/
+.pytest_cache
 .env
-test_output.txt
+*.db
+evidence
+tests

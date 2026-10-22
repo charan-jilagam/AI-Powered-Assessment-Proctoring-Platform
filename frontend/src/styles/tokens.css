@@ -1,0 +1,69 @@
+:root {
+  --ink: #12202b;
+  --ink-2: #1b2f3d;
+  --ink-line: #2a4252;
+  --ink-text: #c6d4dd;
+  --ink-mute: #7f98a8;
+
+  --paper: #f3f5f4;
+  --surface: #ffffff;
+  --surface-2: #f8faf9;
+  --line: #dde3e1;
+  --line-strong: #c3ccc9;
+  --text: #14212b;
+  --text-2: #475662;
+  --text-3: #75828c;
+
+  --accent: #0f766e;
+  --accent-strong: #0b5a54;
+  --accent-soft: #d9efec;
+  --on-accent: #ffffff;
+
+  --ok: #0f766e;   --ok-soft: #d9efec;
+  --warn: #9a6a0a; --warn-soft: #f7ecd2;
+  --bad: #b8400b;  --bad-soft: #fae0d2;
+  --info: #2c5f8a; --info-soft: #dce9f4;
+  --neutral-soft: #e8ecea;
+
+  --font-display: 'Bricolage Grotesque Variable', 'Segoe UI', system-ui, sans-serif;
+  --font-body: 'IBM Plex Sans', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+
+  --radius: 6px;
+  --radius-lg: 10px;
+  --shadow-pop: 0 12px 40px rgba(18, 32, 43, 0.22);
+  --sidebar-w: 232px;
+  --focus: 0 0 0 3px rgba(15, 118, 110, 0.35);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --paper: #0d161d;
+    --surface: #14212b;
+    --surface-2: #18283340;
+    --line: #243745;
+    --line-strong: #34495a;
+    --text: #e6edf1;
+    --text-2: #aebdc7;
+    --text-3: #7f909c;
+    --accent: #38b2a6;
+    --accent-strong: #5ccbc0;
+    --accent-soft: #123b3a;
+    --on-accent: #06201e;
+    --ok: #4fc3b6; --ok-soft: #123b3a;
+    --warn: #e0b04a; --warn-soft: #3a2f12;
+    --bad: #f08a58; --bad-soft: #43241a;
+    --info: #7fb2de; --info-soft: #172f44;
+    --neutral-soft: #1d2d38;
+    --ink: #0a1218; --ink-2: #111d26; --ink-line: #1e303d;
+    --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.55);
+  }
+}
+:root[data-theme='dark'] {
+  --paper: #0d161d; --surface: #14212b; --surface-2: #182833; --line: #243745; --line-strong: #34495a;
+  --text: #e6edf1; --text-2: #aebdc7; --text-3: #7f909c;
+  --accent: #38b2a6; --accent-strong: #5ccbc0; --accent-soft: #123b3a; --on-accent: #06201e;
+  --ok: #4fc3b6; --ok-soft: #123b3a; --warn: #e0b04a; --warn-soft: #3a2f12; --bad: #f08a58; --bad-soft: #43241a;
+  --info: #7fb2de; --info-soft: #172f44; --neutral-soft: #1d2d38;
+  --ink: #0a1218; --ink-2: #111d26; --ink-line: #1e303d;
+}
