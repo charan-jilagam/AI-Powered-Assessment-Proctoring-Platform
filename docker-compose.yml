@@ -1,79 +1,89 @@
+# Production-style stack: Postgres + API (migrates on start) + web (nginx, proxies /api to the API).
+#   cp .env.example .env   # then edit the secrets
+#   docker compose up -d --build
+#   docker compose --profile judge0 up -d     # optional: sandboxed code execution for coding questions
 services:
   database:
     image: postgres:16
-    container_name: proctoring_db
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: admin123
-      POSTGRES_DB: proctoring_db
-    ports:
-      - "5433:5432"
+      POSTGRES_USER: proctorai
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: proctorai
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U proctorai"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   backend:
-    build: ./backend
-    container_name: proctoring_backend
+    build:
+      context: ./backend
+      args:
+        WITH_AI: ${WITH_AI:-false}
+    restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://postgres:admin123@database:5432/proctoring_db
-      SECRET_KEY: 798b9c99fd71290645c1f33265317136375e620930a413d653299a774ba3fbe3
-      # Coding questions: where the Judge0 server is (only reachable if started with --profile judge0)
-      JUDGE0_URL: http://judge0-server:2358
-    ports:
-      - "8000:8000"
+      APP_ENV: production
+      DATABASE_URL: postgresql://proctorai:${POSTGRES_PASSWORD}@database:5432/proctorai
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
+      CORS_ORIGINS: ${FRONTEND_URL:-http://localhost:8080}
+      SUPERADMIN_EMAIL: ${SUPERADMIN_EMAIL:-}
+      SUPERADMIN_PASSWORD: ${SUPERADMIN_PASSWORD:-}
+      SUPERADMIN_NAME: ${SUPERADMIN_NAME:-Platform Owner}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-true}
+      MAIL_FROM: ${MAIL_FROM:-ProctorAI <no-reply@proctorai.local>}
+      REDIS_URL: ${REDIS_URL:-}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-2}
+      TRIAL_DAYS: ${TRIAL_DAYS:-14}
+      AI_PROCTORING_ENABLED: ${AI_PROCTORING_ENABLED:-true}
+      JUDGE0_URL: ${JUDGE0_URL:-http://judge0-server:2358}
+    volumes:
+      - evidence_data:/data/evidence
     depends_on:
       database:
         condition: service_healthy
+    # not published: only the web container reaches it
 
-  frontend:
+  web:
     build: ./frontend
-    container_name: proctoring_frontend
+    restart: unless-stopped
     ports:
-      - "5173:80"
+      - "${WEB_PORT:-8080}:80"
     depends_on:
       - backend
 
   # ---------------------------------------------------------------------------
-  # Judge0: sandboxed code execution for coding questions. OPTIONAL - start with
-  #   docker compose --profile judge0 up -d
-  # Plain `docker compose up -d` still runs everything else; coding questions
-  # then report "execution service unavailable" instead of running code.
-  # Judge0 is deliberately NOT published to the host: only the backend can reach it.
-  # Settings live in judge0.conf (change the two passwords in it!).
+  # Judge0: sandboxed code execution for coding questions. OPTIONAL.
+  # Not published to the host; only the backend can reach it. Change the passwords in judge0.conf.
   # ---------------------------------------------------------------------------
   judge0-server:
     image: judge0/judge0:1.13.1
-    container_name: judge0_server
     profiles: ["judge0"]
     volumes:
       - ./judge0.conf:/judge0.conf:ro
     privileged: true   # required by Judge0's isolate sandbox
     restart: always
-    depends_on:
-      - judge0-db
-      - judge0-redis
+    depends_on: [judge0-db, judge0-redis]
 
   judge0-worker:
     image: judge0/judge0:1.13.1
-    container_name: judge0_worker
     profiles: ["judge0"]
     command: ["./scripts/workers"]
     volumes:
       - ./judge0.conf:/judge0.conf:ro
     privileged: true
     restart: always
-    depends_on:
-      - judge0-db
-      - judge0-redis
+    depends_on: [judge0-db, judge0-redis]
 
   judge0-db:
     image: postgres:16.2
-    container_name: judge0_db
     profiles: ["judge0"]
     env_file: judge0.conf
     volumes:
@@ -82,7 +92,6 @@ services:
 
   judge0-redis:
     image: redis:7.2.4
-    container_name: judge0_redis
     profiles: ["judge0"]
     command: ["bash", "-c", 'docker-entrypoint.sh --appendonly no --requirepass "$$REDIS_PASSWORD"']
     env_file: judge0.conf
@@ -90,4 +99,5 @@ services:
 
 volumes:
   postgres_data:
+  evidence_data:
   judge0_data:

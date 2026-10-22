@@ -1,0 +1,6 @@
+# Optional: server-side AI proctoring (face / gaze / lips / object detection).
+# The platform runs without these; AI analysis is simply reported as "unavailable".
+numpy>=1.26
+opencv-python-headless>=4.9
+mediapipe>=0.10
+ultralytics>=8.2

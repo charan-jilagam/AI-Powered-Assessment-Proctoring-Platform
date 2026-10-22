@@ -1,27 +1,29 @@
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Database connection URL
-# Format: postgresql://username:password@host:port/database_name
-import os
-from dotenv import load_dotenv
+from app.config import settings
 
-load_dotenv()
+_is_sqlite = settings.database_url.startswith("sqlite")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-# Create the database engine - this manages the connection
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    **({"connect_args": {"check_same_thread": False}} if _is_sqlite else {"pool_size": 10, "max_overflow": 20}),
+)
 
-# Create a session factory - each request gets its own session
+if _is_sqlite:
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_connection, _):  # enforce FKs like Postgres does
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# Base class that all our database models will inherit from
 Base = declarative_base()
 
-# Dependency function - gives each API request a database session
-# and closes it automatically when done
+
 def get_db():
+    """One database session per request, always closed."""
     db = SessionLocal()
     try:
         yield db

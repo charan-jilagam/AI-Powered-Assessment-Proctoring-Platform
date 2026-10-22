@@ -1,23 +1,47 @@
+"""Audit trail: every security-relevant action is written to the audit_logs table and to the log stream."""
+import json
 import logging
-import os
+from typing import Optional
 
-# Set up a dedicated audit logger that writes to a file
-LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-LOG_FILE = os.path.join(LOG_DIR, "audit.log")
+from sqlalchemy.orm import Session
 
-audit_logger = logging.getLogger("audit")
-audit_logger.setLevel(logging.INFO)
+from app import models
 
-# Avoid adding duplicate handlers on reload
-if not audit_logger.handlers:
-    handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    formatter = logging.Formatter("%(asctime)s | %(message)s")
-    handler.setFormatter(formatter)
-    audit_logger.addHandler(handler)
+audit_logger = logging.getLogger("proctorai.audit")
 
 
-def log_event(event: str, user_email: str = "system", details: str = ""):
-    """Write a structured audit event to the log file."""
-    message = f"{event} | user={user_email} | {details}"
-    audit_logger.info(message)
+def log_event(
+    db: Optional[Session],
+    action: str,
+    *,
+    user: Optional[models.User] = None,
+    actor_email: Optional[str] = None,
+    org_id: Optional[int] = None,
+    entity_type: Optional[str] = None,
+    entity_id: Optional[int] = None,
+    details: str = "",
+    ip: Optional[str] = None,
+    commit: bool = False,
+) -> None:
+    """Record an event. By default the row joins the caller's transaction; pass commit=True for stand-alone events."""
+    email = actor_email or (user.email if user else "system")
+    if org_id is None and user is not None:
+        org_id = user.org_id
+    audit_logger.info(json.dumps({
+        "event": action, "actor": email, "org_id": org_id, "entity": entity_type,
+        "entity_id": entity_id, "details": details[:500], "ip": ip,
+    }))
+    if db is None:
+        return
+    db.add(models.AuditLog(
+        org_id=org_id,
+        actor_id=user.id if user else None,
+        actor_email=email,
+        action=action,
+        entity_type=entity_type,
+        entity_id=entity_id,
+        details=details[:2000] if details else None,
+        ip_address=ip,
+    ))
+    if commit:
+        db.commit()

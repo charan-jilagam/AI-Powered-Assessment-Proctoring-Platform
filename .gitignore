@@ -34,3 +34,8 @@ questions.csv
 .DS_Store
 Thumbs.db
 .vscode/
+# SaaS additions
+backend/evidence/
+*.db
+.env.*
+!.env.example

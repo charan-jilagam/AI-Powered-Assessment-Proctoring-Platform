@@ -2,8 +2,8 @@
 Coding questions: admin authoring + candidate run/submit, judged by Judge0.
 
 Security model
-- Candidates can only run code for an exam they have an *active, in-time* session
-  for, and only for problems that belong to that exam.
+- Candidates can only run code inside their own *active, in-time* attempt, and only for problems
+  that belong to that attempt's test. Admin endpoints are scoped to the caller's organization.
 - Hidden test cases (inputs AND expected outputs) never leave the server. Sample
   cases are shown to candidates; hidden ones only report pass/fail.
 - Grading is done server-side from stored code submissions, never from a score
@@ -21,7 +21,9 @@ from typing import Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app import audit, auth, judge0, models, schemas
+from app import attempt_service, audit, auth, judge0, models, schemas, tenancy
+from app.attempt_deps import AttemptCtx, attempt_ctx
+from app.constants import ATT_IN_PROGRESS
 from app.database import get_db
 
 router = APIRouter(tags=["coding"])
@@ -49,11 +51,6 @@ def _throttle(user_id: int) -> None:
     if len(recent) >= EXEC_PER_MINUTE:
         raise HTTPException(status_code=429, detail="You are running code too quickly. Please wait a few seconds.")
     recent.append(now)
-
-
-def _require_admin(user: models.User, action: str) -> None:
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail=f"Only admins can {action}")
 
 
 # ----------------------------------------------------------------------------
@@ -158,13 +155,13 @@ def student_problem_views(exam: models.Exam) -> List[dict]:
 # ----------------------------------------------------------------------------
 # scoring + cleanup helpers (used by main.py)
 # ----------------------------------------------------------------------------
-def _best_by_problem(db: Session, exam_id: int, student_id: int) -> Dict[int, models.CodeSubmission]:
-    rows = (
-        db.query(models.CodeSubmission)
-        .filter(models.CodeSubmission.exam_id == exam_id, models.CodeSubmission.student_id == student_id)
-        .order_by(models.CodeSubmission.id)
-        .all()
+def _best_by_problem(db: Session, exam_id: int, candidate_id: int, attempt_id: Optional[int] = None) -> Dict[int, models.CodeSubmission]:
+    query = db.query(models.CodeSubmission).filter(
+        models.CodeSubmission.exam_id == exam_id, models.CodeSubmission.candidate_id == candidate_id
     )
+    if attempt_id is not None:
+        query = query.filter(models.CodeSubmission.attempt_id == attempt_id)
+    rows = query.order_by(models.CodeSubmission.id).all()
     best: Dict[int, models.CodeSubmission] = {}
     for row in rows:
         ratio = (row.passed / row.total) if row.total else 0
@@ -175,13 +172,13 @@ def _best_by_problem(db: Session, exam_id: int, student_id: int) -> Dict[int, mo
     return best
 
 
-def coding_score(db: Session, exam_id: int, student_id: int) -> Tuple[int, int]:
+def coding_score(db: Session, exam_id: int, candidate_id: int, attempt_id: Optional[int] = None) -> Tuple[int, int]:
     """
     (points earned, points available) from the student's best submission per
     problem. Partial credit is rounded DOWN, so full points need every test.
     """
     problems = db.query(models.CodingProblem).filter(models.CodingProblem.exam_id == exam_id).all()
-    best = _best_by_problem(db, exam_id, student_id)
+    best = _best_by_problem(db, exam_id, candidate_id, attempt_id)
     earned = 0
     for problem in problems:
         sub = best.get(problem.id)
@@ -199,8 +196,8 @@ def delete_exam_coding_data(db: Session, exam_id: int) -> None:
     db.query(models.CodingProblem).filter(models.CodingProblem.exam_id == exam_id).delete()
 
 
-def delete_student_code(db: Session, student_id: int, exam_id: Optional[int] = None) -> None:
-    q = db.query(models.CodeSubmission).filter(models.CodeSubmission.student_id == student_id)
+def delete_candidate_code(db: Session, candidate_id: int, exam_id: Optional[int] = None) -> None:
+    q = db.query(models.CodeSubmission).filter(models.CodeSubmission.candidate_id == candidate_id)
     if exam_id is not None:
         q = q.filter(models.CodeSubmission.exam_id == exam_id)
     q.delete()
@@ -209,33 +206,13 @@ def delete_student_code(db: Session, student_id: int, exam_id: Optional[int] = N
 # ----------------------------------------------------------------------------
 # candidate helpers
 # ----------------------------------------------------------------------------
-def _elapsed_seconds(started_at: datetime) -> float:
-    """Seconds since the exam session started, correct for aware (Postgres) and naive (SQLite, UTC) values."""
-    if started_at.tzinfo is None:
-        started_at = started_at.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - started_at).total_seconds()
-
-
-def _student_problem(db: Session, exam_id: int, problem_id: int, user: models.User) -> models.CodingProblem:
-    exam = db.get(models.Exam, exam_id)
-    if not exam:
-        raise HTTPException(status_code=404, detail="Exam not found")
-
-    session = db.query(models.ExamSession).filter(
-        models.ExamSession.exam_id == exam_id,
-        models.ExamSession.student_id == user.id,
-    ).first()
-    if not session:
-        raise HTTPException(status_code=400, detail="Start the exam before running code")
-    if session.status != "in_progress":
+def _candidate_problem(db: Session, ctx: AttemptCtx, problem_id: int) -> models.CodingProblem:
+    attempt, exam = ctx.attempt, ctx.exam
+    if attempt.status != ATT_IN_PROGRESS:
         raise HTTPException(status_code=403, detail="This exam session is no longer active")
-
-    if _elapsed_seconds(session.started_at) > exam.duration_minutes * 60 + TIME_GRACE_SECONDS:
-        raise HTTPException(status_code=400, detail="Time is up for this exam")
-
     problem = db.query(models.CodingProblem).filter(
         models.CodingProblem.id == problem_id,
-        models.CodingProblem.exam_id == exam_id,
+        models.CodingProblem.exam_id == exam.id,
     ).first()
     if not problem:
         raise HTTPException(status_code=404, detail="Coding problem not found in this exam")
@@ -251,69 +228,64 @@ def _check_code(language_id: int, source_code: str) -> None:
         raise HTTPException(status_code=400, detail="Source code is too long")
 
 
-def _unavailable(user: models.User, exc: Exception) -> HTTPException:
-    audit.log_event("JUDGE0_ERROR", user.email, str(exc)[:300])
+def _unavailable(email: str, exc: Exception) -> HTTPException:
+    audit.log_event(None, "JUDGE0_ERROR", actor_email=email, details=str(exc)[:300])
     return HTTPException(status_code=503, detail="Code execution service is unavailable right now. Please try again in a moment.")
 
 
-# ----------------------------------------------------------------------------
-# routes: shared
-# ----------------------------------------------------------------------------
-@router.get("/coding/languages")
-def list_languages(current_user: models.User = Depends(auth.get_current_user)):
-    return [{"id": lid, "name": name} for lid, name in judge0.SUPPORTED_LANGUAGES.items()]
+def _admin_exam(db: Session, exam_id: int, user: models.User, org: models.Organization, *, need_feature: bool = False) -> models.Exam:
+    exam = tenancy.get_exam(db, exam_id, user.org_id)
+    if need_feature:
+        tenancy.ensure_feature(org, "coding_enabled", "Coding questions")
+    return exam
 
 
 # ----------------------------------------------------------------------------
-# routes: admin authoring
+# routes: admin authoring (organization-scoped)
 # ----------------------------------------------------------------------------
-@router.post("/exams/{exam_id}/coding-problems")
+@router.post("/tests/{exam_id}/coding-problems")
 def add_coding_problem(
     exam_id: int,
     problem: schemas.CodingProblemCreate,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    user: models.User = Depends(auth.require_org_admin),
+    org: models.Organization = Depends(auth.get_current_org),
 ):
-    _require_admin(current_user, "add coding problems")
-    if not db.get(models.Exam, exam_id):
-        raise HTTPException(status_code=404, detail="Exam not found")
+    _admin_exam(db, exam_id, user, org, need_feature=True)
     validate_problem(problem)
-
     created = create_problem(db, exam_id, problem)
+    audit.log_event(db, "CODING_PROBLEM_ADDED", user=user, entity_type="test", entity_id=exam_id, details=f"title='{problem.title}'")
     db.commit()
     db.refresh(created)
-    audit.log_event("CODING_PROBLEM_ADDED", current_user.email, f"exam_id={exam_id} problem_id={created.id} title='{created.title}'")
     return admin_view(created)
 
 
-@router.post("/exams/{exam_id}/coding-problems/bulk")
+@router.post("/tests/{exam_id}/coding-problems/bulk")
 def add_coding_problems_bulk(
     exam_id: int,
     body: schemas.CodingProblemBulkCreate,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    user: models.User = Depends(auth.require_org_admin),
+    org: models.Organization = Depends(auth.get_current_org),
 ):
-    _require_admin(current_user, "add coding problems")
-    if not db.get(models.Exam, exam_id):
-        raise HTTPException(status_code=404, detail="Exam not found")
+    _admin_exam(db, exam_id, user, org, need_feature=True)
     if not body.problems:
         raise HTTPException(status_code=400, detail="No problems provided")
     for p in body.problems:  # validate everything first so the import is all-or-nothing
         validate_problem(p)
-
     created = [create_problem(db, exam_id, p) for p in body.problems]
+    audit.log_event(db, "CODING_PROBLEMS_IMPORTED", user=user, entity_type="test", entity_id=exam_id, details=f"count={len(created)}")
     db.commit()
-    audit.log_event("CODING_PROBLEMS_IMPORTED", current_user.email, f"exam_id={exam_id} count={len(created)}")
     return {"status": "imported", "count": len(created)}
 
 
-@router.get("/exams/{exam_id}/coding-problems")
+@router.get("/tests/{exam_id}/coding-problems")
 def list_coding_problems(
     exam_id: int,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    user: models.User = Depends(auth.require_org_admin),
 ):
-    _require_admin(current_user, "view coding problems")
+    tenancy.get_exam(db, exam_id, user.org_id)
     problems = (
         db.query(models.CodingProblem)
         .filter(models.CodingProblem.exam_id == exam_id)
@@ -327,32 +299,31 @@ def list_coding_problems(
 def delete_coding_problem(
     problem_id: int,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    user: models.User = Depends(auth.require_org_admin),
 ):
-    _require_admin(current_user, "delete coding problems")
     problem = db.get(models.CodingProblem, problem_id)
     if not problem:
         raise HTTPException(status_code=404, detail="Coding problem not found")
-
+    tenancy.get_exam(db, problem.exam_id, user.org_id)  # 404 if it belongs to another organization
     db.query(models.CodeSubmission).filter(models.CodeSubmission.problem_id == problem_id).delete()
     title, exam_id = problem.title, problem.exam_id
     db.delete(problem)  # test cases go with it (cascade)
+    audit.log_event(db, "CODING_PROBLEM_DELETED", user=user, entity_type="test", entity_id=exam_id, details=f"title='{title}'")
     db.commit()
-    audit.log_event("CODING_PROBLEM_DELETED", current_user.email, f"exam_id={exam_id} problem_id={problem_id} title='{title}'")
     return {"status": "deleted", "problem_id": problem_id}
 
 
-@router.get("/exams/{exam_id}/coding-submissions")
+@router.get("/tests/{exam_id}/coding-submissions")
 def list_coding_submissions(
     exam_id: int,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    user: models.User = Depends(auth.require_org_staff),
 ):
-    """Admin review: every graded code submission for the exam, newest first."""
-    _require_admin(current_user, "view code submissions")
+    """Review: every graded code submission for the test, newest first."""
+    tenancy.get_exam(db, exam_id, user.org_id)
     rows = (
         db.query(models.CodeSubmission, models.User, models.CodingProblem)
-        .join(models.User, models.User.id == models.CodeSubmission.student_id)
+        .join(models.User, models.User.id == models.CodeSubmission.candidate_id)
         .join(models.CodingProblem, models.CodingProblem.id == models.CodeSubmission.problem_id)
         .filter(models.CodeSubmission.exam_id == exam_id)
         .order_by(models.CodeSubmission.id.desc())
@@ -362,9 +333,9 @@ def list_coding_submissions(
     return [
         {
             "id": sub.id,
-            "student_id": user.id,
-            "student_name": user.full_name,
-            "student_email": user.email,
+            "candidate_id": u.id,
+            "candidate_name": u.full_name,
+            "candidate_email": u.email,
             "problem_id": problem.id,
             "problem_title": problem.title,
             "language": judge0.SUPPORTED_LANGUAGES.get(sub.language_id, str(sub.language_id)),
@@ -374,23 +345,27 @@ def list_coding_submissions(
             "created_at": sub.created_at,
             "source_code": sub.source_code,
         }
-        for sub, user, problem in rows
+        for sub, u, problem in rows
     ]
 
 
 # ----------------------------------------------------------------------------
-# routes: candidate run / submit / progress
+# routes: candidate (bound to the caller's own in-progress attempt)
 # ----------------------------------------------------------------------------
-@router.post("/exams/{exam_id}/coding-problems/{problem_id}/run")
+@router.get("/attempt/coding/languages")
+def list_languages(ctx: AttemptCtx = Depends(attempt_ctx)):
+    return [{"id": lid, "name": name} for lid, name in judge0.SUPPORTED_LANGUAGES.items()]
+
+
+@router.post("/attempt/coding/{problem_id}/run")
 def run_code(
-    exam_id: int,
     problem_id: int,
     body: schemas.CodeRunRequest,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    ctx: AttemptCtx = Depends(attempt_ctx),
 ):
     """Practice run: sample tests (or custom stdin). Not graded, not stored."""
-    problem = _student_problem(db, exam_id, problem_id, current_user)
+    problem = _candidate_problem(db, ctx, problem_id)
     _check_code(body.language_id, body.source_code)
     if body.custom_input is not None and len(body.custom_input) > MAX_CUSTOM_INPUT_CHARS:
         raise HTTPException(status_code=400, detail="Custom input is too long")
@@ -403,7 +378,7 @@ def run_code(
     if body.custom_input is None and not samples:
         raise HTTPException(status_code=400, detail="This problem has no sample tests - use custom input to try your code")
 
-    _throttle(current_user.id)
+    _throttle(ctx.user.id)
     try:
         if body.custom_input is not None:
             result = judge0.run_custom(body.source_code, body.language_id, body.custom_input,
@@ -413,19 +388,18 @@ def run_code(
                               problem.time_limit_seconds, problem.memory_limit_mb)
         return {"mode": "samples", **result}
     except judge0.Judge0Error as exc:
-        raise _unavailable(current_user, exc)
+        raise _unavailable(ctx.user.email, exc)
 
 
-@router.post("/exams/{exam_id}/coding-problems/{problem_id}/submit")
+@router.post("/attempt/coding/{problem_id}/submit")
 def submit_code(
-    exam_id: int,
     problem_id: int,
     body: schemas.CodeSubmitRequest,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    ctx: AttemptCtx = Depends(attempt_ctx),
 ):
     """Graded run against ALL tests. The best submission per problem counts."""
-    problem = _student_problem(db, exam_id, problem_id, current_user)
+    problem = _candidate_problem(db, ctx, problem_id)
     _check_code(body.language_id, body.source_code)
 
     cases = [
@@ -435,17 +409,19 @@ def submit_code(
     if not cases:
         raise HTTPException(status_code=400, detail="This problem has no test cases yet")
 
-    _throttle(current_user.id)
+    _throttle(ctx.user.id)
     try:
         result = judge0.judge(body.source_code, body.language_id, cases,
                               problem.time_limit_seconds, problem.memory_limit_mb)
     except judge0.Judge0Error as exc:
-        raise _unavailable(current_user, exc)
+        raise _unavailable(ctx.user.email, exc)
 
+    exam_id = ctx.exam.id
     submission = models.CodeSubmission(
         exam_id=exam_id,
         problem_id=problem_id,
-        student_id=current_user.id,
+        candidate_id=ctx.user.id,
+        attempt_id=ctx.attempt.id,
         language_id=body.language_id,
         source_code=body.source_code,
         verdict=result["verdict"],
@@ -457,14 +433,14 @@ def submit_code(
         ]),
     )
     db.add(submission)
+    audit.log_event(
+        db, "CODE_SUBMITTED", user=ctx.user, org_id=ctx.exam.org_id, entity_type="test", entity_id=exam_id,
+        details=f"problem_id={problem_id} verdict='{result['verdict']}' passed={result['passed']}/{result['total']}",
+    )
     db.commit()
     db.refresh(submission)
-    audit.log_event(
-        "CODE_SUBMITTED", current_user.email,
-        f"exam_id={exam_id} problem_id={problem_id} verdict='{result['verdict']}' passed={result['passed']}/{result['total']}",
-    )
 
-    best = _best_by_problem(db, exam_id, current_user.id).get(problem_id)
+    best = _best_by_problem(db, exam_id, ctx.user.id, ctx.attempt.id).get(problem_id)
     return {
         "submission_id": submission.id,
         **result,
@@ -473,19 +449,20 @@ def submit_code(
     }
 
 
-@router.get("/exams/{exam_id}/coding-progress")
+@router.get("/attempt/coding/progress")
 def coding_progress(
-    exam_id: int,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(auth.get_current_user),
+    ctx: AttemptCtx = Depends(attempt_ctx),
 ):
     """The candidate's own best result + last code per problem (restores state after a refresh)."""
-    best = _best_by_problem(db, exam_id, current_user.id)
+    exam_id, user_id = ctx.exam.id, ctx.user.id
+    best = _best_by_problem(db, exam_id, user_id, ctx.attempt.id)
     last_by_problem: Dict[int, models.CodeSubmission] = {}
     attempts: Dict[int, int] = defaultdict(int)
     rows = (
         db.query(models.CodeSubmission)
-        .filter(models.CodeSubmission.exam_id == exam_id, models.CodeSubmission.student_id == current_user.id)
+        .filter(models.CodeSubmission.exam_id == exam_id, models.CodeSubmission.candidate_id == user_id,
+                models.CodeSubmission.attempt_id == ctx.attempt.id)
         .order_by(models.CodeSubmission.id)
         .all()
     )
