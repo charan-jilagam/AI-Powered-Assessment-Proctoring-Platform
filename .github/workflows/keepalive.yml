@@ -1,0 +1,10 @@
+name: Keep ORVEXA awake
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - run: curl -fsS --max-time 60 https://orvexa.onrender.com/health/live
