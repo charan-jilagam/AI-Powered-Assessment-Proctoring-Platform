@@ -1,9 +1,9 @@
 # Architecture
 
-**Stack:** FastAPI + SQLAlchemy 2 + Pydantic 2 (backend) · React 19 + Vite + react-router 7 (frontend) · PostgreSQL in production, SQLite for dev/tests · Alembic · Judge0 for code execution · optional MediaPipe/YOLO for AI proctoring.
+**Stack:** FastAPI + PyMongo + Pydantic 2 (backend; `app/mongo.py` is a small ODM with a SQLAlchemy-like query API and integer ids from an atomic counter) · React 19 + Vite + react-router 7 (frontend) · MongoDB Atlas (tests use mongomock) · Razorpay · Cloudinary · Judge0 for code execution · optional MediaPipe/YOLO for AI proctoring.
 
 ## Tenancy
-`Organization` → `Plan` (+ `limits_override`, `-1` = unlimited). Every tenant table carries `org_id`; routers resolve the org from the authenticated user (or API key) and never accept an org id from the client. Super admins have `org_id = NULL` and use `/superadmin/*`. Candidates are `User` rows unique per `(org_id, email)`.
+`Organization` → `Plan` (+ `limits_override`, `-1` = unlimited). Every tenant table carries `org_id`; routers resolve the org from the authenticated user (or API key) and never accept an org id from the client. Super admins have `org_id = null` and use `/superadmin/*`. Candidates are `User` rows unique per `(org_id, email)`.
 
 ## Authentication
 JWT (HS256) with `sub`, `role`, `org`, `tv` (token version, bumped on password change/logout-all). Candidate tokens add `aid` (attempt) and `sn` (session nonce): joining again rotates the nonce and invalidates the earlier session. Passwords: bcrypt, ≥10 chars with a letter and a digit, lockout after repeated failures. API keys `pk_live_…` sent as `X-API-Key`, stored hashed. Reset/invite tokens are single-use and expire.

@@ -1,69 +1,87 @@
+/* ORVEXA design tokens. Light is the default; dark is a deep-navy theme with soft blue glows.
+   Brand: electric blue -> indigo -> violet (taken from the ORVEXA emblem). */
 :root {
-  --ink: #12202b;
-  --ink-2: #1b2f3d;
-  --ink-line: #2a4252;
-  --ink-text: #c6d4dd;
-  --ink-mute: #7f98a8;
+  --brand-1: #12a5f4;
+  --brand-2: #4f5bef;
+  --brand-3: #7c4dff;
+  --brand-grad: linear-gradient(135deg, #12a5f4 0%, #4f5bef 55%, #7c4dff 100%);
 
-  --paper: #f3f5f4;
+  --ink: #0b1230;               /* constant deep navy: toasts, public hero panels */
+  --ink-2: #131c45;
+  --ink-line: #243066;
+  --ink-text: #c9d2f5;
+  --ink-mute: #8591c7;
+
+  --paper: #f3f5fc;
   --surface: #ffffff;
-  --surface-2: #f8faf9;
-  --line: #dde3e1;
-  --line-strong: #c3ccc9;
-  --text: #14212b;
-  --text-2: #475662;
-  --text-3: #75828c;
+  --surface-2: #f7f8fe;
+  --line: #e4e8f5;
+  --line-strong: #cfd6ec;
+  --text: #0f1738;
+  --text-2: #475072;
+  --text-3: #7a84a6;
 
-  --accent: #0f766e;
-  --accent-strong: #0b5a54;
-  --accent-soft: #d9efec;
+  --side-bg: #f8f9fe;
+  --side-line: #e4e8f5;
+  --side-text: #3d4770;
+  --side-mute: #8089ab;
+  --side-hover: #eceffd;
+  --side-active-bg: #dfe4fd;
+  --side-active-text: #3340d6;
+  --glow: none;
+
+  --accent: #4f5bef;
+  --accent-strong: #3944d4;
+  --accent-soft: #e8ebfe;
   --on-accent: #ffffff;
+  --accent-shadow: 0 6px 16px rgba(79, 91, 239, 0.28);
 
-  --ok: #0f766e;   --ok-soft: #d9efec;
-  --warn: #9a6a0a; --warn-soft: #f7ecd2;
-  --bad: #b8400b;  --bad-soft: #fae0d2;
-  --info: #2c5f8a; --info-soft: #dce9f4;
-  --neutral-soft: #e8ecea;
+  --ok: #0e9f6e;   --ok-soft: #dcf6ea;
+  --warn: #b7791f; --warn-soft: #fdf1da;
+  --bad: #d92d4a;  --bad-soft: #fde4e8;
+  --info: #2563eb; --info-soft: #e0ebff;
+  --violet: #7c4dff; --violet-soft: #ece6ff;
+  --neutral-soft: #eceffa;
 
-  --font-display: 'Bricolage Grotesque Variable', 'Segoe UI', system-ui, sans-serif;
-  --font-body: 'IBM Plex Sans', 'Segoe UI', system-ui, sans-serif;
+  --font-display: 'Inter Variable', 'Inter', 'Segoe UI', system-ui, sans-serif;
+  --font-body: 'Inter Variable', 'Inter', 'Segoe UI', system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
 
-  --radius: 6px;
-  --radius-lg: 10px;
-  --shadow-pop: 0 12px 40px rgba(18, 32, 43, 0.22);
-  --sidebar-w: 232px;
-  --focus: 0 0 0 3px rgba(15, 118, 110, 0.35);
+  --radius: 10px;
+  --radius-lg: 16px;
+  --shadow-card: 0 1px 2px rgba(22, 31, 80, 0.04), 0 8px 24px rgba(22, 31, 80, 0.05);
+  --shadow-pop: 0 18px 50px rgba(15, 23, 56, 0.22);
+  --sidebar-w: 244px;
+  --focus: 0 0 0 3px rgba(79, 91, 239, 0.32);
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme='light']) {
-    --paper: #0d161d;
-    --surface: #14212b;
-    --surface-2: #18283340;
-    --line: #243745;
-    --line-strong: #34495a;
-    --text: #e6edf1;
-    --text-2: #aebdc7;
-    --text-3: #7f909c;
-    --accent: #38b2a6;
-    --accent-strong: #5ccbc0;
-    --accent-soft: #123b3a;
-    --on-accent: #06201e;
-    --ok: #4fc3b6; --ok-soft: #123b3a;
-    --warn: #e0b04a; --warn-soft: #3a2f12;
-    --bad: #f08a58; --bad-soft: #43241a;
-    --info: #7fb2de; --info-soft: #172f44;
-    --neutral-soft: #1d2d38;
-    --ink: #0a1218; --ink-2: #111d26; --ink-line: #1e303d;
-    --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.55);
+    --paper: #060b1e; --surface: #0b1330; --surface-2: #0e1738; --line: #1a2650; --line-strong: #2a3a72;
+    --text: #eef1ff; --text-2: #b3bde6; --text-3: #7e8bbd;
+    --side-bg: #080e26; --side-line: #172250; --side-text: #b7c1ea; --side-mute: #6f7cb0; --side-hover: #111b46;
+    --side-active-bg: linear-gradient(90deg, #4455f0, #5a62f5); --side-active-text: #ffffff;
+    --glow: 0 0 0 1px rgba(91, 108, 255, 0.10), 0 10px 40px rgba(34, 52, 160, 0.22);
+    --accent: #5b6cff; --accent-strong: #8c98ff; --accent-soft: #17215a; --on-accent: #ffffff;
+    --accent-shadow: 0 0 22px rgba(91, 108, 255, 0.55);
+    --ok: #34d399; --ok-soft: #0b3a33; --warn: #fbbf24; --warn-soft: #3a2c0b; --bad: #fb7185; --bad-soft: #43182a;
+    --info: #7db0ff; --info-soft: #11295a; --violet: #a78bfa; --violet-soft: #2a1f5c; --neutral-soft: #131d45;
+    --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.02), 0 10px 40px rgba(0, 0, 0, 0.35);
+    --shadow-pop: 0 18px 60px rgba(0, 0, 0, 0.65);
+    --focus: 0 0 0 3px rgba(91, 108, 255, 0.45);
   }
 }
 :root[data-theme='dark'] {
-  --paper: #0d161d; --surface: #14212b; --surface-2: #182833; --line: #243745; --line-strong: #34495a;
-  --text: #e6edf1; --text-2: #aebdc7; --text-3: #7f909c;
-  --accent: #38b2a6; --accent-strong: #5ccbc0; --accent-soft: #123b3a; --on-accent: #06201e;
-  --ok: #4fc3b6; --ok-soft: #123b3a; --warn: #e0b04a; --warn-soft: #3a2f12; --bad: #f08a58; --bad-soft: #43241a;
-  --info: #7fb2de; --info-soft: #172f44; --neutral-soft: #1d2d38;
-  --ink: #0a1218; --ink-2: #111d26; --ink-line: #1e303d;
+  --paper: #060b1e; --surface: #0b1330; --surface-2: #0e1738; --line: #1a2650; --line-strong: #2a3a72;
+  --text: #eef1ff; --text-2: #b3bde6; --text-3: #7e8bbd;
+  --side-bg: #080e26; --side-line: #172250; --side-text: #b7c1ea; --side-mute: #6f7cb0; --side-hover: #111b46;
+  --side-active-bg: linear-gradient(90deg, #4455f0, #5a62f5); --side-active-text: #ffffff;
+  --glow: 0 0 0 1px rgba(91, 108, 255, 0.10), 0 10px 40px rgba(34, 52, 160, 0.22);
+  --accent: #5b6cff; --accent-strong: #8c98ff; --accent-soft: #17215a; --on-accent: #ffffff;
+  --accent-shadow: 0 0 22px rgba(91, 108, 255, 0.55);
+  --ok: #34d399; --ok-soft: #0b3a33; --warn: #fbbf24; --warn-soft: #3a2c0b; --bad: #fb7185; --bad-soft: #43182a;
+  --info: #7db0ff; --info-soft: #11295a; --violet: #a78bfa; --violet-soft: #2a1f5c; --neutral-soft: #131d45;
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.02), 0 10px 40px rgba(0, 0, 0, 0.35);
+  --shadow-pop: 0 18px 60px rgba(0, 0, 0, 0.65);
+  --focus: 0 0 0 3px rgba(91, 108, 255, 0.45);
 }

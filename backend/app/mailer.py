@@ -10,7 +10,7 @@ from app.background import after_commit
 from app.config import settings
 from app.timeutil import utcnow
 
-log = logging.getLogger("proctorai.mail")
+log = logging.getLogger("orvexa.mail")
 
 
 def render(
@@ -32,12 +32,12 @@ def render(
             f'padding:12px 22px;border-radius:8px;font-weight:600;display:inline-block">{html.escape(cta_label)}</a></p>'
             f'<p style="font-size:12px;color:#64748B">If the button does not work, copy this link:<br>{safe_url}</p>'
         )
-    sender = html.escape(org_name or "ProctorAI")
+    sender = html.escape(org_name or "ORVEXA")
     return (
         '<div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:0 auto;padding:24px">'
         f'<h2 style="color:#0F172A;margin:0 0 18px">{html.escape(title)}</h2>{body}{button}'
         f'<hr style="border:none;border-top:1px solid #E2E8F0;margin:26px 0 12px">'
-        f'<p style="font-size:12px;color:#94A3B8">Sent by {sender} via ProctorAI</p></div>'
+        f'<p style="font-size:12px;color:#94A3B8">Sent by {sender} via ORVEXA</p></div>'
     )
 
 

@@ -3,8 +3,7 @@ import logging
 from datetime import timedelta
 from typing import Any, Dict, Optional
 
-from sqlalchemy import update
-from sqlalchemy.orm import Session
+from app.mongo import Session, update
 
 from app import audit, models, scoring, webhooks
 from app.constants import (
@@ -12,7 +11,7 @@ from app.constants import (
 )
 from app.timeutil import as_utc, utcnow
 
-log = logging.getLogger("proctorai.attempts")
+log = logging.getLogger("orvexa.attempts")
 
 EXPIRY_GRACE_SECONDS = 30  # network slack after the timer hits zero before the server force-submits
 

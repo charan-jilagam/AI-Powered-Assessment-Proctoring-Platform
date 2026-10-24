@@ -141,3 +141,23 @@ def test_candidate_token_cannot_call_staff_endpoints(env):
     cand = env.candidate(test["code"])
     assert env.client.get("/tests", headers=cand["headers"]).status_code == 403
     assert env.client.get("/org/dashboard", headers=cand["headers"]).status_code == 403
+
+
+def test_config_accepts_jwt_secret_alias_and_duration(monkeypatch):
+    from app.config import Settings, _duration_minutes
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.setenv("JWT_SECRET", "x" * 64)
+    monkeypatch.setenv("JWT_EXPIRE", "7d")
+    monkeypatch.delenv("STAFF_TOKEN_MINUTES", raising=False)
+    s = Settings()
+    assert s.secret_key == "x" * 64
+    assert s.staff_token_minutes == 7 * 24 * 60
+    assert _duration_minutes("12h", 1) == 720 and _duration_minutes("junk", 5) == 5
+
+
+def test_config_rejects_non_mongo_uri(monkeypatch):
+    import pytest
+    from app.config import Settings
+    monkeypatch.setenv("MONGODB_URI", "postgresql://u:p@db/x")
+    with pytest.raises(RuntimeError):
+        Settings().validate()

@@ -2,10 +2,9 @@
 from datetime import timedelta
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from app.mongo import Session, func, or_
 
 from app import audit, auth, mailer, models, serializers, staff_service, tenancy, webhooks
 from app.constants import (
@@ -70,23 +69,41 @@ def update_org(body: OrgProfilePatch, request: Request, user: models.User = Depe
 # ---------------------------------------------------------------------------
 # dashboard
 # ---------------------------------------------------------------------------
+def _pct_change(now: Optional[float], before: Optional[float]) -> Optional[float]:
+    if now is None or before is None or before == 0:
+        return None
+    return round(100 * (now - before) / before, 1)
+
+
 @router.get("/dashboard")
-def dashboard(user: models.User = Depends(auth.require_org_staff), org: models.Organization = Depends(auth.get_current_org), db: Session = Depends(get_db)):
+def dashboard(days: int = Query(30, alias="range", ge=7, le=90), user: models.User = Depends(auth.require_org_staff),
+              org: models.Organization = Depends(auth.get_current_org), db: Session = Depends(get_db)):
     A, E = models.Attempt, models.Exam
     base = db.query(A).filter(A.org_id == org.id, A.status != ATT_VOIDED)
-    since30 = utcnow() - timedelta(days=30)
-    finals = base.filter(A.status.in_([ATT_SUBMITTED, ATT_TERMINATED]), A.submitted_at >= since30)
-    submitted = finals.filter(A.status == ATT_SUBMITTED).all()
-    avg_pct = round(sum(a.percentage or 0 for a in submitted) / len(submitted), 1) if submitted else None
-    pass_rate = round(100 * sum(1 for a in submitted if a.passed) / len(submitted), 1) if submitted else None
+    if days not in (7, 30, 90):
+        raise bad_request("range must be 7, 30 or 90")
+    now = utcnow()
+    since = now - timedelta(days=days)
+    before = now - timedelta(days=2 * days)
+
+    def window(lo, hi):
+        q = base.filter(A.status.in_([ATT_SUBMITTED, ATT_TERMINATED]), A.submitted_at >= lo, A.submitted_at < hi)
+        done = q.all()
+        ok = [a for a in done if a.status == ATT_SUBMITTED]
+        avg = round(sum(a.percentage or 0 for a in ok) / len(ok), 1) if ok else None
+        rate = round(100 * sum(1 for a in ok if a.passed) / len(ok), 1) if ok else None
+        return len(done), avg, rate
+
+    n_now, avg_pct, pass_rate = window(since, now + timedelta(days=1))
+    n_before, avg_before, rate_before = window(before, since)
 
     by_status = dict(db.query(E.status, func.count(E.id)).filter(E.org_id == org.id).group_by(E.status).all())
     daily = dict(
         db.query(func.date(A.started_at), func.count(A.id))
-        .filter(A.org_id == org.id, A.started_at >= utcnow() - timedelta(days=14), A.status != ATT_VOIDED)
+        .filter(A.org_id == org.id, A.started_at >= since, A.status != ATT_VOIDED)
         .group_by(func.date(A.started_at)).all()
     )
-    series = [{"date": (utcnow() - timedelta(days=i)).date().isoformat(), "attempts": 0} for i in range(13, -1, -1)]
+    series = [{"date": (now - timedelta(days=i)).date().isoformat(), "attempts": 0} for i in range(days - 1, -1, -1)]
     for point in series:
         point["attempts"] = int(daily.get(point["date"], 0))
 
@@ -100,11 +117,13 @@ def dashboard(user: models.User = Depends(auth.require_org_staff), org: models.O
     )
     snap = tenancy.usage_snapshot(db, org)
     return {
+        "range": days,
         "tests": {"total": sum(by_status.values()), **by_status},
         "in_progress_now": base.filter(A.status == ATT_IN_PROGRESS).count(),
-        "attempts_last_30_days": finals.count(),
+        "attempts_last_30_days": n_now,
         "average_percentage": avg_pct,
         "pass_rate": pass_rate,
+        "trends": {"attempts": _pct_change(n_now, n_before), "average": _pct_change(avg_pct, avg_before), "pass_rate": _pct_change(pass_rate, rate_before)},
         "awaiting_review": flagged,
         "attempts_per_day": series,
         "recent_attempts": [
@@ -115,6 +134,43 @@ def dashboard(user: models.User = Depends(auth.require_org_staff), org: models.O
         **snap,
         "block_reason": auth.org_block_reason(org),
     }
+
+
+@router.get("/search")
+def search(q: str = "", user: models.User = Depends(auth.require_org_staff), org: models.Organization = Depends(auth.get_current_org),
+           db: Session = Depends(get_db)):
+    """Global search (Ctrl/Cmd+K): tests and candidates of this organization only."""
+    term = q.strip()[:80]
+    if len(term) < 2:
+        return {"tests": [], "candidates": []}
+    like = f"%{term}%"
+    tests = db.query(models.Exam).filter(models.Exam.org_id == org.id, models.Exam.title.ilike(like)).order_by(models.Exam.id.desc()).limit(6).all()
+    people = (db.query(models.User).filter(models.User.org_id == org.id, models.User.role == "candidate",
+                                           or_(models.User.full_name.ilike(like), models.User.email.ilike(like))).order_by(models.User.id.desc()).limit(6).all())
+    return {"tests": [{"id": t.id, "title": t.title, "status": t.status} for t in tests],
+            "candidates": [{"id": c.id, "name": c.full_name, "email": c.email} for c in people]}
+
+
+@router.get("/notifications")
+def notifications(user: models.User = Depends(auth.require_org_staff), org: models.Organization = Depends(auth.get_current_org),
+                  db: Session = Depends(get_db)):
+    A = models.Attempt
+    flagged = (db.query(func.count(A.id)).filter(A.org_id == org.id, A.status.in_([ATT_SUBMITTED, ATT_TERMINATED]),
+                                                 A.review_status == REVIEW_PENDING, A.risk_score >= 15).scalar() or 0)
+    live = db.query(func.count(A.id)).filter(A.org_id == org.id, A.status == ATT_IN_PROGRESS).scalar() or 0
+    items = []
+    if flagged:
+        items.append({"kind": "review", "tone": "warn", "text": f"{flagged} attempt{'s' if flagged > 1 else ''} need a human decision", "to": "/app/review"})
+    if live:
+        items.append({"kind": "live", "tone": "info", "text": f"{live} candidate{'s' if live > 1 else ''} taking a test right now", "to": "/app/tests"})
+    reason = auth.org_block_reason(org)
+    if reason:
+        items.append({"kind": "org", "tone": "bad", "text": reason, "to": "/app/billing"})
+    elif org.status == "trial" and org.trial_ends_at:
+        days = (as_utc(org.trial_ends_at) - utcnow()).days
+        if days <= 7:
+            items.append({"kind": "trial", "tone": "warn", "text": f"Trial ends in {max(days, 0)} day(s). Choose a plan to keep going.", "to": "/app/billing"})
+    return {"count": len(items), "items": items}
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +239,7 @@ def member_reset_link(member_id: int, user: models.User = Depends(auth.require_o
     member = tenancy.get_org_user(db, member_id, org.id)
     raw = staff_service.issue_token(db, member, "reset")
     url = staff_service.activation_url(raw, "reset")
-    mailer.queue_email(db, member.email, "Reset your ProctorAI password",
+    mailer.queue_email(db, member.email, "Reset your ORVEXA password",
                        mailer.render("Reset your password", [f"Hi {member.full_name},", f"{user.full_name} issued a password reset link for your account."],
                                      cta_label="Choose a new password", cta_url=url, org_name=org.name, brand=org.brand_color), org_id=org.id)
     audit.log_event(db, "RESET_LINK_ISSUED", user=user, entity_type="user", entity_id=member.id)
@@ -305,7 +361,7 @@ def delete_hook(hook_id: int, user: models.User = Depends(auth.require_org_admin
 @router.post("/webhooks/{hook_id}/test")
 def test_hook(hook_id: int, user: models.User = Depends(auth.require_org_admin), db: Session = Depends(get_db)):
     hook = _hook(db, hook_id, user.org_id)
-    delivery = models.WebhookDelivery(org_id=user.org_id, webhook_id=hook.id, event="ping", payload={"event": "ping", "data": {"message": "Hello from ProctorAI"}})
+    delivery = models.WebhookDelivery(org_id=user.org_id, webhook_id=hook.id, event="ping", payload={"event": "ping", "data": {"message": "Hello from ORVEXA"}})
     db.add(delivery)
     db.flush()
     from app.background import after_commit

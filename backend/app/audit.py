@@ -3,11 +3,11 @@ import json
 import logging
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from app.mongo import Session
 
 from app import models
 
-audit_logger = logging.getLogger("proctorai.audit")
+audit_logger = logging.getLogger("orvexa.audit")
 
 
 def log_event(

@@ -265,3 +265,20 @@ def test_usage_endpoint_reports_limits_and_counts(env):
     d = env.client.get("/org", headers=org["headers"]).json()
     assert d["limits"]["max_active_tests"] == 5 and d["usage"]["active_tests"] == 1 and d["usage"]["team_seats"] == 1
     assert d["plan"]["code"] == "starter"
+
+
+def test_dashboard_range_search_and_notifications(env):
+    org = env.make_org()
+    other = env.make_org()
+    test = env.make_test(org, title="Zebra Aptitude")
+    env.make_test(other, title="Zebra Secret")
+    env.candidate(test["code"])
+    d7 = env.client.get("/org/dashboard?range=7", headers=org["headers"]).json()
+    d90 = env.client.get("/org/dashboard?range=90", headers=org["headers"]).json()
+    assert len(d7["attempts_per_day"]) == 7 and len(d90["attempts_per_day"]) == 90 and "trends" in d7
+    assert env.client.get("/org/dashboard?range=5", headers=org["headers"]).status_code == 422 and env.client.get("/org/dashboard?range=45", headers=org["headers"]).status_code == 400
+    found = env.client.get("/org/search?q=zebra", headers=org["headers"]).json()
+    assert [t["title"] for t in found["tests"]] == ["Zebra Aptitude"]          # never another tenant's test
+    assert env.client.get("/org/search?q=z", headers=org["headers"]).json() == {"tests": [], "candidates": []}
+    n = env.client.get("/org/notifications", headers=org["headers"]).json()
+    assert n["count"] == len(n["items"]) and any(i["kind"] == "live" for i in n["items"])

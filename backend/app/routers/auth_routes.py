@@ -2,7 +2,7 @@ from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy.orm import Session
+from app.mongo import Session
 
 from app import audit, auth, mailer, models, serializers, staff_service
 from app.config import settings
@@ -111,7 +111,7 @@ def forgot_password(request: Request, body: ForgotPassword, db: Session = Depend
         raw = staff_service.issue_token(db, user, "reset")
         url = staff_service.activation_url(raw, "reset")
         mailer.queue_email(
-            db, user.email, "Reset your ProctorAI password",
+            db, user.email, "Reset your ORVEXA password",
             mailer.render("Reset your password", [f"Hi {user.full_name},", "We received a request to reset your password. This link works once and expires soon.",
                                                   "If you did not ask for this, you can ignore this email."],
                           cta_label="Choose a new password", cta_url=url, org_name=org.name if org else None,
@@ -135,7 +135,7 @@ def token_info(token: str, db: Session = Depends(get_db)):
     row = _valid_token_row(db, token)
     user = db.get(models.User, row.user_id)
     org = db.get(models.Organization, user.org_id) if user.org_id else None
-    return {"purpose": row.purpose, "full_name": user.full_name, "email": user.email, "organization": org.name if org else "ProctorAI"}
+    return {"purpose": row.purpose, "full_name": user.full_name, "email": user.email, "organization": org.name if org else "ORVEXA"}
 
 
 @router.post("/reset-password")

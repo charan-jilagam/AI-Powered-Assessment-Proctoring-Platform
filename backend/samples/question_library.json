@@ -1,0 +1,739 @@
+{
+ "name": "ORVEXA starter library",
+ "version": 1,
+ "questions": [
+  {
+   "section": "Python",
+   "difficulty": "easy",
+   "question_type": "single",
+   "question_text": "What does `len([1, 2, [3, 4]])` return in Python?",
+   "options": [
+    "2",
+    "3",
+    "4",
+    "Error"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "The nested list counts as one element.",
+   "tags": [
+    "python"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "Python",
+   "difficulty": "easy",
+   "question_type": "single",
+   "question_text": "Which of these is immutable in Python?",
+   "options": [
+    "list",
+    "dict",
+    "tuple",
+    "set"
+   ],
+   "correct": [
+    2
+   ],
+   "explanation": "Tuples cannot be changed after creation.",
+   "tags": [
+    "python"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "Python",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "What is the output of `print(type(3 / 2))`?",
+   "options": [
+    "<class 'int'>",
+    "<class 'float'>",
+    "<class 'double'>",
+    "<class 'number'>"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "`/` is true division and always returns a float in Python 3.",
+   "tags": [
+    "python"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Python",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "What does `[x*x for x in range(4)]` produce?",
+   "options": [
+    "[0, 1, 4, 9]",
+    "[1, 4, 9, 16]",
+    "[0, 1, 2, 3]",
+    "[0, 2, 4, 6]"
+   ],
+   "correct": [
+    0
+   ],
+   "explanation": "range(4) yields 0,1,2,3.",
+   "tags": [
+    "python"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Python",
+   "difficulty": "medium",
+   "question_type": "multiple",
+   "question_text": "Which of these are valid ways to create an empty dictionary?",
+   "options": [
+    "{}",
+    "dict()",
+    "[]",
+    "()"
+   ],
+   "correct": [
+    0,
+    1
+   ],
+   "explanation": "`[]` is a list and `()` is a tuple.",
+   "tags": [
+    "python"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Python",
+   "difficulty": "hard",
+   "question_type": "single",
+   "question_text": "What does the following print?\n\ndef f(x, acc=[]):\n    acc.append(x)\n    return acc\nf(1); print(f(2))",
+   "options": [
+    "[2]",
+    "[1, 2]",
+    "[1]",
+    "Error"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "The default list is created once and shared between calls.",
+   "tags": [
+    "python",
+    "pitfall"
+   ],
+   "marks": 3
+  },
+  {
+   "section": "JavaScript",
+   "difficulty": "easy",
+   "question_type": "single",
+   "question_text": "Which keyword declares a block-scoped variable that cannot be reassigned?",
+   "options": [
+    "var",
+    "let",
+    "const",
+    "static"
+   ],
+   "correct": [
+    2
+   ],
+   "explanation": "`const` bindings cannot be reassigned.",
+   "tags": [
+    "javascript"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "JavaScript",
+   "difficulty": "easy",
+   "question_type": "single",
+   "question_text": "What is the result of `typeof null`?",
+   "options": [
+    "\"null\"",
+    "\"object\"",
+    "\"undefined\"",
+    "\"number\""
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "A long-standing quirk of the language.",
+   "tags": [
+    "javascript"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "JavaScript",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "What does `[1, 2, 3].map(n => n * 2)` return?",
+   "options": [
+    "[2, 4, 6]",
+    "[1, 2, 3]",
+    "6",
+    "undefined"
+   ],
+   "correct": [
+    0
+   ],
+   "explanation": "`map` returns a new array of the callback results.",
+   "tags": [
+    "javascript"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "JavaScript",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "What is logged by `console.log(0.1 + 0.2 === 0.3)`?",
+   "options": [
+    "true",
+    "false",
+    "undefined",
+    "NaN"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "Binary floating point cannot represent 0.1 and 0.2 exactly.",
+   "tags": [
+    "javascript",
+    "pitfall"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "JavaScript",
+   "difficulty": "hard",
+   "question_type": "single",
+   "question_text": "Which statement about `Promise.all` is correct?",
+   "options": [
+    "It resolves with the first promise that settles",
+    "It rejects as soon as any input promise rejects",
+    "It always waits for every promise, even rejected ones",
+    "It runs the promises one after another"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "`Promise.allSettled` is the variant that waits for all.",
+   "tags": [
+    "javascript",
+    "async"
+   ],
+   "marks": 3
+  },
+  {
+   "section": "SQL",
+   "difficulty": "easy",
+   "question_type": "single",
+   "question_text": "Which clause filters rows after grouping?",
+   "options": [
+    "WHERE",
+    "HAVING",
+    "ORDER BY",
+    "LIMIT"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "WHERE filters rows before grouping; HAVING filters groups.",
+   "tags": [
+    "sql"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "SQL",
+   "difficulty": "easy",
+   "question_type": "single",
+   "question_text": "Which statement removes all rows from a table but keeps the table?",
+   "options": [
+    "DROP TABLE t",
+    "DELETE FROM t",
+    "REMOVE t",
+    "ERASE t"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "DELETE without WHERE (or TRUNCATE) empties the table; DROP removes it.",
+   "tags": [
+    "sql"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "SQL",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "Which JOIN returns all rows from the left table, with NULLs where the right table has no match?",
+   "options": [
+    "INNER JOIN",
+    "LEFT JOIN",
+    "CROSS JOIN",
+    "SELF JOIN"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "LEFT (OUTER) JOIN keeps unmatched left rows.",
+   "tags": [
+    "sql"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "SQL",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "What does `SELECT COUNT(*) FROM t` count?",
+   "options": [
+    "Only non-NULL values of the first column",
+    "All rows",
+    "Distinct rows",
+    "Only rows where every column is non-NULL"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "COUNT(*) counts rows; COUNT(col) skips NULLs.",
+   "tags": [
+    "sql"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "SQL",
+   "difficulty": "hard",
+   "question_type": "single",
+   "question_text": "Which index type usually speeds up `WHERE email = 'a@b.c'` on a large table?",
+   "options": [
+    "No index",
+    "A B-tree index on email",
+    "A second copy of the table",
+    "A view"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "An index on the filtered column lets the database avoid a full scan.",
+   "tags": [
+    "sql",
+    "performance"
+   ],
+   "marks": 3
+  },
+  {
+   "section": "Data structures & algorithms",
+   "difficulty": "easy",
+   "question_type": "single",
+   "question_text": "Which data structure is first-in, first-out?",
+   "options": [
+    "Stack",
+    "Queue",
+    "Tree",
+    "Heap"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "A queue serves elements in arrival order.",
+   "tags": [
+    "dsa"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "Data structures & algorithms",
+   "difficulty": "easy",
+   "question_type": "single",
+   "question_text": "What is the time complexity of binary search on a sorted array of n items?",
+   "options": [
+    "O(n)",
+    "O(log n)",
+    "O(n log n)",
+    "O(1)"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "Each step halves the search range.",
+   "tags": [
+    "dsa",
+    "complexity"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "Data structures & algorithms",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "Average-case lookup in a well-sized hash table is:",
+   "options": [
+    "O(1)",
+    "O(log n)",
+    "O(n)",
+    "O(n log n)"
+   ],
+   "correct": [
+    0
+   ],
+   "explanation": "Hashing locates the bucket directly.",
+   "tags": [
+    "dsa",
+    "complexity"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Data structures & algorithms",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "Which traversal of a binary search tree visits keys in ascending order?",
+   "options": [
+    "Pre-order",
+    "In-order",
+    "Post-order",
+    "Level-order"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "In-order visits left, node, right.",
+   "tags": [
+    "dsa",
+    "trees"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Data structures & algorithms",
+   "difficulty": "medium",
+   "question_type": "multiple",
+   "question_text": "Which of these sorting algorithms have O(n log n) worst-case time?",
+   "options": [
+    "Merge sort",
+    "Heap sort",
+    "Quick sort (naive pivot)",
+    "Bubble sort"
+   ],
+   "correct": [
+    0,
+    1
+   ],
+   "explanation": "Naive quick sort is O(n²) in the worst case; bubble sort is O(n²).",
+   "tags": [
+    "dsa",
+    "sorting"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Data structures & algorithms",
+   "difficulty": "hard",
+   "question_type": "single",
+   "question_text": "Which algorithm finds shortest paths from one source in a graph with non-negative edge weights?",
+   "options": [
+    "Depth-first search",
+    "Dijkstra's algorithm",
+    "Kruskal's algorithm",
+    "Topological sort"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "Kruskal builds a minimum spanning tree, a different problem.",
+   "tags": [
+    "dsa",
+    "graphs"
+   ],
+   "marks": 3
+  },
+  {
+   "section": "Data structures & algorithms",
+   "difficulty": "hard",
+   "question_type": "true_false",
+   "question_text": "A stack can be used to check whether the brackets in an expression are balanced.",
+   "options": [],
+   "correct": [
+    "True"
+   ],
+   "explanation": "Push opening brackets; pop and compare on closing ones.",
+   "tags": [
+    "dsa",
+    "stack"
+   ],
+   "marks": 3
+  },
+  {
+   "section": "Computer science",
+   "difficulty": "easy",
+   "question_type": "single",
+   "question_text": "What does HTTP status code 404 mean?",
+   "options": [
+    "Server error",
+    "Not found",
+    "Unauthorized",
+    "Redirect"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "The server cannot find the requested resource.",
+   "tags": [
+    "web",
+    "http"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "Computer science",
+   "difficulty": "easy",
+   "question_type": "true_false",
+   "question_text": "HTTPS encrypts traffic between the browser and the server.",
+   "options": [],
+   "correct": [
+    "True"
+   ],
+   "explanation": "HTTPS is HTTP over TLS.",
+   "tags": [
+    "web",
+    "security"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "Computer science",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "Which HTTP method is defined as idempotent?",
+   "options": [
+    "POST",
+    "PUT",
+    "PATCH (always)",
+    "CONNECT"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "Repeating the same PUT leaves the resource in the same state.",
+   "tags": [
+    "web",
+    "http"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Computer science",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "What is a deadlock?",
+   "options": [
+    "A program that runs very slowly",
+    "Threads waiting on each other forever for resources",
+    "A crashed process",
+    "A full disk"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "Each thread holds a resource another one needs.",
+   "tags": [
+    "os",
+    "concurrency"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Computer science",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "Which ACID property guarantees that a committed transaction survives a crash?",
+   "options": [
+    "Atomicity",
+    "Consistency",
+    "Isolation",
+    "Durability"
+   ],
+   "correct": [
+    3
+   ],
+   "explanation": "Durability: committed data is persisted.",
+   "tags": [
+    "database"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Computer science",
+   "difficulty": "hard",
+   "question_type": "single",
+   "question_text": "In Git, what does `git rebase main` do on a feature branch?",
+   "options": [
+    "Deletes main",
+    "Replays the branch's commits on top of main",
+    "Merges main with a merge commit",
+    "Pushes to origin"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "Rebase rewrites the branch's commits onto the new base.",
+   "tags": [
+    "git"
+   ],
+   "marks": 3
+  },
+  {
+   "section": "Computer science",
+   "difficulty": "hard",
+   "question_type": "single",
+   "question_text": "Which security flaw does using parameterised queries primarily prevent?",
+   "options": [
+    "Cross-site scripting",
+    "SQL injection",
+    "Clickjacking",
+    "Denial of service"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "Parameters keep user input out of the SQL text.",
+   "tags": [
+    "security",
+    "sql"
+   ],
+   "marks": 3
+  },
+  {
+   "section": "Aptitude",
+   "difficulty": "easy",
+   "question_type": "single",
+   "question_text": "What is 15% of 240?",
+   "options": [
+    "30",
+    "36",
+    "24",
+    "40"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "240 × 0.15 = 36.",
+   "tags": [
+    "aptitude",
+    "maths"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "Aptitude",
+   "difficulty": "easy",
+   "question_type": "single",
+   "question_text": "What comes next: 2, 4, 8, 16, ...?",
+   "options": [
+    "24",
+    "30",
+    "32",
+    "64"
+   ],
+   "correct": [
+    2
+   ],
+   "explanation": "Each term doubles.",
+   "tags": [
+    "aptitude",
+    "series"
+   ],
+   "marks": 1
+  },
+  {
+   "section": "Aptitude",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "A train covers 120 km in 1.5 hours. Its average speed is:",
+   "options": [
+    "60 km/h",
+    "75 km/h",
+    "80 km/h",
+    "90 km/h"
+   ],
+   "correct": [
+    2
+   ],
+   "explanation": "120 ÷ 1.5 = 80.",
+   "tags": [
+    "aptitude",
+    "maths"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Aptitude",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "If 5 workers finish a job in 12 days, how many days do 10 workers need (same rate)?",
+   "options": [
+    "4",
+    "6",
+    "8",
+    "24"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "Work is constant: 5×12 = 10×d, so d = 6.",
+   "tags": [
+    "aptitude",
+    "maths"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Aptitude",
+   "difficulty": "medium",
+   "question_type": "single",
+   "question_text": "The average of 4, 8, 12 and 16 is:",
+   "options": [
+    "8",
+    "9",
+    "10",
+    "12"
+   ],
+   "correct": [
+    2
+   ],
+   "explanation": "(4+8+12+16)/4 = 10.",
+   "tags": [
+    "aptitude",
+    "maths"
+   ],
+   "marks": 2
+  },
+  {
+   "section": "Aptitude",
+   "difficulty": "hard",
+   "question_type": "single",
+   "question_text": "A price is raised by 20% and then reduced by 20%. Compared with the original, the final price is:",
+   "options": [
+    "The same",
+    "4% lower",
+    "4% higher",
+    "2% lower"
+   ],
+   "correct": [
+    1
+   ],
+   "explanation": "1.2 × 0.8 = 0.96.",
+   "tags": [
+    "aptitude",
+    "maths"
+   ],
+   "marks": 3
+  }
+ ]
+}

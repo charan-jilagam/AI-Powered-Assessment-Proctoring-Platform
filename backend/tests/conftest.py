@@ -1,12 +1,13 @@
-"""Shared test setup: an isolated SQLite file per run, deterministic background jobs, and API builders."""
+"""Shared test setup: an in-memory MongoDB (mongomock), deterministic background jobs, and API builders."""
 import os
 import sys
 import tempfile
 
-_TMP = tempfile.mkdtemp(prefix="proctorai-tests-")
+_TMP = tempfile.mkdtemp(prefix="orvexa-tests-")
 os.environ.update({
     "APP_ENV": "test",
-    "DATABASE_URL": f"sqlite:///{_TMP}/test.db",
+    "MONGODB_URI": "mongomock://",
+    "MONGODB_DB": "orvexa_test",
     "SECRET_KEY": "test-secret-key-for-unit-tests-0123456789abcdef",
     "EVIDENCE_DIR": f"{_TMP}/evidence",
     "FRONTEND_URL": "http://frontend.test",
@@ -25,7 +26,8 @@ import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app import auth, coding, models  # noqa: E402
-from app.database import Base, SessionLocal, engine  # noqa: E402
+from app import mongo  # noqa: E402
+from app.database import SessionLocal, init_db  # noqa: E402
 from app.limiter import limiter  # noqa: E402
 from app.main import app  # noqa: E402
 from app.seed import seed_plans  # noqa: E402
@@ -133,8 +135,8 @@ class Env:
 
 @pytest.fixture()
 def env():
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
+    mongo.drop_all_data()
+    init_db()
     db = SessionLocal()
     seed_plans(db)
     db.close()

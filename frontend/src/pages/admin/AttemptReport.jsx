@@ -1,9 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { Check, Clock, MessageSquare, Power, RotateCcw, X } from 'lucide-react'
+import { Check, Clock, FileText, MessageSquare, Power, RotateCcw, X } from 'lucide-react'
 import { api } from '../../lib/api'
-import { duration, fmtDateTime, num, pct } from '../../lib/format'
-import { useAuth } from '../../lib/auth'
+import { duration, fmtDateTime, num, pct, toDate } from '../../lib/format'
 import { useDocumentTitle } from '../../lib/hooks'
 import { Alert, Async, Badge, Button, Modal, PageHeader, Panel, RiskMeter, Select, Stats, Tabs, Textarea, useLoad, useUI } from '../../ui'
 import { TextDialog } from './test/Live'
@@ -26,7 +25,6 @@ const REVIEW = [['cleared', 'Cleared — no concern'], ['suspicious', 'Suspiciou
 export default function AttemptReport() {
   const { id } = useParams()
   const nav = useNavigate()
-  const { user } = useAuth()
   const { toast, error, confirm } = useUI()
   const state = useLoad(() => api.get(`/attempts/${id}`), [id])
   const [tab, setTab] = useState('answers')
@@ -45,10 +43,12 @@ export default function AttemptReport() {
         <>
           <PageHeader title={a.candidate.name} crumbs={[{ label: 'Tests', to: '/app/tests' }, { label: a.test.title, to: `/app/tests/${a.test.id}/results` }, { label: a.candidate.name }]} subtitle={`${a.candidate.email}${a.attempt_no > 1 ? ` · attempt ${a.attempt_no}` : ''}`}>
             <Badge status={a.status} dot />{a.final_result && <Badge status={a.final_result} />}
+            <Button icon={FileText} onClick={() => nav(`/app/attempts/${id}/report`)}>Download report</Button>
             {live && <><Button icon={MessageSquare} onClick={() => setDlg('message')}>Message</Button><Button icon={Clock} onClick={() => setDlg('extend')}>Add time</Button><Button variant="danger" icon={Power} onClick={() => setDlg('terminate')}>End attempt</Button></>}
             {a.can_void && a.status !== 'voided' && <Button icon={RotateCcw} onClick={async () => { if (await confirm({ title: 'Allow a retake?', message: 'This attempt is hidden from results and kept in the audit trail. The candidate can join again with the same code and e-mail.', confirmLabel: 'Allow retake', danger: true })) run(async () => { await api.post(`/attempts/${id}/void`); nav(`/app/tests/${a.test.id}/results`) }, 'Attempt voided') }}>Allow retake</Button>}
           </PageHeader>
 
+          {a.similarity?.length > 0 && <Alert tone={a.similarity.some((x) => x.level === 'high') ? 'bad' : 'warn'}><b>Code similarity:</b> {a.similarity.map((x) => `${x.percent}% match with ${x.other_candidate} on “${x.problem}”`).join('; ')}. Compare the submissions in the Code tab — similar structure is a reason to look, not proof of copying.</Alert>}
           {a.terminated_reason && <Alert tone="bad"><b>Ended early:</b> {a.terminated_reason}</Alert>}
           <Stats items={[
             { value: a.score == null ? '—' : `${num(a.score)}/${num(a.max_score)}`, label: 'Score', sub: a.percentage != null ? `${pct(a.percentage)} · pass mark ${a.test.pass_percentage}%` : undefined },
@@ -88,7 +88,7 @@ export default function AttemptReport() {
 
           {tab === 'snapshots' && (a.snapshots.length ? <Panel><div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>{a.snapshots.map((s) => <figure key={s.id} style={{ margin: 0 }}><Evidence id={s.id} alt={`${s.kind} photo`} onOpen={setZoom} style={{ width: 160, height: 120 }} /><figcaption className="sub">{s.kind === 'id' ? 'ID document' : s.kind === 'face' ? 'Face photo' : 'Periodic'} · {fmtDateTime(s.created_at)}</figcaption></figure>)}</div></Panel> : <Panel><p className="muted">No photos stored for this attempt.</p></Panel>)}
 
-          {tab === 'code' && a.coding.map((c) => <Panel key={c.id} title={c.problem} actions={<><Badge>{c.language}</Badge><Badge tone={c.passed === c.total ? 'ok' : 'warn'}>{c.passed}/{c.total} · {c.verdict}</Badge></>} className="mb"><pre style={{ margin: 0, overflow: 'auto', fontFamily: 'var(--font-mono)', fontSize: 13 }}>{c.source_code}</pre></Panel>)}
+          {tab === 'code' && <CodeHistory coding={a.coding} startedAt={a.started_at} />}
 
           {tab === 'env' && <Panel><dl className="kv"><dt>IP address</dt><dd>{a.environment.ip_address || '—'}</dd><dt>Browser</dt><dd>{a.environment.user_agent || '—'}</dd><dt>Consent given</dt><dd>{fmtDateTime(a.environment.consent_at)}</dd>
             {Object.entries(a.environment.system_info || {}).map(([k, v]) => [<dt key={k + 'k'}>{k}</dt>, <dd key={k + 'v'}>{String(v)}</dd>])}
@@ -114,5 +114,32 @@ function ReviewForm({ current, onSave }) {
       <Textarea label="Note (kept with the record)" rows={2} value={note} onChange={(e) => setNote(e.target.value)} />
       <div><Button variant="primary" onClick={() => onSave({ status, note: note.trim() || null })}>Save decision</Button></div>
     </div>
+  )
+}
+
+
+// Replay of a candidate's coding submissions, oldest to newest, with the lines that changed since the previous one marked.
+function CodeHistory({ coding, startedAt }) {
+  const groups = useMemo(() => { const m = new Map(); coding.forEach((c) => { if (!m.has(c.problem)) m.set(c.problem, []); m.get(c.problem).push(c) }); return [...m.entries()] }, [coding])
+  return groups.map(([problem, subs]) => <CodeReplay key={problem} problem={problem} subs={subs} startedAt={startedAt} />)
+}
+
+function CodeReplay({ problem, subs, startedAt }) {
+  const [i, setI] = useState(subs.length - 1)
+  const cur = subs[i], prev = i > 0 ? subs[i - 1] : null
+  const seen = useMemo(() => new Set((prev?.source_code || '').split('\n').map((l) => l.trim())), [prev])
+  const mins = (c) => (startedAt && c.created_at ? Math.max(0, Math.round((toDate(c.created_at) - toDate(startedAt)) / 60000)) : null)
+  return (
+    <Panel title={problem} className="mb" actions={<><Badge>{cur.language}</Badge><Badge tone={cur.passed === cur.total ? 'ok' : 'warn'}>{cur.passed}/{cur.total} · {cur.verdict}</Badge></>}>
+      {subs.length > 1 && (
+        <div className="replay-bar">
+          <Button size="sm" disabled={i === 0} onClick={() => setI(i - 1)}>Previous</Button>
+          <input type="range" min={0} max={subs.length - 1} value={i} onChange={(e) => setI(Number(e.target.value))} aria-label="Submission history" />
+          <Button size="sm" disabled={i === subs.length - 1} onClick={() => setI(i + 1)}>Next</Button>
+          <span className="muted">Submission {i + 1} of {subs.length}{mins(cur) != null ? ` · ${mins(cur)} min into the test` : ''}</span>
+        </div>
+      )}
+      <pre className="code-view">{cur.source_code.split('\n').map((line, n) => <span key={n} className={prev && line.trim() && !seen.has(line.trim()) ? 'added' : ''}><i>{n + 1}</i>{line || ' '}{'\n'}</span>)}</pre>
+    </Panel>
   )
 }

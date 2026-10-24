@@ -4,8 +4,8 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from app.mongo import func, or_
+from app.mongo import Session
 
 from app import audit, auth, coding, exam_service, models, question_rules, tenancy, webhooks
 from app.constants import (
@@ -26,7 +26,7 @@ router = APIRouter(prefix="/tests", tags=["tests"])
 @router.get("/questions-template.csv")
 def questions_template(user: models.User = Depends(auth.require_org_staff)):
     return Response(exam_service.csv_template(), media_type="text/csv",
-                    headers={"Content-Disposition": 'attachment; filename="proctorai-questions-template.csv"'})
+                    headers={"Content-Disposition": 'attachment; filename="orvexa-questions-template.csv"'})
 
 
 @router.get("")

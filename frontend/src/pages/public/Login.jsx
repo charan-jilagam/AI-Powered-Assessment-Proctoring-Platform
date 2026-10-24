@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
-import { ShieldCheck } from 'lucide-react'
 import { homeFor, useAuth } from '../../lib/auth'
 import { Alert, Button, Input } from '../../ui'
 
@@ -8,8 +7,8 @@ export function AuthShell({ children, headline = 'Run assessments you can stand 
   return (
     <div className="auth">
       <div className="auth-art">
-        <Link to="/" className="brand" style={{ padding: 0 }}><span className="mark"><ShieldCheck size={16} /></span>ProctorAI</Link>
-        <div><h2>{headline}</h2><p>{blurb}</p></div>
+        <Link to="/" className="brand" style={{ padding: 0 }}><img src="/brand/orvexa-emblem.png" alt="" width="30" height="30" />ORVEXA</Link>
+        <div><h2>{headline}</h2><p>{blurb}</p><p className="tagline">Assess Smarter. Trust Every Result.</p></div>
         <small style={{ color: 'var(--ink-mute)' }}>Taking a test? Use the link or code your organizer sent you.</small>
       </div>
       <div className="auth-form"><div className="auth-card">{children}</div></div>

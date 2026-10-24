@@ -1,6 +1,7 @@
-"""ProctorAI API - multi-tenant assessment & proctoring platform."""
+"""ORVEXA API - multi-tenant assessment & proctoring platform."""
 import asyncio
 import logging
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -8,21 +9,23 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app import attempt_service, coding, proctoring
 from app.config import settings
-from app.database import Base, SessionLocal, engine
+from app import database
+from app.mongo import IntegrityError
+from app.database import SessionLocal
 from app.limiter import limiter
-from app.routers import auth_routes, bank, candidate, invites, org, public, results, superadmin, tests
+from app.routers import auth_routes, bank, billing, candidate, invites, org, public, results, superadmin, tests
 from app.seed import bootstrap_super_admin, seed_plans
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
-log = logging.getLogger("proctorai")
+log = logging.getLogger("orvexa")
 
 VERSION = "2.0.0"
 
@@ -48,15 +51,17 @@ async def _sweeper() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # Production schema is managed by Alembic (`alembic upgrade head`); dev/test auto-create for convenience.
-    if not settings.is_production:
-        Base.metadata.create_all(bind=engine)
+    # MongoDB creates databases and collections lazily; this makes sure the indexes (and so the database) exist.
+    try:
+        database.init_db()
+    except Exception:  # noqa: BLE001
+        log.exception("could not initialise MongoDB (check MONGODB_URI and Atlas network access)")
     db = SessionLocal()
     try:
         seed_plans(db)
         bootstrap_super_admin(db)
     except Exception:  # noqa: BLE001
-        log.exception("startup seeding failed (has the database been migrated?)")
+        log.exception("startup seeding failed (is MongoDB reachable?)")
     finally:
         db.close()
     task = asyncio.create_task(_sweeper()) if settings.run_sweeper else None
@@ -66,7 +71,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="ProctorAI API",
+    title="ORVEXA API",
     description="Multi-tenant online assessment and AI proctoring platform.",
     version=VERSION,
     lifespan=lifespan,
@@ -86,8 +91,18 @@ app.add_middleware(
 )
 
 
+STATIC = settings.static_dir if settings.static_dir and os.path.isfile(os.path.join(settings.static_dir, "index.html")) else ""
+CSP = ("default-src 'self'; script-src 'self' https://checkout.razorpay.com; style-src 'self' 'unsafe-inline'; "
+       "img-src 'self' data: blob: https:; media-src 'self' blob:; font-src 'self' data:; "
+       "connect-src 'self' https://api.razorpay.com https://lumberjack.razorpay.com https://checkout.razorpay.com; "
+       "frame-src https://api.razorpay.com https://checkout.razorpay.com; worker-src 'self' blob:; object-src 'none'; "
+       "base-uri 'self'; form-action 'self' https://api.razorpay.com; frame-ancestors 'none'")
+
+
 @app.middleware("http")
 async def request_context(request: Request, call_next):
+    if STATIC and (request.scope["path"] == "/api" or request.scope["path"].startswith("/api/")):
+        request.scope["path"] = request.scope["path"][4:] or "/"      # the frontend calls /api/*; the routers live at /*
     request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
     started = time.perf_counter()
     response = await call_next(request)
@@ -95,6 +110,9 @@ async def request_context(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
+    if STATIC:
+        response.headers.setdefault("Content-Security-Policy", CSP)
+        response.headers["Permissions-Policy"] = "camera=(self), microphone=(self), fullscreen=(self)"
     if settings.is_production:
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     if request.url.path not in ("/health", "/health/live", "/health/ready"):
@@ -125,6 +143,11 @@ async def rate_limited(_: Request, exc: RateLimitExceeded):
     return JSONResponse({"detail": "Too many requests. Please wait a minute and try again.", "code": "rate_limited"}, status_code=429)
 
 
+@app.exception_handler(IntegrityError)
+async def duplicate(_: Request, exc: IntegrityError):
+    return JSONResponse({"detail": "That record already exists.", "code": "conflict"}, status_code=409)
+
+
 @app.exception_handler(Exception)
 async def unhandled(request: Request, exc: Exception):
     log.exception("unhandled error on %s %s", request.method, request.url.path)
@@ -133,7 +156,7 @@ async def unhandled(request: Request, exc: Exception):
 
 @app.get("/")
 def root():
-    return {"name": "ProctorAI API", "version": VERSION, "status": "online"}
+    return {"name": "ORVEXA API", "version": VERSION, "status": "online"}
 
 
 @app.get("/health/live")
@@ -146,8 +169,7 @@ def live():
 def ready():
     db_ok = True
     try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        database.ping()
     except Exception:  # noqa: BLE001
         db_ok = False
     ai = proctoring._state
@@ -156,6 +178,22 @@ def ready():
     return JSONResponse(body, status_code=200 if db_ok else 503)
 
 
-for r in (auth_routes.router, public.router, superadmin.router, org.router, tests.router, bank.router, invites.router,
+for r in (auth_routes.router, public.router, billing.router, superadmin.router, org.router, tests.router, bank.router, invites.router,
           candidate.public_router, candidate.router, results.router, coding.router):
     app.include_router(r)
+
+
+# ---------------------------------------------------------------------------
+# Single-service deployments (Render): serve the built frontend from this process.
+# Registered last so every API route wins; unknown GET paths fall back to the SPA.
+# ---------------------------------------------------------------------------
+if STATIC:
+    app.mount("/assets", StaticFiles(directory=os.path.join(STATIC, "assets")), name="assets")
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def spa(path: str):
+        root = os.path.realpath(STATIC)
+        target = os.path.realpath(os.path.join(root, path))
+        if path and target.startswith(root + os.sep) and os.path.isfile(target):
+            return FileResponse(target, headers={"Cache-Control": "public, max-age=3600"})
+        return FileResponse(os.path.join(root, "index.html"), headers={"Cache-Control": "no-cache"})

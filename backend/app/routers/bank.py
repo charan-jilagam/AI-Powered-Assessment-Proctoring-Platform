@@ -1,9 +1,13 @@
 """The organization's reusable question bank (questions not attached to any test)."""
-from typing import Optional
+import json
+from collections import Counter
+from pathlib import Path
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from app.mongo import func, or_
+from app.mongo import Session
 
 from app import auth, exam_service, models, question_rules
 from app.database import get_db
@@ -12,6 +16,19 @@ from app.pagination import PageParams, paginate
 from app.schemas import QuestionIn
 
 router = APIRouter(prefix="/bank", tags=["question bank"])
+
+_LIBRARY_FILE = Path(__file__).resolve().parent.parent.parent / "samples" / "question_library.json"
+
+
+def _library() -> list:
+    try:
+        return json.loads(_LIBRARY_FILE.read_text(encoding="utf-8"))["questions"]
+    except (OSError, ValueError, KeyError):
+        return []
+
+
+class LibraryImport(BaseModel):
+    sections: List[str] = []   # empty = everything
 
 
 def _bank_question(db: Session, qid: int, org_id: int) -> models.Question:
@@ -78,3 +95,32 @@ def delete_bank_question(question_id: int, user: models.User = Depends(auth.requ
     db.delete(_bank_question(db, question_id, user.org_id))
     db.commit()
     return {"status": "deleted"}
+
+
+@router.get("/library")
+def library_overview(user: models.User = Depends(auth.require_org_admin), db: Session = Depends(get_db)):
+    """The built-in starter library, grouped by section, with how much of it is already in this organization's bank."""
+    have = {t for (t,) in db.query(models.Question.question_text).filter(models.Question.org_id == user.org_id, models.Question.exam_id.is_(None)).all()}
+    total, imported = Counter(), Counter()
+    for q in _library():
+        total[q["section"]] += 1
+        imported[q["section"]] += q["question_text"] in have
+    return {"sections": [{"section": s, "questions": n, "imported": imported[s]} for s, n in sorted(total.items())]}
+
+
+@router.post("/library/import")
+def library_import(body: LibraryImport, user: models.User = Depends(auth.require_org_admin), db: Session = Depends(get_db)):
+    """Copy library questions into the bank. Safe to repeat: questions already in the bank are skipped."""
+    wanted = set(body.sections)
+    have = {t for (t,) in db.query(models.Question.question_text).filter(models.Question.org_id == user.org_id, models.Question.exam_id.is_(None)).all()}
+    added = skipped = 0
+    for item in _library():
+        if wanted and item["section"] not in wanted:
+            continue
+        if item["question_text"] in have:
+            skipped += 1
+            continue
+        db.add(models.Question(org_id=user.org_id, exam_id=None, created_by=user.id, **question_rules.normalize_question(item)))
+        added += 1
+    db.commit()
+    return {"added": added, "skipped": skipped}

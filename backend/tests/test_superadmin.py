@@ -122,7 +122,7 @@ def test_overview_numbers(env):
     o = env.client.get("/superadmin/overview", headers=env.super).json()
     assert o["organizations"]["total"] == 1 and o["organizations"]["active"] == 1
     assert o["tests"]["published"] == 1 and o["attempts"]["this_month"] == 1 and o["attempts"]["in_progress_now"] == 1
-    assert o["mrr"] == {"USD": 199} and len(o["attempts_last_30_days"]) == 30
+    assert o["mrr"] == {"INR": 3999} and len(o["attempts_last_30_days"]) == 30
     assert o["top_organizations"][0]["attempts"] == 1
 
 

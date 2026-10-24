@@ -6,8 +6,8 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, UploadFile
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from app.mongo import func
+from app.mongo import Session
 
 from app import audit, auth, exam_service, mailer, models, staff_service, tenancy, webhooks
 from app.constants import EXAM_PUBLISHED, INV_COMPLETED, INV_PENDING, INV_REVOKED, INV_STARTED

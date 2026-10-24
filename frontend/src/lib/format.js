@@ -14,7 +14,7 @@ export function ago(v) {
 }
 export const pct = (v) => (v === null || v === undefined ? '—' : `${Math.round(v * 10) / 10}%`)
 export const num = (v) => (v === null || v === undefined ? '—' : Number.isInteger(v) ? String(v) : String(Math.round(v * 100) / 100))
-export const money = (v, cur = 'USD') => new Intl.NumberFormat(undefined, { style: 'currency', currency: cur, maximumFractionDigits: 0 }).format(v || 0)
+export const money = (v, cur = 'USD') => new Intl.NumberFormat(cur === 'INR' ? 'en-IN' : undefined, { style: 'currency', currency: cur, maximumFractionDigits: 0 }).format(v || 0)
 export function clock(totalSeconds) {
   const s = Math.max(0, Math.floor(totalSeconds))
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60

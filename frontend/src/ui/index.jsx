@@ -1,7 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useId, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Link } from 'react-router-dom'
-import { AlertTriangle, Check, ChevronLeft, ChevronRight, Copy, Info, Loader2, Search, X, CircleCheck, CircleAlert } from 'lucide-react'
+import { AlertTriangle, ArrowDown, ArrowUp, Check, ChevronLeft, ChevronRight, Copy, Info, Loader2, Plus, Search, X, CircleCheck, CircleAlert } from 'lucide-react'
+import { Sparkline } from './charts'
 
 export const cx = (...a) => a.filter(Boolean).join(' ')
 
@@ -106,9 +107,21 @@ export function PageHeader({ title, subtitle, children, crumbs }) {
   )
 }
 export const Stats = ({ items }) => (
-  <div className="stats">{items.map((s, i) => (
-    <div className="stat" key={i}><div className="v">{s.value}</div><div className="l">{s.label}</div>{s.sub && <div className="s">{s.sub}</div>}</div>
-  ))}</div>
+  <div className="stats">{items.map((s, i) => {
+    const Icon = s.icon
+    const t = s.trend
+    return (
+      <div className="stat" key={i}>
+        {Icon && <span className={cx('ico', s.tone && `t-${s.tone}`)}><Icon size={22} /></span>}
+        <div className="v">{s.value}</div>
+        <div className="l">{s.label}</div>
+        {s.sub && <div className="s">{s.sub}</div>}
+        {s.live && <span className="trend"><Plus size={10} />Live</span>}
+        {!s.live && t !== undefined && t !== null && <span className={cx('trend', t < 0 ? 'down' : t === 0 && 'flat')}>{t < 0 ? <ArrowDown size={10} /> : <ArrowUp size={10} />}{Math.abs(t)}%</span>}
+        {s.spark && <Sparkline data={s.spark} tone={s.tone} />}
+      </div>
+    )
+  })}</div>
 )
 export const Panel = ({ title, actions, children, flush, className }) => (
   <section className={cx('panel', className)}>

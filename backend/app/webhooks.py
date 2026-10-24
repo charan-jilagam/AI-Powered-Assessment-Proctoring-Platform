@@ -11,13 +11,13 @@ from typing import Any, Dict
 from urllib.parse import urlparse
 
 import httpx
-from sqlalchemy.orm import Session
+from app.mongo import Session
 
 from app import models
 from app.background import after_commit, inline
 from app.config import settings
 
-log = logging.getLogger("proctorai.webhooks")
+log = logging.getLogger("orvexa.webhooks")
 
 EVENTS = (
     "attempt.started", "attempt.submitted", "attempt.terminated", "attempt.reviewed",
@@ -87,9 +87,9 @@ def deliver(delivery_id: int) -> None:
             timestamp = int(time.time())
             headers = {
                 "Content-Type": "application/json",
-                "User-Agent": "ProctorAI-Webhooks/1.0",
-                "X-ProctorAI-Event": delivery.event,
-                "X-ProctorAI-Signature": sign(hook.secret, timestamp, body),
+                "User-Agent": "ORVEXA-Webhooks/1.0",
+                "X-Orvexa-Event": delivery.event,
+                "X-Orvexa-Signature": sign(hook.secret, timestamp, body),
             }
             delivery.attempts = attempt
             try:

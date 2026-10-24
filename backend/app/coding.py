@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from app.mongo import Session
 
 from app import attempt_service, audit, auth, judge0, models, schemas, tenancy
 from app.attempt_deps import AttemptCtx, attempt_ctx

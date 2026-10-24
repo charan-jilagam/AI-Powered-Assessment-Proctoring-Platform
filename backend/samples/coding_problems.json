@@ -30,7 +30,7 @@
         { "input_data": "hello\n", "expected_output": "olleh\n", "is_sample": true },
         { "input_data": "racecar\n", "expected_output": "racecar\n", "is_sample": true },
         { "input_data": "a\n", "expected_output": "a\n", "is_sample": false },
-        { "input_data": "ProctorAI\n", "expected_output": "IArotcorP\n", "is_sample": false },
+        { "input_data": "ORVEXA\n", "expected_output": "AXEVRO\n", "is_sample": false },
         { "input_data": "Judge0\n", "expected_output": "0egduJ\n", "is_sample": false }
       ]
     },

@@ -11,7 +11,7 @@ import bcrypt
 from fastapi import Depends, Request
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
-from sqlalchemy.orm import Session
+from app.mongo import Session
 
 from app import models
 from app.config import settings

@@ -76,7 +76,7 @@ function Hooks() {
   return (
     <>
       <Panel title="Webhook endpoints" actions={<Button variant="primary" icon={Plus} onClick={() => setEdit({ url: '', events: [], is_active: true })}>Add endpoint</Button>} flush>
-        <Async state={state}>{(rows) => !rows.length ? <Empty title="No endpoints">We POST a signed JSON event to your URL when candidates start, submit or finish a test. Verify the <code>X-ProctorAI-Signature</code> header with your signing secret.</Empty> : (
+        <Async state={state}>{(rows) => !rows.length ? <Empty title="No endpoints">We POST a signed JSON event to your URL when candidates start, submit or finish a test. Verify the <code>X-Orvexa-Signature</code> header with your signing secret.</Empty> : (
           <table className="t"><tbody>{rows.map((h) => <tr key={h.id}><td><b className="mono" style={{ wordBreak: 'break-all' }}>{h.url}</b><div className="sub">{h.events.length ? h.events.join(', ') : 'All events'} · secret {h.secret_hint}</div></td><td>{h.is_active ? <Badge status="active" /> : <Badge>Paused</Badge>}</td>
             <td className="num nowrap"><Button size="sm" icon={Zap} onClick={async () => { try { await api.post(`/org/webhooks/${h.id}/test`); toast('Test event sent'); } catch (e) { error(e) } }}>Send test</Button>{' '}<Button size="sm" onClick={() => setLog(h)}>Deliveries</Button>{' '}<Button size="sm" onClick={() => setEdit(h)}>Edit</Button>{' '}
               <IconButton icon={Trash2} label="Delete endpoint" onClick={async () => { if (await confirm({ title: 'Delete this endpoint?', message: h.url, confirmLabel: 'Delete', danger: true })) { try { await api.del(`/org/webhooks/${h.id}`); state.reload() } catch (e) { error(e) } } }} /></td></tr>)}</tbody></table>)}</Async>
@@ -99,7 +99,7 @@ function HookEditor({ hook, events, onClose, onSaved }) {
   }
   return (
     <Modal title={hook.id ? 'Edit endpoint' : 'Add endpoint'} onClose={onClose} footer={<><Button onClick={onClose}>Cancel</Button><Button variant="primary" busy={busy} onClick={save}>Save</Button></>}>
-      <Input label="Endpoint URL" type="url" placeholder="https://example.com/hooks/proctorai" value={f.url} onChange={(e) => setF({ ...f, url: e.target.value })} hint="Must be a public https address." />
+      <Input label="Endpoint URL" type="url" placeholder="https://example.com/hooks/orvexa" value={f.url} onChange={(e) => setF({ ...f, url: e.target.value })} hint="Must be a public https address." />
       <div className="field"><span className="label">Events</span><p className="hint">Choose none to receive everything.</p>{events.map((e) => <Check_ key={e} label={<code>{e}</code>} checked={f.events.includes(e)} onChange={() => toggle(e)} />)}</div>
       <Check_ label="Active" checked={f.is_active} onChange={(e) => setF({ ...f, is_active: e.target.checked })} />
     </Modal>

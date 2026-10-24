@@ -19,7 +19,7 @@ export default function Overview() {
             {d.new_demo_requests > 0 && <Alert tone="info"><Link to="/super/leads">{d.new_demo_requests} new demo request{d.new_demo_requests > 1 ? 's' : ''}</Link> waiting for a reply.</Alert>}
             <Stats items={[
               { value: o.total, label: 'Organizations', sub: `${o.active} active · ${o.trial} on trial` },
-              { value: mrr, label: 'Monthly recurring', sub: 'From active plans (manual billing)' },
+              { value: mrr, label: 'Monthly recurring', sub: 'From active plans' },
               { value: d.attempts.this_month, label: 'Attempts this month', sub: `${d.attempts.in_progress_now} in progress now` },
               { value: d.candidates, label: 'Candidates', sub: `${d.tests.published} of ${d.tests.total} tests published` },
             ]} />
