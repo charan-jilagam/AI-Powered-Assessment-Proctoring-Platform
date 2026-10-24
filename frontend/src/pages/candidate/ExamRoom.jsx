@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Bell, Camera, ChevronLeft, ChevronRight, Flag, Maximize, Send, WifiOff, AlertTriangle } from 'lucide-react'
+import { Bell, ChevronLeft, ChevronRight, Flag, Maximize, Send, WifiOff } from 'lucide-react'
 import { ApiError, cand, candToken, setCandidateExpiredHandler } from '../../lib/api'
 import { clock } from '../../lib/format'
 import { Alert, Button, Loading, Modal } from '../../ui'
+import { ThemeToggle } from '../../lib/theme'
+import { CamTile, ProctorAlerts } from './ProctorHud'
 import { CodeEntry } from '../public/Landing'
 import CodingPanel from './CodingPanel'
 import Finished from './Finished'
@@ -25,7 +27,7 @@ export default function ExamRoom() {
   useEffect(() => { setCandidateExpiredHandler(() => setProblem('ended')) }, [])
   useEffect(() => {
     if (state?.test?.organization?.brand_color) document.documentElement.style.setProperty('--accent', state.test.organization.brand_color)
-    document.title = state?.test?.title ? `${state.test.title} · ProctorAI` : 'Test · ProctorAI'
+    document.title = state?.test?.title ? `${state.test.title} · ORVEXA` : 'Test · ORVEXA'
     return () => document.documentElement.style.removeProperty('--accent')
   }, [state?.test?.title, state?.test?.organization?.brand_color]) // eslint-disable-line
 
@@ -68,7 +70,7 @@ function Exam({ state, media, onDone }) {
   const [view, setView] = useState(questions.length ? 'questions' : 'coding')
   const [save, setSave] = useState('saved')           // saved | saving | offline
   const [notices, setNotices] = useState((state.messages || []).map((m) => ({ id: 'm' + m.id, text: m.body, tone: 'info' })))
-  const [warning, setWarning] = useState(null)
+  const [alerts, setAlerts] = useState([])
   const [confirm, setConfirm] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [fsLost, setFsLost] = useState(false)
@@ -84,6 +86,10 @@ function Exam({ state, media, onDone }) {
   const lastReport = useRef({})
   const video = useRef(null)
   const dirty = useRef(false)
+  const alertSeq = useRef(0)
+  const pushAlert = useCallback((o, auto) => setAlerts((a) => [...a.filter((x) => !(x.code === o.code && x.severity < 2)), { id: ++alertSeq.current, code: o.code, label: o.label, severity: o.severity, n: o.level2_count, max: o.max_level2, auto }]), [])
+  const dismissAlert = useCallback((id) => setAlerts((a) => a.filter((x) => x.id !== id)), [])
+  useEffect(() => { document.body.classList.add('in-exam'); return () => document.body.classList.remove('in-exam') }, [])
 
   const needCam = cfg.webcam_required
   const needGate = (needCam && !media.cam) || (cfg.fullscreen_required && !document.fullscreenElement)
@@ -139,9 +145,9 @@ function Exam({ state, media, onDone }) {
     try {
       const o = await cand.post('/attempt/violations', { code, details, image })
       if (o.terminated) { finishing.current = true; await onDone(); return }
-      if (o.recorded && o.severity === 2) setWarning({ label: o.label, n: o.level2_count, max: o.max_level2, auto: cfg.auto_terminate })
+      if (o.recorded) pushAlert(o, cfg.auto_terminate)
     } catch { /* offline: the heartbeat will keep trying; a missed flag is not the candidate's fault */ }
-  }, [media, cfg.auto_terminate, onDone])
+  }, [media, cfg.auto_terminate, onDone, pushAlert])
 
   /* ---------- heartbeat ---------- */
   useEffect(() => {
@@ -206,7 +212,7 @@ function Exam({ state, media, onDone }) {
         if (r.terminated) { finishing.current = true; onDone(); return }
         const live = r.findings || []
         setHint(r.available && live.length ? live[0].label : '')
-        if (r.outcome?.recorded && r.outcome.severity === 2) setWarning({ label: r.outcome.label, n: r.outcome.level2_count, max: r.outcome.max_level2, auto: cfg.auto_terminate && cfg.ai_can_terminate })
+        if (r.outcome?.recorded) pushAlert(r.outcome, cfg.auto_terminate && cfg.ai_can_terminate)
       } catch { /* skip this frame */ } finally { busy = false }
     }, cfg.analysis_interval_seconds * 1000)
     return () => clearInterval(id)
@@ -240,15 +246,15 @@ function Exam({ state, media, onDone }) {
     <div className="room">
       <header className="room-top">
         <div className="grow truncate"><b>{state.test.title}</b><span className="muted" style={{ marginLeft: 10, fontSize: 13 }}>{answeredCount}/{questions.length} answered</span></div>
+        <ThemeToggle />
         <span className={`save ${save}`} role="status">{save === 'saved' ? 'All answers saved' : save === 'saving' ? 'Saving…' : <><WifiOff size={14} /> Offline — saved on this device</>}</span>
         <div className={`timer ${urgent ? 'urgent' : low ? 'low' : ''}`} role="timer" aria-label={`Time left ${clock(left)}`}>{clock(left)}</div>
         <Button variant="primary" icon={Send} onClick={() => setConfirm(true)}>Submit</Button>
       </header>
 
+      <ProctorAlerts alerts={alerts} onDismiss={dismissAlert} />
       <div className="room-notices" aria-live="polite">
-        {warning && <Alert tone="bad"><b>Warning: {warning.label}.</b> {warning.auto ? `Serious warning ${warning.n} of ${warning.max}. The test ends at ${warning.max}.` : 'This has been recorded for the organizer.'} <a href="#close" onClick={(e) => { e.preventDefault(); setWarning(null) }}>Dismiss</a></Alert>}
         {notices.slice(-3).map((n) => <Alert key={n.id} tone={n.tone}><Bell size={14} /> <b>From the organizer:</b> {n.text} <a href="#close" onClick={(e) => { e.preventDefault(); setNotices((x) => x.filter((m) => m.id !== n.id)) }}>Dismiss</a></Alert>)}
-        {hint && <Alert tone="warn"><AlertTriangle size={14} /> {hint}. Please look at the screen and keep only your face in view.</Alert>}
       </div>
 
       {questions.length > 0 && problems.length > 0 && <div className="tabs room-tabs"><button className={view === 'questions' ? 'active' : ''} onClick={() => setView('questions')}>Questions ({answeredCount}/{questions.length})</button><button className={view === 'coding' ? 'active' : ''} onClick={() => setView('coding')}>Coding ({problems.length})</button></div>}
@@ -278,7 +284,7 @@ function Exam({ state, media, onDone }) {
         </main>
 
         <aside className="room-side">
-          {needCam && <div className="cam"><video ref={video} muted playsInline autoPlay aria-label="Your camera" />{!media.cam && <div className="ph"><Camera size={20} />Camera off</div>}</div>}
+          {needCam && <CamTile video={video} camOn={media.cam} issue={hint} monitoring={!!cfg.ai_monitoring} />}
           {view === 'questions' && <nav aria-label="Question navigator">{sections.map((g, gi) => (
             <div key={gi}>{g.s && <div className="nav-sec">{g.s}</div>}<div className="qgrid">{g.items.map((i) => { const id = questions[i].id; return <button key={id} className={`qn ${i === idx ? 'cur' : ''} ${answers[id] != null ? 'ans' : ''} ${flagged.includes(id) ? 'flag' : ''}`} aria-label={`Question ${i + 1}${answers[id] != null ? ', answered' : ''}${flagged.includes(id) ? ', flagged' : ''}`} onClick={() => { setIdx(i); setView('questions') }}>{i + 1}</button> })}</div></div>))}
             <div className="legend mt"><span><i style={{ background: 'var(--accent)' }} />Answered</span><span><i style={{ background: 'var(--warn)' }} />Flagged</span><span><i style={{ background: 'var(--neutral-soft)' }} />Not answered</span></div></nav>}

@@ -1,5 +1,6 @@
 import { lazy, Suspense } from 'react'
-import { Route, Routes } from 'react-router-dom'
+import { Route, Routes, useLocation } from 'react-router-dom'
+import { ThemeFloat } from './lib/theme'
 import { RequireRole } from './layouts/StaffLayout'
 import { Loading } from './ui'
 
@@ -25,6 +26,7 @@ const Tests = L(() => import('./pages/admin/Tests'))
 const TestNew = L(() => import('./pages/admin/TestNew'))
 const TestDetail = L(() => import('./pages/admin/TestDetail'))
 const AttemptReport = L(() => import('./pages/admin/AttemptReport'))
+const ReportPrint = L(() => import('./pages/admin/ReportPrint'))
 const Bank = L(() => import('./pages/admin/Bank'))
 const ReviewQueue = L(() => import('./pages/admin/ReviewQueue'))
 const Candidates = L(() => import('./pages/admin/Candidates'))
@@ -37,8 +39,11 @@ const Join = L(() => import('./pages/candidate/Join'))
 const ExamRoom = L(() => import('./pages/candidate/ExamRoom'))
 
 export default function App() {
+  const { pathname } = useLocation()
+  const staff = pathname.startsWith('/app') || pathname.startsWith('/super') || pathname === '/account' || pathname === '/'
   return (
     <Suspense fallback={<Loading />}>
+      {!staff && <ThemeFloat />}
       <Routes>
         <Route path="/" element={<Landing />} />
         <Route path="/login" element={<Login />} />
@@ -69,6 +74,7 @@ export default function App() {
           <Route path="tests/new" element={<TestNew />} />
           <Route path="tests/:id/*" element={<TestDetail />} />
           <Route path="attempts/:id" element={<AttemptReport />} />
+          <Route path="attempts/:id/report" element={<ReportPrint />} />
           <Route path="bank" element={<Bank />} />
           <Route path="review" element={<ReviewQueue />} />
           <Route path="candidates" element={<Candidates />} />

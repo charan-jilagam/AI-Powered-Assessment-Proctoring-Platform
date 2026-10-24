@@ -20,6 +20,7 @@ export default function CodingPanel({ problems, attemptId }) {
   const [custom, setCustom] = useState({})
   const [busy, setBusy] = useState('')
   const [err, setErr] = useState('')
+  const gutter = useRef(null)
   const key = (pid) => `pai_code_${attemptId}_${pid}`
   const store = useRef({ get: (k) => { try { return JSON.parse(sessionStorage.getItem(k)) } catch { return null } }, set: (k, v) => { try { sessionStorage.setItem(k, JSON.stringify(v)) } catch { /* ignore */ } } })
 
@@ -57,8 +58,19 @@ export default function CodingPanel({ problems, attemptId }) {
     } catch (e) { setErr(e.message) } finally { setBusy('') }
   }
   const onKey = (e) => {
-    if (e.key === 'Tab') { e.preventDefault(); const t = e.target, s = t.selectionStart; update({ code: draft.code.slice(0, s) + '    ' + draft.code.slice(t.selectionEnd) }); requestAnimationFrame(() => { t.selectionStart = t.selectionEnd = s + 4 }) }
+    const t = e.target, code = draft.code ?? ''
+    const set = (value, caret) => { update({ code: value }); requestAnimationFrame(() => { t.selectionStart = t.selectionEnd = caret }) }
+    if (e.key === 'Tab') { e.preventDefault(); const s = t.selectionStart; set(code.slice(0, s) + '    ' + code.slice(t.selectionEnd), s + 4) }
+    else if (e.key === 'Enter' && t.selectionStart === t.selectionEnd) {      // keep the indentation of the current line; indent after an opening bracket or colon
+      e.preventDefault()
+      const s = t.selectionStart, lineStart = code.lastIndexOf('\n', s - 1) + 1
+      const line = code.slice(lineStart, s), indent = /^[ \t]*/.exec(line)[0]
+      const extra = /[{(\[:]\s*$/.test(line) ? '    ' : ''
+      set(code.slice(0, s) + '\n' + indent + extra + code.slice(s), s + 1 + indent.length + extra.length)
+    }
   }
+  const text = draft.code ?? TEMPLATES[draft.lang] ?? ''
+  const lines = text.split('\n').length
 
   return (
     <div className="coding">
@@ -76,7 +88,7 @@ export default function CodingPanel({ problems, attemptId }) {
         <div className="coding-editor">
           <div className="row between mb"><select className="input" style={{ width: 'auto' }} aria-label="Language" value={draft.lang} onChange={(e) => changeLang(Number(e.target.value))}>{langs.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}</select>
             <span className="row"><Button icon={Play} busy={busy === 'run'} disabled={!!busy} onClick={() => go('run')}>Run</Button><Button variant="primary" icon={Send} busy={busy === 'submit'} disabled={!!busy} onClick={() => go('submit')}>Submit</Button></span></div>
-          <textarea className="code-area" aria-label="Code editor" spellCheck={false} value={draft.code ?? TEMPLATES[draft.lang] ?? ''} onChange={(e) => update({ code: e.target.value })} onKeyDown={onKey} />
+          <div className="code-frame"><pre className="gutter" ref={gutter} aria-hidden>{Array.from({ length: lines }, (_, n) => n + 1).join('\n')}</pre><textarea className="code-area" aria-label="Code editor" spellCheck={false} wrap="off" autoCapitalize="off" autoCorrect="off" value={text} onChange={(e) => update({ code: e.target.value })} onKeyDown={onKey} onScroll={(e) => { if (gutter.current) gutter.current.scrollTop = e.target.scrollTop }} /></div>
           <label className="check" style={{ margin: '8px 0' }}><input type="checkbox" checked={!!custom[active]?.on} onChange={(e) => setCustom({ ...custom, [active]: { ...custom[active], on: e.target.checked } })} />Run with my own input</label>
           {custom[active]?.on && <textarea className="input mono" rows={3} aria-label="Custom input" value={custom[active].text || ''} onChange={(e) => setCustom({ ...custom, [active]: { ...custom[active], text: e.target.value } })} />}
           {err && <Alert tone="bad" className="mt">{err}</Alert>}

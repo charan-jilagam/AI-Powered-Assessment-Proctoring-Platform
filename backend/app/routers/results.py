@@ -9,11 +9,11 @@ from typing import Any, Dict, List, Literal, Optional
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from app.mongo import func, or_
+from app.mongo import Session
 
 from app import (
-    attempt_service, audit, auth, judge0, models, proctor_rules, scoring, storage, tenancy, webhooks,
+    attempt_service, audit, auth, judge0, models, proctor_rules, scoring, similarity, storage, tenancy, webhooks,
 )
 from app.constants import (
     ATT_IN_PROGRESS, ATT_REGISTERED, ATT_SUBMITTED, ATT_TERMINATED, ATT_VOIDED, FINAL_ATTEMPT_STATUSES, INV_PENDING,
@@ -156,6 +156,15 @@ def live_monitor(exam_id: int, user: models.User = Depends(auth.require_org_staf
 # ---------------------------------------------------------------------------
 # analytics + export
 # ---------------------------------------------------------------------------
+@router.get("/tests/{exam_id}/similarity")
+def code_similarity(exam_id: int, min_percent: int = 65, user: models.User = Depends(auth.require_org_staff), db: Session = Depends(get_db)):
+    """Pairs of candidates with structurally similar code in this test (screening aid, not proof)."""
+    exam = tenancy.get_exam(db, exam_id, user.org_id)
+    pairs = similarity.find_pairs(db, exam.id, max(0, min(100, min_percent)))
+    return {"pairs": pairs, "method": "token k-gram Jaccard, identifiers and literals normalised; within this test only",
+            "min_tokens": similarity.MIN_TOKENS}
+
+
 @router.get("/tests/{exam_id}/analytics")
 def analytics(exam_id: int, user: models.User = Depends(auth.require_org_staff), db: Session = Depends(get_db)):
     exam = tenancy.get_exam(db, exam_id, user.org_id)
@@ -293,6 +302,8 @@ def attempt_report(attempt_id: int, user: models.User = Depends(auth.require_org
         "messages": [{"body": m.body, "created_at": m.created_at} for m in db.query(models.AttemptMessage).filter(models.AttemptMessage.attempt_id == a.id).all()],
         "environment": {"ip_address": a.ip_address, "user_agent": a.user_agent, "system_info": a.system_info or {}, "consent_at": a.consent_at},
         "can_void": user.role == ROLE_ADMIN,
+        "similarity": similarity.matches_for_attempt(similarity.find_pairs(db, exam.id), a.id) if subs else [],
+        "organization": db.get(models.Organization, a.org_id).name if getattr(a, "org_id", None) else None,
     }
 
 

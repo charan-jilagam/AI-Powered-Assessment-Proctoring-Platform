@@ -3,7 +3,7 @@ counts, scores risk and terminates. A tampered client can omit reports but canno
 from datetime import timedelta
 from typing import Any, Dict, Optional
 
-from sqlalchemy.orm import Session
+from app.mongo import Session
 
 from app import audit, models, storage
 from app.constants import (
@@ -60,7 +60,7 @@ def record_violation(
     severity, category, label, weight = classify(code)
     cfg = config_for(exam)
     max_l2 = int(cfg.get("max_level2_violations", 3))
-    outcome = {"recorded": False, "severity": severity, "label": label,
+    outcome = {"recorded": False, "code": code, "severity": severity, "label": label,
                "level2_count": attempt.level2_count, "max_level2": max_l2, "terminated": attempt.status == ATT_TERMINATED}
 
     if attempt.status != ATT_IN_PROGRESS or not _enabled(cfg, code):

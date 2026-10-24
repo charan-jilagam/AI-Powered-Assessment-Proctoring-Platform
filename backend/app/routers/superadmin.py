@@ -4,8 +4,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from app.mongo import func, or_
+from app.mongo import Session
 
 from app import audit, auth, mailer, models, serializers, staff_service, tenancy
 from app.config import settings
@@ -151,17 +151,19 @@ def overview(user: models.User = Depends(auth.require_super_admin), db: Session 
         series.append({"date": day, "attempts": int(daily.get(day, 0))})
 
     mrr: Dict[str, int] = {}
-    for plan, in_ in db.query(models.Plan, func.count(models.Organization.id)).join(
-        models.Organization, models.Organization.plan_id == models.Plan.id
-    ).filter(models.Organization.status == ORG_ACTIVE).group_by(models.Plan.id).all():
-        mrr[plan.currency] = mrr.get(plan.currency, 0) + plan.price_monthly * in_
-
-    top = (
-        db.query(models.Organization.id, models.Organization.name, func.count(models.Attempt.id))
-        .join(models.Attempt, models.Attempt.org_id == models.Organization.id)
-        .filter(models.Attempt.started_at >= month, models.Attempt.status != ATT_VOIDED)
-        .group_by(models.Organization.id).order_by(func.count(models.Attempt.id).desc()).limit(5).all()
+    active_by_plan = dict(
+        db.query(models.Organization.plan_id, func.count(models.Organization.id))
+        .filter(models.Organization.status == ORG_ACTIVE).group_by(models.Organization.plan_id).all()
     )
+    for plan in db.query(models.Plan).filter(models.Plan.id.in_(list(active_by_plan) or [0])).all():
+        mrr[plan.currency] = mrr.get(plan.currency, 0) + plan.price_monthly * active_by_plan[plan.id]
+
+    per_org = dict(
+        db.query(models.Attempt.org_id, func.count(models.Attempt.id))
+        .filter(models.Attempt.started_at >= month, models.Attempt.status != ATT_VOIDED).group_by(models.Attempt.org_id).all()
+    )
+    names = {o.id: o.name for o in db.query(models.Organization).filter(models.Organization.id.in_(list(per_org) or [0])).all()}
+    top = sorted(((oid, names.get(oid, str(oid)), n) for oid, n in per_org.items()), key=lambda r: -r[2])[:5]
     soon = utcnow() + timedelta(days=7)
     expiring = [
         {"id": o.id, "name": o.name, "trial_ends_at": o.trial_ends_at}
@@ -227,7 +229,7 @@ def create_org(body: OrgCreate, request: Request, user: models.User = Depends(au
     db.flush()
     created = staff_service.create_staff(
         db, org=org, full_name=body.admin_name, email=body.admin_email, role=ROLE_ADMIN,
-        temp_password=body.admin_temp_password, send_invite=body.send_invite, invited_by="The ProctorAI platform team",
+        temp_password=body.admin_temp_password, send_invite=body.send_invite, invited_by="The ORVEXA platform team",
     )
     audit.log_event(db, "ORG_CREATED", user=user, org_id=org.id, entity_type="organization", entity_id=org.id,
                     details=f"name='{org.name}' plan={plan.code} admin={body.admin_email}", ip=auth.client_ip(request))
@@ -316,7 +318,7 @@ def add_org_admin(org_id: int, body: AdminCreate, request: Request, user: models
     org = _org(db, org_id)
     created = staff_service.create_staff(
         db, org=org, full_name=body.full_name, email=body.email, role=body.role,
-        temp_password=body.temp_password, send_invite=body.send_invite, invited_by="The ProctorAI platform team",
+        temp_password=body.temp_password, send_invite=body.send_invite, invited_by="The ORVEXA platform team",
     )
     audit.log_event(db, "ORG_STAFF_CREATED", user=user, org_id=org.id, entity_type="user", entity_id=created["user"].id,
                     details=f"{body.email} as {body.role}", ip=auth.client_ip(request))
@@ -330,7 +332,7 @@ def issue_reset_link(org_id: int, user_id: int, request: Request, user: models.U
     target = tenancy.get_org_user(db, user_id, org.id)
     raw = staff_service.issue_token(db, target, "reset")
     url = staff_service.activation_url(raw, "reset")
-    mailer.queue_email(db, target.email, "Reset your ProctorAI password",
+    mailer.queue_email(db, target.email, "Reset your ORVEXA password",
                        mailer.render("Reset your password", [f"Hi {target.full_name},", "The platform team has issued a password reset link for your account."],
                                      cta_label="Choose a new password", cta_url=url, org_name=org.name, brand=org.brand_color), org_id=org.id)
     audit.log_event(db, "RESET_LINK_ISSUED", user=user, org_id=org.id, entity_type="user", entity_id=target.id, ip=auth.client_ip(request))
@@ -423,8 +425,8 @@ def create_platform_admin(body: PlatformAdminCreate, user: models.User = Depends
     db.add(new_user)
     db.flush()
     url = staff_service.activation_url(staff_service.issue_token(db, new_user, "invite"), "invite")
-    mailer.queue_email(db, new_user.email, "You have been added as a ProctorAI platform admin",
-                       mailer.render("Platform admin access", [f"Hi {new_user.full_name},", "You now have platform-owner access to ProctorAI."],
+    mailer.queue_email(db, new_user.email, "You have been added as a ORVEXA platform admin",
+                       mailer.render("Platform admin access", [f"Hi {new_user.full_name},", "You now have platform-owner access to ORVEXA."],
                                      cta_label="Set your password", cta_url=url))
     audit.log_event(db, "PLATFORM_ADMIN_CREATED", user=user, entity_type="user", entity_id=new_user.id, details=body.email)
     db.commit()

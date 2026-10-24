@@ -4,8 +4,8 @@ import io
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from app.mongo import func
+from app.mongo import Session
 
 from app import auth, models, question_rules, serializers, tenancy
 from app.config import settings

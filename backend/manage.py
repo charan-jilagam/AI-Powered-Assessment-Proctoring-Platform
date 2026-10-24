@@ -16,10 +16,9 @@ from datetime import timedelta
 
 def _db():
     from app.config import settings
-    from app.database import Base, SessionLocal, engine
-    if not settings.is_production:   # production schema is owned by Alembic
-        Base.metadata.create_all(bind=engine)
-    return SessionLocal()
+    from app import database
+    database.init_db()
+    return database.SessionLocal()
 
 
 def _password(args) -> str:
@@ -147,11 +146,29 @@ def demo_data(args):
         db.close()
 
 
+def init_db(_args=None):
+    """Connect to MongoDB, create the database, collections and indexes, seed the plans. Run this once to verify Atlas."""
+    from app import database, mongo
+    from app.config import settings
+    from app.seed import seed_plans as seed
+    mongo.ping()
+    database.init_db()
+    db = database.SessionLocal()
+    try:
+        seed(db)
+        db.commit()
+    finally:
+        db.close()
+    names = sorted(mongo.database().list_collection_names())
+    print(f"Connected. Database '{settings.mongodb_db}' is ready with {len(names)} collections: {', '.join(names)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("create-superadmin"); p.add_argument("--email", required=True); p.add_argument("--name", default="Platform Owner"); p.add_argument("--password"); p.set_defaults(fn=create_superadmin)
     p = sub.add_parser("reset-password"); p.add_argument("--email", required=True); p.add_argument("--password"); p.set_defaults(fn=reset_password)
+    sub.add_parser("init-db").set_defaults(fn=init_db)
     sub.add_parser("seed-plans").set_defaults(fn=seed_plans)
     sub.add_parser("sweep-expired").set_defaults(fn=sweep_expired)
     sub.add_parser("purge-evidence").set_defaults(fn=purge_evidence)

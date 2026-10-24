@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Camera, Code2, KeyRound, ShieldCheck, Webhook, Eye, Lock, Check } from 'lucide-react'
+import { Camera, Code2, KeyRound, Webhook, Eye, Lock, Check } from 'lucide-react'
 import { pub } from '../../lib/api'
 import { money, limitText } from '../../lib/format'
 import { Alert, Button, Input, Textarea } from '../../ui'
+import { ThemeToggle } from '../../lib/theme'
 
 export function CodeEntry({ autoFocus }) {
   const nav = useNavigate()
@@ -66,12 +67,13 @@ export default function Landing() {
   return (
     <div className="landing">
       <header className="l-nav">
-        <span className="brand"><span className="mark"><ShieldCheck size={16} /></span>ProctorAI</span>
-        <nav><a href="#features">Features</a><a href="#pricing">Pricing</a><a href="#demo">Book a demo</a><Link className="btn sm" to="/login">Sign in</Link></nav>
+        <span className="brand"><img src="/brand/orvexa-emblem.png" alt="" width="34" height="34" />ORVEXA</span>
+        <nav><a href="#features">Features</a><a href="#pricing">Pricing</a><a href="#demo">Book a demo</a><ThemeToggle /><Link className="btn sm" to="/login">Sign in</Link></nav>
       </header>
 
       <section className="l-hero">
         <div>
+          <span className="l-kicker">Assess Smarter. Trust Every Result.</span>
           <h1>Share a code. Run the exam. Trust the result.</h1>
           <p>Create a test, hand candidates an 8-character code, and get scored, proctored results with the evidence to back every decision.</p>
           <div className="row wrap mt"><a className="btn primary lg" href="#demo">Book a demo</a><Link className="btn lg" to="/login">Sign in</Link></div>
@@ -90,7 +92,7 @@ export default function Landing() {
 
       <section id="pricing" className="l-section">
         <h2>Plans</h2>
-        <p className="muted-2" style={{ marginTop: 6 }}>Start with a {plans.length ? 'free trial' : 'trial'}; your account manager sets up the plan that fits.</p>
+        <p className="muted-2" style={{ marginTop: 6 }}>Start with a free trial, then upgrade online whenever you are ready. Prices are in INR per month.</p>
         <div className="l-plans">
           {plans.map((p) => (
             <div className="l-plan" key={p.id}>
@@ -123,7 +125,7 @@ export default function Landing() {
           </form>
         )}
       </section>
-      <footer className="l-foot"><span>© {new Date().getFullYear()} ProctorAI</span><Link to="/login">Sign in</Link></footer>
+      <footer className="l-foot"><span>© {new Date().getFullYear()} ORVEXA</span><Link to="/login">Sign in</Link></footer>
     </div>
   )
 }

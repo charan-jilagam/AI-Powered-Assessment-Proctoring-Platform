@@ -2,8 +2,8 @@
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from app.mongo import func
+from app.mongo import Session
 
 from app import models
 from app.constants import (

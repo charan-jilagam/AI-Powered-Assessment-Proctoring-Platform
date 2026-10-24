@@ -2,7 +2,7 @@
 from typing import NamedTuple
 
 from fastapi import Depends, Request
-from sqlalchemy.orm import Session
+from app.mongo import Session
 
 from app import attempt_service, auth, models
 from app.constants import ATT_IN_PROGRESS, ROLE_CANDIDATE

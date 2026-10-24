@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from app.config import settings
 
-log = logging.getLogger("proctorai.ai")
+log = logging.getLogger("orvexa.ai")
 
 _BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))
 FACE_MODEL_PATH = os.getenv("FACE_MODEL_PATH", os.path.join(_BACKEND_DIR, "face_landmarker.task"))

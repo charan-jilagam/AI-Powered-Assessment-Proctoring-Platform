@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy.orm import Session
+from app.mongo import Session
 
 from app import audit, models, serializers
 from app.database import get_db

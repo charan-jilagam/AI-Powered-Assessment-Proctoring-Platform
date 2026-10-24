@@ -1,23 +1,23 @@
 """Idempotent bootstrap data: default subscription plans and the first platform owner."""
 import logging
 
-from sqlalchemy.orm import Session
+from app.mongo import Session
 
 from app import auth, models
 from app.config import settings
 from app.constants import ROLE_SUPER_ADMIN
 
-log = logging.getLogger("proctorai.seed")
+log = logging.getLogger("orvexa.seed")
 
 DEFAULT_PLANS = [
     dict(code="trial", name="Free Trial", description="Try the platform with a small group of candidates.", price_monthly=0,
          max_admins=2, max_active_tests=2, max_candidates_per_month=25, ai_proctoring=True, coding_enabled=False,
          api_access=False, webhooks_enabled=False, evidence_retention_days=14, is_public=False, sort_order=0),
-    dict(code="starter", name="Starter", description="For small teams running regular assessments.", price_monthly=49,
+    dict(code="starter", name="Starter", description="For small teams running regular assessments.", price_monthly=999, currency="INR",
          max_admins=3, max_active_tests=5, max_candidates_per_month=200, ai_proctoring=False, coding_enabled=True,
          api_access=False, webhooks_enabled=False, evidence_retention_days=30, is_public=True, sort_order=1),
     dict(code="professional", name="Professional", description="AI proctoring, coding tests and integrations for growing companies.",
-         price_monthly=199, max_admins=10, max_active_tests=25, max_candidates_per_month=1500, ai_proctoring=True,
+         price_monthly=3999, currency="INR", max_admins=10, max_active_tests=25, max_candidates_per_month=1500, ai_proctoring=True,
          coding_enabled=True, api_access=True, webhooks_enabled=True, evidence_retention_days=90, is_public=True, sort_order=2),
     dict(code="enterprise", name="Enterprise", description="Unlimited scale with custom terms and priority support.", price_monthly=0,
          max_admins=-1, max_active_tests=-1, max_candidates_per_month=-1, ai_proctoring=True, coding_enabled=True,

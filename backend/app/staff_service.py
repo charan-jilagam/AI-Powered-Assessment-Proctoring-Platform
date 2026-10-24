@@ -2,8 +2,8 @@
 from datetime import timedelta
 from typing import Optional
 
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from app.mongo import func
+from app.mongo import Session
 
 from app import auth, mailer, models
 from app.config import settings
@@ -76,10 +76,10 @@ def create_staff(
         url = activation_url(raw, "invite")
         result["invite_url"] = url
         mailer.queue_email(
-            db, user.email, f"You have been invited to {org.name} on ProctorAI",
+            db, user.email, f"You have been invited to {org.name} on ORVEXA",
             mailer.render(
                 f"Welcome to {org.name}",
-                [f"Hi {user.full_name},", f"{invited_by or 'The platform team'} has created a {role} account for you on ProctorAI.",
+                [f"Hi {user.full_name},", f"{invited_by or 'The platform team'} has created a {role} account for you on ORVEXA.",
                  "Use the button below to choose your password and sign in."],
                 cta_label="Set your password", cta_url=url, org_name=org.name, brand=org.brand_color,
             ),

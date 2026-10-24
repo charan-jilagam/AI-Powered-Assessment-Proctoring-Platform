@@ -54,11 +54,11 @@ def test_signature_is_verifiable_by_the_receiver(hook_env):
     c = hook_env.candidate(test["code"])
     hook_env.client.post("/attempt/submit", headers=c["headers"], json={"answers": {}})
     call = hook_env.sink.calls[-1]
-    sig = call["headers"]["X-ProctorAI-Signature"]
+    sig = call["headers"]["X-Orvexa-Signature"]
     ts, mac = [p.split("=", 1)[1] for p in sig.split(",")]
     expected = hmac.new(hook["secret"].encode(), f"{ts}.".encode() + call["raw"], hashlib.sha256).hexdigest()
     assert hmac.compare_digest(mac, expected)
-    assert call["headers"]["X-ProctorAI-Event"] == "attempt.submitted" and call["follow"] is False
+    assert call["headers"]["X-Orvexa-Event"] == "attempt.submitted" and call["follow"] is False
     assert call["body"]["data"]["attempt_id"] == c["attempt_id"]
 
 

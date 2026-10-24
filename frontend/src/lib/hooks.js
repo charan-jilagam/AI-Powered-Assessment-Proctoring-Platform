@@ -36,5 +36,5 @@ export function usePoll(fn, ms, active = true) {
 }
 
 export function useDocumentTitle(title) {
-  useEffect(() => { document.title = title ? `${title} · ProctorAI` : 'ProctorAI' }, [title])
+  useEffect(() => { document.title = title ? `${title} · ORVEXA` : 'ORVEXA' }, [title])
 }

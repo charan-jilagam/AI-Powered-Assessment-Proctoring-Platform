@@ -4,8 +4,8 @@ from datetime import timedelta
 from typing import Any, Dict, List, NamedTuple, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
-from sqlalchemy import func
-from sqlalchemy.orm import Session
+from app.mongo import func
+from app.mongo import Session
 
 from app import (
     attempt_service, audit, auth, coding, exam_service, models, proctor_rules, proctoring, scoring, serializers, staff_service,
