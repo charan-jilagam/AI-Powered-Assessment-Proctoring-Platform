@@ -18,7 +18,8 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from pydantic import ValidationError
 from app.mongo import Session
 
 from app import attempt_service, audit, auth, judge0, models, schemas, tenancy
@@ -220,7 +221,7 @@ def _candidate_problem(db: Session, ctx: AttemptCtx, problem_id: int) -> models.
 
 
 def _check_code(language_id: int, source_code: str) -> None:
-    if language_id not in judge0.SUPPORTED_LANGUAGES:
+    if language_id not in judge0.get_languages():
         raise HTTPException(status_code=400, detail="Unsupported programming language")
     if not source_code.strip():
         raise HTTPException(status_code=400, detail="Write some code first")
@@ -241,6 +242,133 @@ def _admin_exam(db: Session, exam_id: int, user: models.User, org: models.Organi
 
 
 # ----------------------------------------------------------------------------
+# JSON import
+# ----------------------------------------------------------------------------
+MAX_IMPORT_PROBLEMS = 50
+
+JSON_FORMAT_DOC = [
+    {"field": "problems", "type": "array", "required": True, "note": "The list of coding problems. A bare array [ ... ] or a single problem object is accepted too."},
+    {"field": "title", "type": "string", "required": True, "note": "Shown to the candidate."},
+    {"field": "statement", "type": "string", "required": True, "note": "The problem description. Plain text; line breaks are kept."},
+    {"field": "input_format", "type": "string", "required": False, "note": "How the input is laid out."},
+    {"field": "output_format", "type": "string", "required": False, "note": "What the program must print."},
+    {"field": "constraints", "type": "string", "required": False, "note": "Limits on the input, e.g. 1 <= n <= 1000."},
+    {"field": "points", "type": "integer", "required": False, "note": "1 to 1000. Default 10. Partial credit is given per test case passed."},
+    {"field": "time_limit_seconds", "type": "number", "required": False, "note": "0.5 to 15. Default 2."},
+    {"field": "memory_limit_mb", "type": "integer", "required": False, "note": "16 to 256. Default 256."},
+    {"field": "test_cases", "type": "array", "required": True, "note": "At least one, at most 50. Candidates run the sample cases and are graded on all of them."},
+    {"field": "test_cases[].input_data", "type": "string", "required": False, "note": "Text sent to the program's standard input (\\n for new lines). Empty if the program reads nothing."},
+    {"field": "test_cases[].expected_output", "type": "string", "required": True, "note": "What the program must print. Trailing spaces and blank lines at the end are ignored."},
+    {"field": "test_cases[].is_sample", "type": "boolean", "required": False, "note": "true = shown to candidates and used by Run. false (default) = hidden; only pass/fail is revealed."},
+]
+
+JSON_FORMAT_EXAMPLE = {
+    "problems": [
+        {
+            "title": "Sum of Two Numbers",
+            "statement": "Read two integers a and b and print their sum.",
+            "input_format": "One line with two integers a and b separated by a space.",
+            "output_format": "A single integer: a + b.",
+            "constraints": "-10^9 <= a, b <= 10^9",
+            "points": 10,
+            "time_limit_seconds": 2,
+            "memory_limit_mb": 256,
+            "test_cases": [
+                {"input_data": "3 4\n", "expected_output": "7\n", "is_sample": True},
+                {"input_data": "-5 12\n", "expected_output": "7\n", "is_sample": True},
+                {"input_data": "0 0\n", "expected_output": "0\n", "is_sample": False},
+                {"input_data": "1000000000 1000000000\n", "expected_output": "2000000000\n", "is_sample": False},
+            ],
+        },
+        {
+            "title": "Palindrome Check",
+            "statement": "Read a word. Print YES if it reads the same forwards and backwards, otherwise NO.",
+            "input_format": "One line with a lowercase word.",
+            "output_format": "YES or NO.",
+            "points": 20,
+            "test_cases": [
+                {"input_data": "level\n", "expected_output": "YES\n", "is_sample": True},
+                {"input_data": "coding\n", "expected_output": "NO\n", "is_sample": False},
+            ],
+        },
+    ]
+}
+
+_TC_ALIASES = {"input": "input_data", "stdin": "input_data", "output": "expected_output", "expected": "expected_output", "stdout": "expected_output", "sample": "is_sample"}
+_P_ALIASES = {"testcases": "test_cases", "testCases": "test_cases", "tests": "test_cases", "name": "title", "description": "statement",
+              "timeLimit": "time_limit_seconds", "memoryLimit": "memory_limit_mb", "inputFormat": "input_format", "outputFormat": "output_format"}
+
+
+def _text(value) -> str:
+    """Numbers are fine as test data ("expected_output": 7); None means empty."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return value if isinstance(value, str) else json.dumps(value) if isinstance(value, (list, dict)) else str(value)
+
+
+def _normalize_problem(raw: dict) -> dict:
+    p = {_P_ALIASES.get(k, k): v for k, v in raw.items()}
+    cases = []
+    for tc in p.get("test_cases") or []:
+        if not isinstance(tc, dict):
+            cases.append(tc)  # let validation report it
+            continue
+        tc = {_TC_ALIASES.get(k, k): v for k, v in tc.items()}
+        for key in ("input_data", "expected_output"):
+            if key in tc:
+                tc[key] = _text(tc[key])
+        cases.append(tc)
+    if "test_cases" in p or cases:
+        p["test_cases"] = cases
+    return p
+
+
+def parse_import(payload) -> List[schemas.CodingProblemCreate]:
+    """Turn pasted JSON into validated problems or raise one 422 that lists every mistake, with the problem number."""
+    if isinstance(payload, dict) and isinstance(payload.get("problems"), list):
+        items = payload["problems"]
+    elif isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict) and ("title" in payload or "statement" in payload):
+        items = [payload]
+    else:
+        raise HTTPException(status_code=422, detail='Expected {"problems": [ ... ]}, a list of problems, or a single problem object.')
+    if not items:
+        raise HTTPException(status_code=422, detail="The list of problems is empty.")
+    if len(items) > MAX_IMPORT_PROBLEMS:
+        raise HTTPException(status_code=422, detail=f"At most {MAX_IMPORT_PROBLEMS} problems can be imported at once (you sent {len(items)}).")
+
+    problems: List[schemas.CodingProblemCreate] = []
+    errors: List[str] = []
+    for n, raw in enumerate(items, start=1):
+        label = f"Problem {n}"
+        if not isinstance(raw, dict):
+            errors.append(f"{label}: must be an object with title, statement and test_cases.")
+            continue
+        if isinstance(raw.get("title"), str) and raw["title"].strip():
+            label += f" (\u201c{raw['title'].strip()[:60]}\u201d)"
+        try:
+            problem = schemas.CodingProblemCreate(**_normalize_problem(raw))
+            validate_problem(problem)
+            problems.append(problem)
+        except ValidationError as exc:
+            for err in exc.errors()[:4]:
+                where = ".".join(str(x) for x in err["loc"]) or "problem"
+                errors.append(f"{label}: {where} - {err['msg']}")
+        except HTTPException as exc:
+            errors.append(f"{label}: {exc.detail}")
+        except (TypeError, ValueError) as exc:
+            errors.append(f"{label}: {exc}")
+    if errors:
+        shown = errors[:12]
+        more = f" (+{len(errors) - len(shown)} more)" if len(errors) > len(shown) else ""
+        raise HTTPException(status_code=422, detail=" | ".join(shown) + more)
+    return problems
+
+
+# ----------------------------------------------------------------------------
 # routes: admin authoring (organization-scoped)
 # ----------------------------------------------------------------------------
 @router.post("/tests/{exam_id}/coding-problems")
@@ -248,7 +376,7 @@ def add_coding_problem(
     exam_id: int,
     problem: schemas.CodingProblemCreate,
     db: Session = Depends(get_db),
-    user: models.User = Depends(auth.require_org_admin),
+    user: models.User = Depends(auth.require_verified_admin),
     org: models.Organization = Depends(auth.get_current_org),
 ):
     _admin_exam(db, exam_id, user, org, need_feature=True)
@@ -265,7 +393,7 @@ def add_coding_problems_bulk(
     exam_id: int,
     body: schemas.CodingProblemBulkCreate,
     db: Session = Depends(get_db),
-    user: models.User = Depends(auth.require_org_admin),
+    user: models.User = Depends(auth.require_verified_admin),
     org: models.Organization = Depends(auth.get_current_org),
 ):
     _admin_exam(db, exam_id, user, org, need_feature=True)
@@ -277,6 +405,35 @@ def add_coding_problems_bulk(
     audit.log_event(db, "CODING_PROBLEMS_IMPORTED", user=user, entity_type="test", entity_id=exam_id, details=f"count={len(created)}")
     db.commit()
     return {"status": "imported", "count": len(created)}
+
+
+@router.get("/coding-problems/json-format")
+def coding_json_format(user: models.User = Depends(auth.require_org_admin)):
+    """The JSON layout accepted by the importer - shown to whoever builds the test."""
+    return {"fields": JSON_FORMAT_DOC, "example": JSON_FORMAT_EXAMPLE, "max_problems": MAX_IMPORT_PROBLEMS, "max_test_cases": MAX_TEST_CASES}
+
+
+@router.post("/tests/{exam_id}/coding-problems/import-json")
+def import_coding_problems_json(
+    exam_id: int,
+    payload=Body(...),
+    dry_run: bool = Query(False),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.require_verified_admin),
+    org: models.Organization = Depends(auth.get_current_org),
+):
+    """Add coding problems from JSON. All-or-nothing: if anything is wrong nothing is added and every mistake is listed.
+    With dry_run=true the JSON is only checked and summarised."""
+    _admin_exam(db, exam_id, user, org, need_feature=True)
+    problems = parse_import(payload)
+    summary = [{"title": p.title, "points": p.points, "test_cases": len(p.test_cases), "samples": sum(1 for t in p.test_cases if t.is_sample)} for p in problems]
+    if dry_run:
+        return {"status": "valid", "count": len(problems), "problems": summary, "dry_run": True}
+    for p in problems:
+        create_problem(db, exam_id, p)
+    audit.log_event(db, "CODING_PROBLEMS_IMPORTED", user=user, entity_type="test", entity_id=exam_id, details=f"json count={len(problems)}")
+    db.commit()
+    return {"status": "imported", "count": len(problems), "problems": summary, "dry_run": False}
 
 
 @router.get("/tests/{exam_id}/coding-problems")
@@ -338,7 +495,7 @@ def list_coding_submissions(
             "candidate_email": u.email,
             "problem_id": problem.id,
             "problem_title": problem.title,
-            "language": judge0.SUPPORTED_LANGUAGES.get(sub.language_id, str(sub.language_id)),
+            "language": judge0.language_name(sub.language_id),
             "verdict": sub.verdict,
             "passed": sub.passed,
             "total": sub.total,
@@ -354,7 +511,7 @@ def list_coding_submissions(
 # ----------------------------------------------------------------------------
 @router.get("/attempt/coding/languages")
 def list_languages(ctx: AttemptCtx = Depends(attempt_ctx)):
-    return [{"id": lid, "name": name} for lid, name in judge0.SUPPORTED_LANGUAGES.items()]
+    return [{"id": lid, "name": name, "family": judge0.family_of(name)} for lid, name in judge0.get_languages().items()]
 
 
 @router.post("/attempt/coding/{problem_id}/run")

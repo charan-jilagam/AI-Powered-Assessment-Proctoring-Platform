@@ -19,7 +19,7 @@ export default function Account() {
       <PageHeader title="Your account" />
       <div className="grid c2" style={{ alignItems: 'start' }}>
         <Panel title="Profile">
-          <dl className="kv"><dt>Name</dt><dd>{user.full_name}</dd><dt>E-mail</dt><dd>{user.email}</dd><dt>Role</dt><dd><Badge status={user.role} tone="info" /></dd>{org && <><dt>Organization</dt><dd>{org.name}</dd></>}</dl>
+          <dl className="kv"><dt>Name</dt><dd>{user.full_name}</dd><dt>E-mail</dt><dd>{user.email} {user.role !== 'super_admin' && (user.email_verified ? <Badge tone="ok">Verified</Badge> : <Badge tone="warn">Not verified</Badge>)}</dd><dt>Role</dt><dd><Badge status={user.role} tone="info" /></dd>{org && <><dt>Organization</dt><dd>{org.name}</dd></>}</dl>
         </Panel>
         <Panel title="Change password">
           <form onSubmit={change}>

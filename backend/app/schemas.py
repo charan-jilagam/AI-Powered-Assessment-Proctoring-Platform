@@ -173,11 +173,18 @@ class JoinRequest(BaseModel):
     fields: Dict[str, str] = {}
     access_password: Optional[str] = Field(default=None, max_length=100)
     invite_token: Optional[str] = Field(default=None, max_length=100)
+    email_code: Optional[str] = Field(default=None, max_length=12)   # the 6-digit code e-mailed by /send-code
 
     @field_validator("full_name")
     @classmethod
     def _strip(cls, v: str) -> str:
         return " ".join(v.split())
+
+
+class SendCodeRequest(BaseModel):
+    email: EmailStr
+    full_name: Optional[str] = Field(default=None, max_length=160)
+    invite_token: Optional[str] = Field(default=None, max_length=100)
 
 
 class StartRequest(BaseModel):

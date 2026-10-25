@@ -4,25 +4,27 @@ import { Plus } from 'lucide-react'
 import { api } from '../../lib/api'
 import { fmtDate, limitText } from '../../lib/format'
 import { useDocumentTitle, usePaged } from '../../lib/hooks'
-import { Alert, Badge, Button, CopyButton, Empty, Input, Loading, Modal, PageHeader, Pager, Panel, SearchBox, Select, Textarea, useLoad, useUI } from '../../ui'
+import { Alert, Badge, Button, CopyButton, Empty, Input, Loading, Modal, PageHeader, Pager, Panel, SearchBox, Check_, Select, Textarea, useLoad, useUI } from '../../ui'
 
 export function NewOrgModal({ onClose, onCreated }) {
   const { error } = useUI()
   const plans = useLoad(() => api.get('/superadmin/plans'), [])
-  const [f, setF] = useState({ name: '', plan_code: 'trial', status: 'trial', admin_name: '', admin_email: '', contact_email: '', trial_days: '', admin_temp_password: '', internal_notes: '' })
+  const [f, setF] = useState({ name: '', plan_code: 'trial', status: 'trial', admin_name: '', admin_email: '', contact_email: '', trial_days: '', admin_temp_password: '', internal_notes: '', domains: '', candidate_domain_lock: false, install_samples: true })
   const [created, setCreated] = useState(null)
   const [busy, setBusy] = useState(false)
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value })
   async function submit(e) {
     e.preventDefault(); setBusy(true)
-    const body = { ...f, trial_days: f.trial_days ? Number(f.trial_days) : undefined }
+    const { domains, ...rest } = f
+    const body = { ...rest, trial_days: f.trial_days ? Number(f.trial_days) : undefined, allowed_domains: domains.split(/[\s,;]+/).map((d) => d.trim().replace(/^@/, '')).filter(Boolean) }
     Object.keys(body).forEach((k) => body[k] === '' && delete body[k])
+    if (!body.allowed_domains.length) { delete body.allowed_domains; delete body.candidate_domain_lock }
     try { const r = await api.post('/superadmin/organizations', body); setCreated(r); onCreated?.(r) } catch (x) { error(x) } finally { setBusy(false) }
   }
   if (created) return (
     <Modal title="Organization created" onClose={onClose} footer={<Button variant="primary" onClick={onClose}>Done</Button>}>
       <Alert tone="ok"><b>{created.organization.name}</b> is ready on the {created.organization.plan_name} plan.</Alert>
-      <p className="muted-2 mb">The admin <b>{created.admin.email}</b> activates their account with this one-time link{created.admin.temp_password ? ' (or signs in with the temporary password you set)' : ''}. An e-mail was also queued — see the outbox if SMTP is not configured.</p>
+      <p className="muted-2 mb">The admin <b>{created.admin.email}</b> activates their account with this one-time link{created.admin.temp_password ? ' (or signs in with the temporary password you set)' : ''}. Two e-mails were queued: the activation link and a verification link. The admin must verify the e-mail before creating tests — see the outbox if e-mail is not configured.</p>
       <div className="row"><input className="input mono grow" readOnly value={created.admin.invite_url || ''} onFocus={(e) => e.target.select()} aria-label="Activation link" /><CopyButton text={created.admin.invite_url || ''} /></div>
     </Modal>
   )
@@ -43,6 +45,10 @@ export function NewOrgModal({ onClose, onCreated }) {
           <Input label="Temporary password (optional)" type="text" autoComplete="off" value={f.admin_temp_password} onChange={set('admin_temp_password')} hint="Leave empty to send an activation link instead." />
           <Input label="Billing contact (optional)" type="email" value={f.contact_email} onChange={set('contact_email')} />
         </div>
+        <h3 className="mt">E-mail domains</h3>
+        <Input label="Allowed domains (optional)" placeholder="sconexsoft.com, sconexsoft.in" value={f.domains} onChange={set('domains')} hint="The admin and every team member must use an address on one of these domains (subdomains count). Leave empty to allow any address." />
+        {f.domains.trim() && <Check_ label="Also restrict candidates to these domains" checked={f.candidate_domain_lock} onChange={(e) => setF({ ...f, candidate_domain_lock: e.target.checked })} />}
+        <Check_ label="Add the 2 ready-made trial tests" checked={f.install_samples} onChange={(e) => setF({ ...f, install_samples: e.target.checked })} />
         <Textarea label="Internal notes" value={f.internal_notes} onChange={set('internal_notes')} hint="Only visible to platform staff." />
       </form>
     </Modal>

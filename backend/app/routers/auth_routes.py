@@ -123,9 +123,9 @@ def forgot_password(request: Request, body: ForgotPassword, db: Session = Depend
     return {"status": "If that email has an account, a reset link is on its way."}
 
 
-def _valid_token_row(db: Session, raw: str) -> models.PasswordToken:
+def _valid_token_row(db: Session, raw: str, purposes: tuple = ("reset", "invite")) -> models.PasswordToken:
     row = db.query(models.PasswordToken).filter(models.PasswordToken.token_hash == auth.hash_token(raw)).first()
-    if row is None or row.used_at is not None or as_utc(row.expires_at) < utcnow():
+    if row is None or row.purpose not in purposes or row.used_at is not None or as_utc(row.expires_at) < utcnow():
         raise ApiError(400, "This link is invalid or has expired. Please request a new one.", "bad_token")
     return row
 
@@ -154,3 +154,38 @@ def reset_password(request: Request, body: ResetPassword, db: Session = Depends(
     audit.log_event(db, "PASSWORD_SET", user=user, details=f"via {row.purpose}", ip=auth.client_ip(request))
     db.commit()
     return {"status": "password_set"}
+
+
+# ---------------------------------------------------------------------------
+# e-mail verification (staff). Org admins must verify before they can create tests.
+# ---------------------------------------------------------------------------
+class VerifyEmail(BaseModel):
+    token: str = Field(min_length=10, max_length=200)
+
+
+@router.post("/send-verification")
+@limiter.limit("5/minute")
+def send_verification(request: Request, user: models.User = Depends(auth.require_any_staff), db: Session = Depends(get_db)):
+    """(Re)send the verification link to the signed-in user's own address."""
+    if user.email_verified_at:
+        return {"status": "already_verified"}
+    if not settings.mail_enabled and settings.is_production:
+        raise ApiError(503, "This platform cannot send e-mail yet. Ask the platform owner to configure e-mail or to verify your address manually.", "mail_not_configured")
+    org = db.get(models.Organization, user.org_id) if user.org_id else None
+    url = staff_service.send_verification(db, user, org)
+    audit.log_event(db, "EMAIL_VERIFICATION_SENT", user=user, ip=auth.client_ip(request))
+    db.commit()
+    return {"status": "sent", "email": user.email, **({"dev_link": url} if not settings.is_production and not settings.mail_enabled else {})}
+
+
+@router.post("/verify-email")
+@limiter.limit("10/minute")
+def verify_email(request: Request, body: VerifyEmail, db: Session = Depends(get_db)):
+    row = _valid_token_row(db, body.token, ("verify",))
+    user = db.get(models.User, row.user_id)
+    row.used_at = utcnow()
+    if user is not None and user.is_active and not user.email_verified_at:
+        user.email_verified_at = utcnow()
+        audit.log_event(db, "EMAIL_VERIFIED", user=user, ip=auth.client_ip(request))
+    db.commit()
+    return {"status": "verified", "email": user.email if user else None}

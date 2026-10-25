@@ -7,6 +7,8 @@
   sweep-expired       force-submit attempts whose time ran out
   purge-evidence      delete webcam evidence older than each plan's retention period
   demo-data           create a demo organization with a ready-to-use sample test
+  verify-email        mark a staff member's e-mail address as verified (when e-mail delivery is not working yet)
+  install-samples     add the two trial tests to an existing organization
 """
 import argparse
 import getpass
@@ -119,7 +121,7 @@ def demo_data(args):
         db.flush()
         password = _password(args)
         auth.validate_password(password)
-        admin = models.User(org_id=org.id, full_name="Demo Admin", email=args.email.lower(), hashed_password=auth.hash_password(password), role=ROLE_ADMIN)
+        admin = models.User(org_id=org.id, full_name="Demo Admin", email=args.email.lower(), hashed_password=auth.hash_password(password), role=ROLE_ADMIN, email_verified_at=utcnow())
         db.add(admin)
         db.flush()
         exam = models.Exam(
@@ -142,6 +144,38 @@ def demo_data(args):
             db.add(models.Question(org_id=org.id, exam_id=exam.id, position=position, created_by=admin.id, **data))
         db.commit()
         print(f"Demo organization ready.\n  Admin login : {args.email}\n  Test code   : {exam.code}")
+    finally:
+        db.close()
+
+
+def verify_email(args):
+    from app import staff_service
+    from app.timeutil import utcnow
+    db = _db()
+    try:
+        user = staff_service.find_staff_by_email(db, args.email)
+        if not user:
+            sys.exit("No staff account with that email")
+        user.email_verified_at = user.email_verified_at or utcnow()
+        db.commit()
+        print(f"{user.email} is now marked as verified.")
+    finally:
+        db.close()
+
+
+def install_samples(args):
+    from app import models, sample_tests
+    db = _db()
+    try:
+        org = db.query(models.Organization).filter(models.Organization.slug == args.org).first()
+        if not org:
+            sys.exit(f"No organization with slug '{args.org}'")
+        admin = db.query(models.User).filter(models.User.org_id == org.id, models.User.role == "admin").first()
+        if not admin:
+            sys.exit("That organization has no admin")
+        created = sample_tests.install(db, org, admin)
+        db.commit()
+        print(f"{len(created)} trial test(s) added: " + ", ".join(f"{e.title} [{e.code}]" for e in created) if created else "Nothing to add: the trial tests already exist.")
     finally:
         db.close()
 
@@ -172,6 +206,8 @@ def main():
     sub.add_parser("seed-plans").set_defaults(fn=seed_plans)
     sub.add_parser("sweep-expired").set_defaults(fn=sweep_expired)
     sub.add_parser("purge-evidence").set_defaults(fn=purge_evidence)
+    p = sub.add_parser("verify-email"); p.add_argument("--email", required=True); p.set_defaults(fn=verify_email)
+    p = sub.add_parser("install-samples"); p.add_argument("--org", required=True, help="organization slug"); p.set_defaults(fn=install_samples)
     p = sub.add_parser("demo-data"); p.add_argument("--email", default="demo@acme.example.com"); p.add_argument("--password"); p.set_defaults(fn=demo_data)
     args = parser.parse_args()
     args.fn(args)

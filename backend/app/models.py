@@ -50,6 +50,8 @@ class Organization(Model):
     settings = Field(factory=dict)
     internal_notes = Field()                     # visible to the platform owner only
     suspended_reason = Field()
+    allowed_domains = Field(factory=list)        # e-mail domains that belong to this organization, e.g. ["sconexsoft.com"]
+    candidate_domain_lock = Field(default=False) # when true only addresses at allowed_domains may join its tests
     created_at = Field(now=True)
     updated_at = Field(now=True, onupdate=True)
 
@@ -74,6 +76,7 @@ class User(Model):
     last_login_at = Field()
     phone = Field()
     extra = Field(factory=dict)                  # candidate custom fields (roll no, etc.)
+    email_verified_at = Field()                  # staff: clicked the e-mailed link; candidates: last confirmed a join code
     created_at = Field(now=True)
 
     organization = Rel("Organization", local="org_id")
@@ -89,6 +92,21 @@ class PasswordToken(Model):
     expires_at = Field()
     used_at = Field()
     created_at = Field(now=True)
+
+
+class EmailCode(Model):
+    """A short-lived 6-digit code e-mailed to a candidate to prove they own the address before joining a test."""
+    __collection__ = "email_codes"
+    __indexes__ = [(("exam_id", "email"), False)]
+
+    org_id = Field(index=True)
+    exam_id = Field()
+    email = Field(lower=True)
+    code_hash = Field()
+    attempts = Field(default=0)
+    expires_at = Field()
+    used_at = Field()
+    created_at = Field(now=True, index=True)
 
 
 class ApiKey(Model):
@@ -218,6 +236,8 @@ class Exam(Model):
     result_visibility = Field(default="score")
     proctoring = Field(factory=dict)
     candidate_fields = Field(factory=list)       # extra fields to collect on join
+    is_sample = Field(default=False)             # a ready-made trial test; does not count against the plan's active-test limit
+    sample_key = Field()                         # which trial test it is (makes installing them idempotent)
     created_at = Field(now=True)
     updated_at = Field(now=True, onupdate=True)
     published_at = Field()

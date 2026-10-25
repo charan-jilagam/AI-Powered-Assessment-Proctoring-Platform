@@ -1,0 +1,30 @@
+From fa58db41b113bf940bb5048486eda27bbeae1005 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 19:41:30 +0000
+Subject: [PATCH] CI: drop Alembic step (MongoDB has no migrations)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015923r3CRZ6Kd37ob5UoVfW
+---
+ .github/workflows/ci.yml | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 8d3ca1a..7f941ba 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -13,11 +13,6 @@ jobs:
+         with: { python-version: "3.12", cache: pip }
+       - run: pip install -r requirements.txt -r requirements-dev.txt
+       - run: python -m pytest tests -q
+-      - name: Migrations apply cleanly and match the models
+-        env:
+-          DATABASE_URL: sqlite:///./ci.db
+-          SECRET_KEY: ci-secret-key-0123456789abcdef0123456789
+-        run: alembic upgrade head && alembic check
+ 
+   frontend:
+     runs-on: ubuntu-latest
+-- 
+2.43.0
+

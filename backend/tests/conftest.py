@@ -14,6 +14,9 @@ os.environ.update({
     "BACKGROUND_INLINE": "true",     # run e-mail / webhook side effects synchronously
     "RUN_SWEEPER": "false",
     "ALLOW_PRIVATE_WEBHOOKS": "true",
+    "CODE_RUNNER": "judge0",              # tests fake judge0.execute; never touch the machine's real compilers by accident
+    "JUDGE0_FETCH_LANGUAGES": "false",
+    "CANDIDATE_EMAIL_VERIFICATION": "false",   # most tests join candidates directly; test_email_verification.py turns it on
 })
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -69,16 +72,26 @@ class Env:
         self.super = self.h(self.login(email))
         return self.super
 
-    def make_org(self, name=None, plan="professional", status="active", **extra):
+    def verify_email(self, email):
+        """Mark a staff address as verified (the tests of the verification flow itself do it the real way)."""
+        db = self.db()
+        db.query(models.User).filter(models.User.email == email.lower()).update({"email_verified_at": auth.utcnow()})
+        db.commit()
+        db.close()
+
+    def make_org(self, name=None, plan="professional", status="active", verified=True, **extra):
         if not hasattr(self, "super"):
             self.make_super()
         name = name or self.uid("Org")
         email = f"admin-{name.lower().replace(' ', '')}@client.example.com"
-        r = self.client.post("/superadmin/organizations", headers=self.super, json={
-            "name": name, "plan_code": plan, "status": status, "admin_name": f"{name} Admin", "admin_email": email,
-            "admin_temp_password": PASSWORD, **extra})
+        payload = {"name": name, "plan_code": plan, "status": status, "admin_name": f"{name} Admin", "admin_email": email,
+                   "admin_temp_password": PASSWORD, "install_samples": False}
+        payload.update(extra)
+        r = self.client.post("/superadmin/organizations", headers=self.super, json=payload)
         assert r.status_code == 201, r.text
         org = r.json()["organization"]
+        if verified:
+            self.verify_email(email)
         token = self.login(email)
         return {"id": org["id"], "name": name, "email": email, "headers": self.h(token), "invite_url": r.json()["admin"]["invite_url"]}
 
@@ -89,6 +102,7 @@ class Env:
         # activate via the invitation link
         token = r.json()["invite_url"].split("token=")[1]
         assert self.client.post("/auth/reset-password", json={"token": token, "new_password": PASSWORD}).status_code == 200
+        self.verify_email(email)
         return {"email": email, "headers": self.h(self.login(email)), "id": r.json()["id"]}
 
     # ---- tests --------------------------------------------------------

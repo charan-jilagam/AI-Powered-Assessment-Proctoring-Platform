@@ -68,7 +68,7 @@ export default function Landing() {
     <div className="landing">
       <header className="l-nav">
         <span className="brand"><img src="/brand/orvexa-emblem.png" alt="" width="34" height="34" />ORVEXA</span>
-        <nav><a href="#features">Features</a><a href="#pricing">Pricing</a><a href="#demo">Book a demo</a><ThemeToggle /><Link className="btn sm" to="/login">Sign in</Link></nav>
+        <nav><a href="#features">Features</a><a href="#pricing">Pricing</a><Link to="/guide">User guides</Link><a href="#demo">Book a demo</a><ThemeToggle /><Link className="btn sm" to="/signin">Sign in</Link></nav>
       </header>
 
       <section className="l-hero">
@@ -76,7 +76,7 @@ export default function Landing() {
           <span className="l-kicker">Assess Smarter. Trust Every Result.</span>
           <h1>Share a code. Run the exam. Trust the result.</h1>
           <p>Create a test, hand candidates an 8-character code, and get scored, proctored results with the evidence to back every decision.</p>
-          <div className="row wrap mt"><a className="btn primary lg" href="#demo">Book a demo</a><Link className="btn lg" to="/login">Sign in</Link></div>
+          <div className="row wrap mt"><a className="btn primary lg" href="#demo">Book a demo</a><Link className="btn lg" to="/signin">Sign in</Link></div>
         </div>
         <div className="l-entry">
           <h2>Taking a test?</h2>
@@ -125,7 +125,7 @@ export default function Landing() {
           </form>
         )}
       </section>
-      <footer className="l-foot"><span>© {new Date().getFullYear()} ORVEXA</span><Link to="/login">Sign in</Link></footer>
+      <footer className="l-foot"><span>© {new Date().getFullYear()} ORVEXA</span><span className="row"><Link to="/guide">User guides</Link><Link to="/signin">Sign in</Link></span></footer>
     </div>
   )
 }

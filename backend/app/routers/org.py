@@ -29,6 +29,7 @@ class OrgProfilePatch(BaseModel):
     contact_email: Optional[EmailStr] = None
     default_proctoring: Optional[ProctoringConfig] = None
     candidate_data_retention_days: Optional[int] = Field(default=None, ge=30, le=3650)
+    candidate_domain_lock: Optional[bool] = None     # only narrows access, so org admins may switch it (the domain list itself is owner-managed)
 
 
 @router.get("")
@@ -39,6 +40,8 @@ def get_org(user: models.User = Depends(auth.require_org_staff), org: models.Org
         "contact_email": org.contact_email,
         "trial_ends_at": org.trial_ends_at,
         "subscription_ends_at": org.subscription_ends_at,
+        "allowed_domains": list(org.allowed_domains or []),
+        "candidate_domain_lock": bool(org.candidate_domain_lock),
         "default_proctoring": settings_.get("default_proctoring"),
         "candidate_data_retention_days": settings_.get("candidate_data_retention_days", 365),
         "plan": serializers.plan_out(org.plan) if org.plan else None,
@@ -60,6 +63,10 @@ def update_org(body: OrgProfilePatch, request: Request, user: models.User = Depe
         settings_["default_proctoring"] = body.default_proctoring.model_dump()
     if "candidate_data_retention_days" in data:
         settings_["candidate_data_retention_days"] = body.candidate_data_retention_days
+    if data.get("candidate_domain_lock") is not None:
+        if data["candidate_domain_lock"] and not org.allowed_domains:
+            raise bad_request("No e-mail domain is registered for your organization yet. Ask the platform owner to add one.", "no_domains")
+        org.candidate_domain_lock = bool(data["candidate_domain_lock"])
     org.settings = settings_
     audit.log_event(db, "ORG_SETTINGS_UPDATED", user=user, entity_type="organization", entity_id=org.id, details=", ".join(data), ip=auth.client_ip(request))
     db.commit()

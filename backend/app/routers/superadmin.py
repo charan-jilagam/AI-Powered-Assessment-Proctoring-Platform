@@ -7,7 +7,7 @@ from pydantic import BaseModel, EmailStr, Field
 from app.mongo import func, or_
 from app.mongo import Session
 
-from app import audit, auth, mailer, models, serializers, staff_service, tenancy
+from app import audit, auth, mailer, models, sample_tests, serializers, staff_service, tenancy
 from app.config import settings
 from app.constants import (
     ATT_VOIDED, EXAM_PUBLISHED, ORG_ACTIVE, ORG_CANCELLED, ORG_STATUSES, ORG_SUSPENDED, ORG_TRIAL,
@@ -37,6 +37,9 @@ class OrgCreate(BaseModel):
     admin_email: EmailStr
     admin_temp_password: Optional[str] = None
     send_invite: bool = True
+    allowed_domains: List[str] = Field(default_factory=list, max_length=10)   # e.g. ["sconexsoft.com"]
+    candidate_domain_lock: bool = False
+    install_samples: bool = True                                               # add the two trial tests
 
 
 class OrgPatch(BaseModel):
@@ -49,6 +52,8 @@ class OrgPatch(BaseModel):
     contact_email: Optional[EmailStr] = None
     internal_notes: Optional[str] = None
     limits_override: Optional[Dict[str, Any]] = None
+    allowed_domains: Optional[List[str]] = Field(default=None, max_length=10)
+    candidate_domain_lock: Optional[bool] = None
 
 
 class PlanIn(BaseModel):
@@ -128,6 +133,7 @@ def _org_row(db: Session, org: models.Organization) -> Dict[str, Any]:
         "contact_email": org.contact_email, "trial_ends_at": org.trial_ends_at,
         "subscription_ends_at": org.subscription_ends_at, "created_at": org.created_at,
         "block_reason": auth.org_block_reason(org), "usage": snap["usage"], "limits": snap["limits"],
+        "allowed_domains": list(org.allowed_domains or []), "candidate_domain_lock": bool(org.candidate_domain_lock),
     }
 
 
@@ -189,6 +195,8 @@ def overview(user: models.User = Depends(auth.require_super_admin), db: Session 
         "top_organizations": [{"id": i, "name": n, "attempts": c} for i, n, c in top],
         "trials_ending_soon": expiring,
         "new_demo_requests": db.query(func.count(models.DemoRequest.id)).filter(models.DemoRequest.status == "new").scalar() or 0,
+        "mail": {"provider": settings.mail_provider or None, "configured": settings.mail_enabled,
+                 "verification_required": settings.staff_email_verification or settings.candidate_email_verification},
     }
 
 
@@ -217,13 +225,16 @@ def create_org(body: OrgCreate, request: Request, user: models.User = Depends(au
     plan = _plan_by_code(db, body.plan_code)
     if staff_service.find_staff_by_email(db, body.admin_email):
         raise conflict("A staff account with this email already exists", "email_taken")
+    domains = staff_service.normalize_domains(body.allowed_domains)
+    if domains and not staff_service.domain_allowed(domains, body.admin_email):
+        raise bad_request(f"The admin's address must be at one of the organization's domains: {', '.join('@' + d for d in domains)}.", "email_domain_not_allowed")
     now = utcnow()
     org = models.Organization(
         name=body.name.strip(), slug=tenancy.unique_slug(db, body.slug or body.name), status=body.status, plan_id=plan.id,
         contact_email=body.contact_email or body.admin_email, internal_notes=body.internal_notes,
         trial_ends_at=(now + timedelta(days=body.trial_days or settings.trial_days)) if body.status == ORG_TRIAL else None,
         subscription_ends_at=body.subscription_ends_at if body.status == ORG_ACTIVE else None,
-        settings={},
+        settings={}, allowed_domains=domains, candidate_domain_lock=bool(body.candidate_domain_lock and domains),
     )
     db.add(org)
     db.flush()
@@ -231,8 +242,10 @@ def create_org(body: OrgCreate, request: Request, user: models.User = Depends(au
         db, org=org, full_name=body.admin_name, email=body.admin_email, role=ROLE_ADMIN,
         temp_password=body.admin_temp_password, send_invite=body.send_invite, invited_by="The ORVEXA platform team",
     )
+    if body.install_samples:
+        sample_tests.install(db, org, created["user"])
     audit.log_event(db, "ORG_CREATED", user=user, org_id=org.id, entity_type="organization", entity_id=org.id,
-                    details=f"name='{org.name}' plan={plan.code} admin={body.admin_email}", ip=auth.client_ip(request))
+                    details=f"name='{org.name}' plan={plan.code} admin={body.admin_email} domains={','.join(domains) or '-'}", ip=auth.client_ip(request))
     db.commit()
     db.refresh(org)
     return {
@@ -287,6 +300,18 @@ def update_org(org_id: int, body: OrgPatch, request: Request, user: models.User 
             pass
     else:
         changes.pop("status", None)
+    if "allowed_domains" in changes and changes["allowed_domains"] is not None:
+        org.allowed_domains = staff_service.normalize_domains(changes.pop("allowed_domains"))
+        notes.append(f"allowed_domains={','.join(org.allowed_domains) or '-'}")
+    else:
+        changes.pop("allowed_domains", None)
+    if "candidate_domain_lock" in changes and changes["candidate_domain_lock"] is not None:
+        if changes["candidate_domain_lock"] and not org.allowed_domains:
+            raise bad_request("Add at least one e-mail domain before restricting candidates to it.", "no_domains")
+        org.candidate_domain_lock = bool(changes.pop("candidate_domain_lock"))
+        notes.append(f"candidate_domain_lock={org.candidate_domain_lock}")
+    else:
+        changes.pop("candidate_domain_lock", None)
     for field in ("name", "contact_email", "internal_notes", "trial_ends_at", "subscription_ends_at"):
         if field in changes:
             setattr(org, field, changes[field])
@@ -324,6 +349,30 @@ def add_org_admin(org_id: int, body: AdminCreate, request: Request, user: models
                     details=f"{body.email} as {body.role}", ip=auth.client_ip(request))
     db.commit()
     return {**serializers.user_out(created["user"]), "invite_url": created["invite_url"], "temp_password": created["temp_password"]}
+
+
+@router.post("/organizations/{org_id}/users/{user_id}/verify-email")
+def mark_email_verified(org_id: int, user_id: int, request: Request, user: models.User = Depends(auth.require_super_admin), db: Session = Depends(get_db)):
+    """Emergency override: the owner has confirmed this person's address by other means (or e-mail delivery is down)."""
+    _org(db, org_id)
+    member = tenancy.get_org_user(db, user_id, org_id)
+    if member.role not in (ROLE_ADMIN, ROLE_REVIEWER):
+        raise not_found("User")
+    member.email_verified_at = member.email_verified_at or utcnow()
+    audit.log_event(db, "EMAIL_VERIFIED_BY_OWNER", user=user, org_id=org_id, entity_type="user", entity_id=member.id, details=member.email, ip=auth.client_ip(request))
+    db.commit()
+    return serializers.user_out(member)
+
+
+@router.post("/organizations/{org_id}/users/{user_id}/send-verification")
+def resend_verification(org_id: int, user_id: int, user: models.User = Depends(auth.require_super_admin), db: Session = Depends(get_db)):
+    org = _org(db, org_id)
+    member = tenancy.get_org_user(db, user_id, org_id)
+    if member.email_verified_at:
+        return {"status": "already_verified"}
+    staff_service.send_verification(db, member, org)
+    db.commit()
+    return {"status": "sent", "email": member.email}
 
 
 @router.post("/organizations/{org_id}/users/{user_id}/reset-link")

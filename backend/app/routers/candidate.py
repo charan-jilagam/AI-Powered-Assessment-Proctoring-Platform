@@ -8,7 +8,7 @@ from app.mongo import func
 from app.mongo import Session
 
 from app import (
-    attempt_service, audit, auth, coding, exam_service, models, proctor_rules, proctoring, scoring, serializers, staff_service,
+    attempt_service, audit, auth, coding, email_verification, exam_service, models, proctor_rules, proctoring, scoring, serializers, staff_service,
     storage, tenancy, webhooks,
 )
 from app.constants import (
@@ -19,7 +19,8 @@ from app.database import get_db
 from app.errors import ApiError, bad_request, conflict, forbidden, not_found
 from app.attempt_deps import AttemptCtx, attempt_ctx
 from app.limiter import limiter
-from app.schemas import AnswersIn, HeartbeatIn, ImageIn, JoinRequest, StartRequest, ViolationIn
+from app.config import settings
+from app.schemas import AnswersIn, HeartbeatIn, ImageIn, JoinRequest, SendCodeRequest, StartRequest, ViolationIn
 from app.timeutil import as_utc, utcnow
 
 public_router = APIRouter(prefix="/public/tests", tags=["candidate"])
@@ -77,7 +78,29 @@ def _public_test(db: Session, exam: models.Exam, org: models.Organization) -> Di
             {"closed": "This test is closed.", "not_started": "This test has not opened yet.", "ended": "The window for this test has ended."}[state]),
         "proctoring": {k: cfg[k] for k in ("webcam_required", "microphone_required", "fullscreen_required", "ai_monitoring", "id_verification")},
         "instructions": exam.instructions,
+        "is_sample": bool(exam.is_sample),
+        "requires_email_verification": settings.candidate_email_verification,
+        "email_domains": list(org.allowed_domains or []) if org.candidate_domain_lock and org.allowed_domains else [],
     }
+
+
+def _check_domain(org: models.Organization, email: str) -> None:
+    if org.candidate_domain_lock and org.allowed_domains and not staff_service.domain_allowed(org.allowed_domains, email):
+        raise ApiError(403, "This test is only open to people with an e-mail address at " + ", ".join("@" + d for d in org.allowed_domains) + ".",
+                       "email_domain_not_allowed")
+
+
+def _invite_for(db: Session, exam: models.Exam, email: str, token: Optional[str]):
+    """The usable invite for this e-mail on this test (None if there is none). Shared by send-code and join."""
+    invite = db.query(models.Invite).filter(models.Invite.exam_id == exam.id, models.Invite.email == email).first()
+    if token:
+        token_invite = db.query(models.Invite).filter(models.Invite.exam_id == exam.id, models.Invite.token == token).first()
+        if token_invite is None or token_invite.email != email:
+            raise ApiError(403, "This invitation link does not match the email you entered.", "invite_mismatch")
+        invite = token_invite
+    if invite and invite.status == INV_REVOKED:
+        invite = None
+    return invite
 
 
 def _ua(request: Request) -> str:
@@ -133,6 +156,31 @@ def lookup_test(request: Request, code: str, db: Session = Depends(get_db)):
     return _public_test(db, exam, db.get(models.Organization, exam.org_id))
 
 
+@public_router.post("/{code}/send-code")
+@limiter.limit("10/minute")
+def send_email_code(request: Request, code: str, body: SendCodeRequest, db: Session = Depends(get_db)):
+    """Step 1 of joining: e-mail a 6-digit code to the address the candidate typed."""
+    exam = _exam_by_code(db, code)
+    org = db.get(models.Organization, exam.org_id)
+    if auth.org_block_reason(org) or _window_state(exam) != "open":
+        raise ApiError(403, "This test is not available right now. Please contact the organizer.", "unavailable")
+    if not settings.candidate_email_verification:
+        return {"status": "not_required"}
+    email = staff_service.normalize_email(body.email)
+    _check_domain(org, email)
+    if exam.access_mode == ACCESS_INVITE and _invite_for(db, exam, email, body.invite_token) is None:
+        raise ApiError(403, "This test is by invitation only, and that email address was not invited.", "not_invited")
+    if not settings.mail_enabled and settings.is_production:
+        raise ApiError(503, "This platform cannot send e-mail right now, so your address cannot be verified. Please tell the organizer.", "mail_not_configured")
+    sent = email_verification.issue(db, exam, org, email, (body.full_name or "").strip())
+    audit.log_event(db, "EMAIL_CODE_SENT", actor_email=email, org_id=org.id, entity_type="test", entity_id=exam.id, ip=auth.client_ip(request))
+    db.commit()
+    out = {"status": "sent", "expires_minutes": settings.email_code_minutes}
+    if not settings.mail_enabled and not settings.is_production:
+        out["dev_code"] = sent  # local development without any mail transport: show the code instead of e-mailing it
+    return out
+
+
 @public_router.post("/{code}/join")
 @limiter.limit("20/minute")
 def join_test(request: Request, code: str, body: JoinRequest, db: Session = Depends(get_db)):
@@ -147,15 +195,9 @@ def join_test(request: Request, code: str, body: JoinRequest, db: Session = Depe
         raise ApiError(403, "Incorrect access password", "bad_access_password")
 
     email = staff_service.normalize_email(body.email)
+    _check_domain(org, email)
     # --- invite rules
-    invite = db.query(models.Invite).filter(models.Invite.exam_id == exam.id, models.Invite.email == email).first()
-    if body.invite_token:
-        token_invite = db.query(models.Invite).filter(models.Invite.exam_id == exam.id, models.Invite.token == body.invite_token).first()
-        if token_invite is None or token_invite.email != email:
-            raise ApiError(403, "This invitation link does not match the email you entered.", "invite_mismatch")
-        invite = token_invite
-    if invite and invite.status == INV_REVOKED:
-        invite = None
+    invite = _invite_for(db, exam, email, body.invite_token)
     if invite and invite.expires_at and as_utc(invite.expires_at) < utcnow() and invite.status != INV_STARTED:
         raise ApiError(403, "Your invitation has expired. Ask the organizer for a new one.", "invite_expired")
     if exam.access_mode == ACCESS_INVITE and invite is None:
@@ -167,6 +209,14 @@ def join_test(request: Request, code: str, body: JoinRequest, db: Session = Depe
         if spec.get("required") and not fields.get(spec["key"]):
             raise bad_request(f"{spec['label']} is required", "missing_field")
     profile = {s["key"]: fields.get(s["key"], "") for s in (exam.candidate_fields or [])}
+
+    # --- the candidate must prove they own the address
+    verified_now = False
+    if settings.candidate_email_verification:
+        if not (body.email_code or "").strip():
+            raise ApiError(400, "Enter the 6-digit code we e-mailed you to confirm your address.", "email_code_required")
+        email_verification.check(db, exam, email, body.email_code)
+        verified_now = True
 
     # --- candidate account (scoped to the organization)
     candidate = db.query(models.User).filter(
@@ -181,6 +231,8 @@ def join_test(request: Request, code: str, body: JoinRequest, db: Session = Depe
     else:
         candidate.full_name, candidate.phone = body.full_name, body.phone or candidate.phone
         candidate.extra = {**(candidate.extra or {}), **profile}
+    if verified_now:
+        candidate.email_verified_at = utcnow()
 
     attempt = (
         db.query(models.Attempt)

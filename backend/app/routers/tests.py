@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from app.mongo import func, or_
 from app.mongo import Session
 
-from app import audit, auth, coding, exam_service, models, question_rules, tenancy, webhooks
+from app import audit, auth, coding, exam_service, models, question_rules, sample_tests, tenancy, webhooks
 from app.constants import (
     ATT_VOIDED, EXAM_ARCHIVED, EXAM_CLOSED, EXAM_DRAFT, EXAM_PUBLISHED, EXAM_STATUSES, ORG_ACTIVE,
 )
@@ -47,7 +47,7 @@ def list_tests(
 
 @router.post("", status_code=201)
 def create_test(
-    body: ExamIn, request: Request, user: models.User = Depends(auth.require_org_admin),
+    body: ExamIn, request: Request, user: models.User = Depends(auth.require_verified_admin),
     org: models.Organization = Depends(auth.get_current_org), db: Session = Depends(get_db),
 ):
     exam_service.validate_schedule(body.start_time, body.end_time)
@@ -81,6 +81,17 @@ def create_test(
     db.commit()
     db.refresh(exam)
     return {**exam_service.exam_detail(db, exam), "warnings": warnings}
+
+
+@router.post("/samples", status_code=201)
+def install_sample_tests(request: Request, user: models.User = Depends(auth.require_org_admin),
+                         org: models.Organization = Depends(auth.get_current_org), db: Session = Depends(get_db)):
+    """Add the two ready-made trial tests (idempotent: tests you already have are left alone)."""
+    created = sample_tests.install(db, org, user)
+    if created:
+        audit.log_event(db, "SAMPLE_TESTS_INSTALLED", user=user, entity_type="organization", entity_id=org.id, details=", ".join(e.title for e in created), ip=auth.client_ip(request))
+    db.commit()
+    return {"created": [exam_service.exam_summary(db, e) for e in created]}
 
 
 @router.get("/{exam_id}")
@@ -143,7 +154,7 @@ def update_test(
 # lifecycle
 # ---------------------------------------------------------------------------
 @router.post("/{exam_id}/publish")
-def publish_test(exam_id: int, request: Request, user: models.User = Depends(auth.require_org_admin),
+def publish_test(exam_id: int, request: Request, user: models.User = Depends(auth.require_verified_admin),
                  org: models.Organization = Depends(auth.get_current_org), db: Session = Depends(get_db)):
     exam = tenancy.get_exam(db, exam_id, user.org_id)
     if exam.status == EXAM_PUBLISHED:
@@ -201,7 +212,7 @@ def archive_test(exam_id: int, user: models.User = Depends(auth.require_org_admi
 
 
 @router.post("/{exam_id}/duplicate", status_code=201)
-def duplicate_test(exam_id: int, user: models.User = Depends(auth.require_org_admin), db: Session = Depends(get_db)):
+def duplicate_test(exam_id: int, user: models.User = Depends(auth.require_verified_admin), db: Session = Depends(get_db)):
     src = tenancy.get_exam(db, exam_id, user.org_id)
     copy = exam_service.duplicate_exam(db, src, user)
     audit.log_event(db, "TEST_DUPLICATED", user=user, entity_type="test", entity_id=copy.id, details=f"from {src.id}")
@@ -238,7 +249,7 @@ def delete_test(exam_id: int, request: Request, user: models.User = Depends(auth
 # questions
 # ---------------------------------------------------------------------------
 @router.post("/{exam_id}/questions", status_code=201)
-def add_question(exam_id: int, body: QuestionIn, user: models.User = Depends(auth.require_org_admin), db: Session = Depends(get_db)):
+def add_question(exam_id: int, body: QuestionIn, user: models.User = Depends(auth.require_verified_admin), db: Session = Depends(get_db)):
     exam = tenancy.get_exam(db, exam_id, user.org_id)
     q = exam_service.add_question(db, exam, body.model_dump(), user)
     db.commit()
@@ -287,7 +298,7 @@ def reorder_questions(exam_id: int, body: ReorderIn, user: models.User = Depends
 @router.post("/{exam_id}/questions/import-csv")
 async def import_questions_csv(
     exam_id: int, file: UploadFile = File(...), dry_run: bool = Form(False),
-    user: models.User = Depends(auth.require_org_admin), db: Session = Depends(get_db),
+    user: models.User = Depends(auth.require_verified_admin), db: Session = Depends(get_db),
 ):
     """All-or-nothing: if any row is invalid nothing is imported and every problem is reported."""
     exam = tenancy.get_exam(db, exam_id, user.org_id)
@@ -311,7 +322,7 @@ class FromBankIn(BaseModel):
 
 
 @router.post("/{exam_id}/questions/from-bank")
-def add_from_bank(exam_id: int, body: FromBankIn, user: models.User = Depends(auth.require_org_admin), db: Session = Depends(get_db)):
+def add_from_bank(exam_id: int, body: FromBankIn, user: models.User = Depends(auth.require_verified_admin), db: Session = Depends(get_db)):
     exam = tenancy.get_exam(db, exam_id, user.org_id)
     rows = db.query(models.Question).filter(models.Question.id.in_(body.question_ids), models.Question.org_id == user.org_id, models.Question.exam_id.is_(None)).all()
     if not rows:

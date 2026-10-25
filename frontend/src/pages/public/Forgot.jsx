@@ -23,7 +23,7 @@ export default function Forgot() {
           <Button variant="primary" block busy={busy} type="submit">Send reset link</Button>
         </form>
       )}
-      <p className="mt" style={{ fontSize: 13.5 }}><Link to="/login">Back to sign in</Link></p>
+      <p className="mt" style={{ fontSize: 13.5 }}><Link to="/signin">Back to sign in</Link></p>
     </AuthShell>
   )
 }

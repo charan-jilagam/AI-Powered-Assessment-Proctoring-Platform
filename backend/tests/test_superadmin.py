@@ -22,10 +22,11 @@ def test_create_org_with_invite_link_and_first_login(env):
     assert body["organization"]["slug"] == "globex-corporation" and body["organization"]["status"] == "trial"
     assert body["admin"]["email"] == "hank@globex.example.com"                       # normalised
     assert "/accept-invite?token=" in body["admin"]["invite_url"] and body["admin"]["temp_password"] is None
-    # invitation e-mail was queued
+    # two e-mails were queued: the invitation and the (separate) address-verification link
     db = env.db()
-    assert db.query(models.EmailOutbox).filter(models.EmailOutbox.to_email == "hank@globex.example.com").count() == 1
+    subjects = [m.subject for m in db.query(models.EmailOutbox).filter(models.EmailOutbox.to_email == "hank@globex.example.com").all()]
     db.close()
+    assert len(subjects) == 2 and any("invited" in s for s in subjects) and any("Verify" in s for s in subjects)
     # the admin activates the account and can sign in
     token = body["admin"]["invite_url"].split("token=")[1]
     assert env.client.post("/auth/reset-password", json={"token": token, "new_password": PASSWORD}).status_code == 200

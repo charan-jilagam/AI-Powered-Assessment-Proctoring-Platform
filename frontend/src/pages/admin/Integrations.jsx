@@ -24,11 +24,11 @@ export default function Integrations() {
 function Brand() {
   const { org, refresh } = useAuth()
   const { toast, error } = useUI()
-  const [f, setF] = useState({ name: org.name, brand_color: org.brand_color || '#0f766e', logo_url: org.logo_url || '', candidate_data_retention_days: org.candidate_data_retention_days ?? 365 })
+  const [f, setF] = useState({ name: org.name, brand_color: org.brand_color || '#0f766e', logo_url: org.logo_url || '', candidate_data_retention_days: org.candidate_data_retention_days ?? 365, candidate_domain_lock: !!org.candidate_domain_lock })
   const [busy, setBusy] = useState(false)
   async function save() {
     setBusy(true)
-    try { await api.patch('/org', { name: f.name, brand_color: f.brand_color, logo_url: f.logo_url || null, candidate_data_retention_days: Number(f.candidate_data_retention_days) }); await refresh(); toast('Saved') } catch (e) { error(e) } finally { setBusy(false) }
+    try { await api.patch('/org', { name: f.name, brand_color: f.brand_color, logo_url: f.logo_url || null, candidate_data_retention_days: Number(f.candidate_data_retention_days), ...(org.allowed_domains?.length ? { candidate_domain_lock: f.candidate_domain_lock } : {}) }); await refresh(); toast('Saved') } catch (e) { error(e) } finally { setBusy(false) }
   }
   return (
     <div className="grid c2" style={{ alignItems: 'start' }}>
@@ -36,6 +36,12 @@ function Brand() {
         <Input label="Name shown to candidates" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} />
         <div className="grid c2"><Input label="Brand color" type="color" value={f.brand_color} onChange={(e) => setF({ ...f, brand_color: e.target.value })} style={{ padding: 3 }} /><Input label="Keep candidate data (days)" type="number" min="30" value={f.candidate_data_retention_days} onChange={(e) => setF({ ...f, candidate_data_retention_days: e.target.value })} /></div>
         <Input label="Logo URL" type="url" placeholder="https://…/logo.png" value={f.logo_url} onChange={(e) => setF({ ...f, logo_url: e.target.value })} hint="Public https address of a square or wide logo." />
+        <h3 className="mt">E-mail domains</h3>
+        {org.allowed_domains?.length ? <>
+          <div className="chips mb">{org.allowed_domains.map((d) => <span key={d} className="chip">@{d}</span>)}</div>
+          <Check_ label="Only let candidates with these e-mail domains join our tests" checked={f.candidate_domain_lock} onChange={(e) => setF({ ...f, candidate_domain_lock: e.target.checked })} />
+          <p className="hint mb">Your team members must always use these domains. Ask the platform owner to change the list.</p>
+        </> : <p className="hint mb">No domain restriction is set for your organization. Ask the platform owner to add your company domains (for example <code>yourcompany.com</code>).</p>}
         <Button variant="primary" busy={busy} onClick={save}>Save</Button>
       </Panel>
       <Panel title="What candidates see">

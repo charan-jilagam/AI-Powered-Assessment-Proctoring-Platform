@@ -15,7 +15,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app import attempt_service, coding, proctoring
+from app import attempt_service, coding, judge0, local_runner, proctoring
 from app.config import settings
 from app import database
 from app.mongo import IntegrityError
@@ -174,7 +174,10 @@ def ready():
         db_ok = False
     ai = proctoring._state
     body = {"status": "healthy" if db_ok else "degraded", "database": "connected" if db_ok else "unreachable", "version": VERSION,
-            "ai_proctoring": {"enabled": settings.ai_proctoring_enabled, "loaded": ai["loaded"] and ai["error"] is None, "error": ai["error"]}}
+            "ai_proctoring": {"enabled": settings.ai_proctoring_enabled, "loaded": ai["loaded"] and ai["error"] is None, "error": ai["error"]},
+            "mail": {"provider": settings.mail_provider or None, "configured": settings.mail_enabled},
+            "code_runner": {"engine": judge0.CODE_RUNNER, "languages": len(judge0.get_languages()) if judge0.CODE_RUNNER == "local" else None,
+                            "isolated": local_runner.isolation_active() if judge0.CODE_RUNNER == "local" else None}}
     return JSONResponse(body, status_code=200 if db_ok else 503)
 
 

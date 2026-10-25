@@ -78,6 +78,16 @@ class Settings:
     smtp_password: str = field(default_factory=lambda: os.getenv("SMTP_PASSWORD", ""))
     smtp_starttls: bool = field(default_factory=lambda: _bool("SMTP_STARTTLS", True))
     mail_from: str = field(default_factory=lambda: os.getenv("MAIL_FROM", "ORVEXA <no-reply@orvexa.local>"))
+    # HTTPS mail APIs (work on hosts that block outbound SMTP, e.g. Render's free tier). Checked before SMTP.
+    brevo_api_key: str = field(default_factory=lambda: os.getenv("BREVO_API_KEY", ""))
+    resend_api_key: str = field(default_factory=lambda: os.getenv("RESEND_API_KEY", ""))
+
+    # E-mail verification. Staff: org admins/reviewers must verify before creating tests.
+    # Candidates: a 6-digit code e-mailed to them must be entered before they can join a test.
+    staff_email_verification: bool = field(default_factory=lambda: _bool("STAFF_EMAIL_VERIFICATION", True))
+    candidate_email_verification: bool = field(default_factory=lambda: _bool("CANDIDATE_EMAIL_VERIFICATION", True))
+    verify_token_hours: int = field(default_factory=lambda: _int("VERIFY_TOKEN_HOURS", 48))
+    email_code_minutes: int = field(default_factory=lambda: _int("EMAIL_CODE_MINUTES", 10))
 
     # Evidence storage: Cloudinary when configured (CLOUDINARY_URL or the three CLOUDINARY_* values), else local disk.
     cloudinary_url: str = field(default_factory=lambda: os.getenv("CLOUDINARY_URL", ""))
@@ -105,6 +115,19 @@ class Settings:
     sweeper_interval_seconds: int = field(default_factory=lambda: _int("SWEEPER_INTERVAL_SECONDS", 60))
     run_sweeper: bool = field(default_factory=lambda: _bool("RUN_SWEEPER", True))
     allow_private_webhooks: bool = field(default_factory=lambda: _bool("ALLOW_PRIVATE_WEBHOOKS", False))
+
+    @property
+    def mail_provider(self) -> str:
+        """Which transport delivers e-mail: 'brevo' | 'resend' | 'smtp' | '' (none: messages are only stored in the outbox)."""
+        if self.brevo_api_key:
+            return "brevo"
+        if self.resend_api_key:
+            return "resend"
+        return "smtp" if self.smtp_host else ""
+
+    @property
+    def mail_enabled(self) -> bool:
+        return bool(self.mail_provider)
 
     @property
     def razorpay_enabled(self) -> bool:
@@ -137,6 +160,9 @@ class Settings:
             problems.append("MONGODB_URI must start with mongodb:// or mongodb+srv://")
         if self.is_production and any("localhost" in o for o in self.cors_origins):
             log.warning("CORS_ORIGINS still contains localhost in production.")
+        if self.is_production and not self.mail_enabled and (self.staff_email_verification or self.candidate_email_verification):
+            log.warning("E-mail verification is on but no mail transport is configured (BREVO_API_KEY, RESEND_API_KEY or SMTP_HOST): "
+                        "nobody can receive verification links or codes.")
         if problems:
             raise RuntimeError("Invalid configuration: " + "; ".join(problems))
 
