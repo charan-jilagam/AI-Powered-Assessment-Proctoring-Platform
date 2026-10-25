@@ -1,0 +1,2316 @@
+From 5c208e316b83763b5dadf96c46a30231b6b77648 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 24 Oct 2026 18:17:19 +0000
+Subject: [PATCH] Production MVP: themes, proctoring alerts, printable report,
+ similarity screening, question library, hardening
+
+- Light/dark/system theme with no flash; polished proctoring alert stack and camera tile
+- Printable A4 attempt report, code-submission replay, code similarity screening
+- 36-question starter library; editor line numbers and auto-indent
+- Fix: nginx security headers were dropped by location blocks; add CSP
+- Fix: bare postgresql:// URLs selected psycopg v3 under SQLAlchemy 2.1; normalise to psycopg2
+- Remove applied patch files; Docker uses npm ci / node 22
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015923r3CRZ6Kd37ob5UoVfW
+---
+ README.md                                    |  10 +-
+ backend/app/config.py                        |   4 +
+ backend/app/proctor_rules.py                 |   2 +-
+ backend/app/routers/bank.py                  |  48 +-
+ backend/app/routers/results.py               |  13 +-
+ backend/app/similarity.py                    | 124 ++++
+ backend/samples/question_library.json        | 739 +++++++++++++++++++
+ backend/tests/test_auth.py                   |   9 +
+ backend/tests/test_similarity_library.py     | 132 ++++
+ docs/DEPLOYMENT.md                           |   3 +
+ docs/KNOWN_GAPS.md                           |   6 +-
+ frontend/Dockerfile                          |   5 +-
+ frontend/index.html                          |   3 +
+ frontend/nginx.conf                          |  13 +-
+ frontend/public/theme-init.js                |  10 +
+ frontend/security-headers.conf               |  10 +
+ frontend/src/App.jsx                         |   8 +-
+ frontend/src/layouts/StaffLayout.jsx         |   2 +
+ frontend/src/lib/theme.jsx                   |  69 ++
+ frontend/src/main.jsx                        |  18 +-
+ frontend/src/pages/admin/AttemptReport.jsx   |  39 +-
+ frontend/src/pages/admin/Bank.jsx            |  35 +-
+ frontend/src/pages/admin/ReportPrint.jsx     | 173 +++++
+ frontend/src/pages/candidate/CodingPanel.jsx |  16 +-
+ frontend/src/pages/candidate/ExamRoom.jsx    |  22 +-
+ frontend/src/pages/candidate/ProctorHud.jsx  |  87 +++
+ frontend/src/pages/public/Landing.jsx        |   3 +-
+ frontend/src/styles/pages.css                |  76 +-
+ frontend/src/styles/report.css               |  65 ++
+ 29 files changed, 1698 insertions(+), 46 deletions(-)
+ create mode 100644 backend/app/similarity.py
+ create mode 100644 backend/samples/question_library.json
+ create mode 100644 backend/tests/test_similarity_library.py
+ create mode 100644 frontend/public/theme-init.js
+ create mode 100644 frontend/security-headers.conf
+ create mode 100644 frontend/src/lib/theme.jsx
+ create mode 100644 frontend/src/pages/admin/ReportPrint.jsx
+ create mode 100644 frontend/src/pages/candidate/ProctorHud.jsx
+ create mode 100644 frontend/src/styles/report.css
+
+diff --git a/README.md b/README.md
+index 2d925ad..f5a2be5 100644
+--- a/README.md
++++ b/README.md
+@@ -17,7 +17,7 @@ Data is isolated per organization on every query; see `backend/tests/test_tenanc
+ 
+ **Platform (super admin):** organizations with trial/active/suspended/cancelled status · plans (seats, active tests, candidates/month, AI proctoring, coding, API, webhooks, evidence retention) with per-org overrides · platform admins · demo-request leads · e-mail outbox · audit log · platform usage dashboard.
+ 
+-**Test authoring (admin):** single / multiple / true-false / short-text questions · sections · negative marking · per-question marks and difficulty · shuffle questions and options · reusable question bank with tags · CSV import · coding problems (Judge0) with hidden test cases · duplicate test · publish/close/archive · regenerate code.
++**Test authoring (admin):** single / multiple / true-false / short-text questions · sections · negative marking · per-question marks and difficulty · shuffle questions and options · reusable question bank with tags · CSV import · built-in 36-question starter library (Python, JavaScript, SQL, DSA, CS fundamentals, aptitude) · coding problems (Judge0) with hidden test cases · duplicate test · publish/close/archive · regenerate code.
+ 
+ **Access control:** 8-character code and share link `/t/{code}` · optional access password · invite-only mode with per-candidate links · start/end window · max attempts · custom candidate fields · one live session per attempt (a second join ends the first).
+ 
+@@ -25,7 +25,9 @@ Data is isolated per organization on every query; see `backend/tests/test_tenanc
+ 
+ **Proctoring:** tab switch, window blur, fullscreen exit, copy/paste, right-click, shortcuts, devtools, resize, camera/mic loss, voice · webcam snapshots · AI checks (no face, multiple faces, looking away, head turned, lip movement, prohibited objects) with debouncing · severity levels, risk score, optional auto-termination · ID capture · consent.
+ 
+-**Review & results:** per-test results table, ranking, CSV export · attempt report with answers, timeline and evidence images · confirm/dismiss violations · cleared/suspicious/disqualified decisions with notes · void & allow retake · extend time · live monitor · analytics (score distribution, per-question difficulty) · candidate result page (configurable).
++**Candidate experience:** light / dark / match-system theme (light by default) · clear on-screen proctoring alerts (minor notices fade, serious warnings show a strike counter and must be acknowledged) · live camera tile with status · code editor with line numbers, auto-indent and tab support.
++
++**Review & results:** printable professional **PDF report** per attempt (summary, integrity timeline, evidence, code similarity, section scores, answers, reviewer sign-off) · code-submission history replay · **code similarity screening** between candidates of a test · per-test results table, ranking, CSV export · attempt report with answers, timeline and evidence images · confirm/dismiss violations · cleared/suspicious/disqualified decisions with notes · void & allow retake · extend time · live monitor · analytics (score distribution, per-question difficulty) · candidate result page (configurable).
+ 
+ **Integrations & ops:** API keys (`X-API-Key`) · HMAC-signed webhooks with SSRF guard · branded candidate pages · e-mail via SMTP · data erasure · evidence retention purge · health endpoints · Alembic migrations · Docker/compose · CI workflow.
+ 
+@@ -59,7 +61,7 @@ Production uses PostgreSQL and Alembic (`alembic upgrade head` runs in the backe
+ ## Tests
+ 
+ ```bash
+-cd backend && pip install -r requirements-dev.txt && pytest -q     # 260 tests
++cd backend && pip install -r requirements-dev.txt && pytest -q     # 269 tests
+ cd frontend && npm run lint && npm run build
+ ```
+ 
+@@ -72,4 +74,4 @@ cd frontend && npm run lint && npm run build
+ 
+ ## Honest status
+ 
+-Verified by automated tests and a browser smoke test: tenancy isolation, roles, plan limits, candidate lifecycle, server-side proctoring rules, results/review, webhooks, mail outbox, and the main staff and candidate screens. **Not verified here:** real AI models on real webcams, real SMTP delivery, a real Judge0 instance, PostgreSQL migrations, the Docker build. **Not implemented:** online payments/billing (plans are assigned manually by the super admin). Details in `docs/KNOWN_GAPS.md`.
++Verified by automated tests and a browser smoke test: tenancy isolation, roles, plan limits, candidate lifecycle, server-side proctoring rules, results/review, webhooks, mail outbox, and the main staff and candidate screens. PostgreSQL 16 migrations and a production-mode API run against Postgres were also verified. **Not verified here:** real AI models on real webcams, real SMTP delivery, a real Judge0 instance, the Docker image build and the nginx config (no Docker daemon / nginx in the build environment). **Not implemented:** online payments/billing (plans are assigned manually by the super admin). Details in `docs/KNOWN_GAPS.md`.
+diff --git a/backend/app/config.py b/backend/app/config.py
+index 1ee1880..f63b958 100644
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -96,6 +96,10 @@ class Settings:
+                 problems.append("DATABASE_URL must be set in production")
+             else:
+                 self.database_url = "sqlite:///./proctorai_dev.db"
++        # SQLAlchemy 2.1 maps a bare "postgresql://" to psycopg v3, but this app ships psycopg2. Be explicit.
++        for bare in ("postgresql://", "postgres://"):
++            if self.database_url.startswith(bare):
++                self.database_url = "postgresql+psycopg2://" + self.database_url[len(bare):]
+         if self.is_production and any("localhost" in o for o in self.cors_origins):
+             log.warning("CORS_ORIGINS still contains localhost in production.")
+         if problems:
+diff --git a/backend/app/proctor_rules.py b/backend/app/proctor_rules.py
+index f047088..f6e8363 100644
+--- a/backend/app/proctor_rules.py
++++ b/backend/app/proctor_rules.py
+@@ -60,7 +60,7 @@ def record_violation(
+     severity, category, label, weight = classify(code)
+     cfg = config_for(exam)
+     max_l2 = int(cfg.get("max_level2_violations", 3))
+-    outcome = {"recorded": False, "severity": severity, "label": label,
++    outcome = {"recorded": False, "code": code, "severity": severity, "label": label,
+                "level2_count": attempt.level2_count, "max_level2": max_l2, "terminated": attempt.status == ATT_TERMINATED}
+ 
+     if attempt.status != ATT_IN_PROGRESS or not _enabled(cfg, code):
+diff --git a/backend/app/routers/bank.py b/backend/app/routers/bank.py
+index 1745578..4ce72ec 100644
+--- a/backend/app/routers/bank.py
++++ b/backend/app/routers/bank.py
+@@ -1,7 +1,11 @@
+ """The organization's reusable question bank (questions not attached to any test)."""
+-from typing import Optional
++import json
++from collections import Counter
++from pathlib import Path
++from typing import List, Optional
+ 
+ from fastapi import APIRouter, Depends
++from pydantic import BaseModel
+ from sqlalchemy import func, or_
+ from sqlalchemy.orm import Session
+ 
+@@ -13,6 +17,19 @@ from app.schemas import QuestionIn
+ 
+ router = APIRouter(prefix="/bank", tags=["question bank"])
+ 
++_LIBRARY_FILE = Path(__file__).resolve().parent.parent.parent / "samples" / "question_library.json"
++
++
++def _library() -> list:
++    try:
++        return json.loads(_LIBRARY_FILE.read_text(encoding="utf-8"))["questions"]
++    except (OSError, ValueError, KeyError):
++        return []
++
++
++class LibraryImport(BaseModel):
++    sections: List[str] = []   # empty = everything
++
+ 
+ def _bank_question(db: Session, qid: int, org_id: int) -> models.Question:
+     q = db.query(models.Question).filter(models.Question.id == qid, models.Question.org_id == org_id, models.Question.exam_id.is_(None)).first()
+@@ -78,3 +95,32 @@ def delete_bank_question(question_id: int, user: models.User = Depends(auth.requ
+     db.delete(_bank_question(db, question_id, user.org_id))
+     db.commit()
+     return {"status": "deleted"}
++
++
++@router.get("/library")
++def library_overview(user: models.User = Depends(auth.require_org_admin), db: Session = Depends(get_db)):
++    """The built-in starter library, grouped by section, with how much of it is already in this organization's bank."""
++    have = {t for (t,) in db.query(models.Question.question_text).filter(models.Question.org_id == user.org_id, models.Question.exam_id.is_(None)).all()}
++    total, imported = Counter(), Counter()
++    for q in _library():
++        total[q["section"]] += 1
++        imported[q["section"]] += q["question_text"] in have
++    return {"sections": [{"section": s, "questions": n, "imported": imported[s]} for s, n in sorted(total.items())]}
++
++
++@router.post("/library/import")
++def library_import(body: LibraryImport, user: models.User = Depends(auth.require_org_admin), db: Session = Depends(get_db)):
++    """Copy library questions into the bank. Safe to repeat: questions already in the bank are skipped."""
++    wanted = set(body.sections)
++    have = {t for (t,) in db.query(models.Question.question_text).filter(models.Question.org_id == user.org_id, models.Question.exam_id.is_(None)).all()}
++    added = skipped = 0
++    for item in _library():
++        if wanted and item["section"] not in wanted:
++            continue
++        if item["question_text"] in have:
++            skipped += 1
++            continue
++        db.add(models.Question(org_id=user.org_id, exam_id=None, created_by=user.id, **question_rules.normalize_question(item)))
++        added += 1
++    db.commit()
++    return {"added": added, "skipped": skipped}
+diff --git a/backend/app/routers/results.py b/backend/app/routers/results.py
+index 1f9abc5..5addd57 100644
+--- a/backend/app/routers/results.py
++++ b/backend/app/routers/results.py
+@@ -13,7 +13,7 @@ from sqlalchemy import func, or_
+ from sqlalchemy.orm import Session
+ 
+ from app import (
+-    attempt_service, audit, auth, judge0, models, proctor_rules, scoring, storage, tenancy, webhooks,
++    attempt_service, audit, auth, judge0, models, proctor_rules, scoring, similarity, storage, tenancy, webhooks,
+ )
+ from app.constants import (
+     ATT_IN_PROGRESS, ATT_REGISTERED, ATT_SUBMITTED, ATT_TERMINATED, ATT_VOIDED, FINAL_ATTEMPT_STATUSES, INV_PENDING,
+@@ -156,6 +156,15 @@ def live_monitor(exam_id: int, user: models.User = Depends(auth.require_org_staf
+ # ---------------------------------------------------------------------------
+ # analytics + export
+ # ---------------------------------------------------------------------------
++@router.get("/tests/{exam_id}/similarity")
++def code_similarity(exam_id: int, min_percent: int = 65, user: models.User = Depends(auth.require_org_staff), db: Session = Depends(get_db)):
++    """Pairs of candidates with structurally similar code in this test (screening aid, not proof)."""
++    exam = tenancy.get_exam(db, exam_id, user.org_id)
++    pairs = similarity.find_pairs(db, exam.id, max(0, min(100, min_percent)))
++    return {"pairs": pairs, "method": "token k-gram Jaccard, identifiers and literals normalised; within this test only",
++            "min_tokens": similarity.MIN_TOKENS}
++
++
+ @router.get("/tests/{exam_id}/analytics")
+ def analytics(exam_id: int, user: models.User = Depends(auth.require_org_staff), db: Session = Depends(get_db)):
+     exam = tenancy.get_exam(db, exam_id, user.org_id)
+@@ -293,6 +302,8 @@ def attempt_report(attempt_id: int, user: models.User = Depends(auth.require_org
+         "messages": [{"body": m.body, "created_at": m.created_at} for m in db.query(models.AttemptMessage).filter(models.AttemptMessage.attempt_id == a.id).all()],
+         "environment": {"ip_address": a.ip_address, "user_agent": a.user_agent, "system_info": a.system_info or {}, "consent_at": a.consent_at},
+         "can_void": user.role == ROLE_ADMIN,
++        "similarity": similarity.matches_for_attempt(similarity.find_pairs(db, exam.id), a.id) if subs else [],
++        "organization": db.get(models.Organization, a.org_id).name if getattr(a, "org_id", None) else None,
+     }
+ 
+ 
+diff --git a/backend/app/similarity.py b/backend/app/similarity.py
+new file mode 100644
+index 0000000..0535e78
+--- /dev/null
++++ b/backend/app/similarity.py
+@@ -0,0 +1,124 @@
++"""Source-code similarity between candidates of the same test (plagiarism *screening*).
++
++Method: strip comments, collapse string/number literals and rename every non-keyword identifier to one placeholder,
++so renaming variables or reformatting does not hide a copy. The token stream is cut into overlapping k-grams
++("shingles") and two solutions are compared with the Jaccard index of their shingle sets.
++
++This is a screening aid for a human reviewer, not proof of copying: short or very standard solutions
++(e.g. "print the sum of two numbers") are legitimately alike. Solutions with fewer than ``MIN_TOKENS`` tokens are
++therefore never scored. Similarity is measured only *within the same test*; matching against the public web is
++not implemented.
++"""
++import re
++from collections import defaultdict
++from itertools import combinations
++from typing import Dict, FrozenSet, List, Optional
++
++from sqlalchemy.orm import Session
++
++from app import models
++
++K = 5                      # shingle length in tokens
++MIN_TOKENS = 30            # below this a solution is too small to say anything
++MAX_PER_PROBLEM = 400      # keeps the O(n^2) comparison bounded
++HIGH, MEDIUM = 85, 65      # percent thresholds for the labels
++
++_KEYWORDS = frozenset("""
++abstract and as assert async await auto bool boolean break byte case catch char class const continue def default defer del
++delete do double elif else enum except export extends extern false final finally float fn for from func function go goto
++if implements import in include instanceof int interface is lambda len let list long map namespace new nil none not null
++operator or override package pass print println private protected public range raise return self short signed sizeof static
++string struct super switch template this throw throws true try type typedef typeof union unsigned using var vector virtual
++void volatile while with yield cin cout endl scanf printf puts input
++""".split())
++
++_COMMENTS = re.compile(r"/\*.*?\*/|//[^\n]*|#[^\n]*", re.S)
++_STRINGS = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
++_TOKEN = re.compile(r"[A-Za-z_]\w*|\d+(?:\.\d+)?|==|!=|<=|>=|&&|\|\||\+\+|--|[-+*/%<>=!&|^~?:;,.(){}\[\]]")
++
++
++def normalize(source: str) -> List[str]:
++    text = _STRINGS.sub(" S ", _COMMENTS.sub(" ", source or ""))
++    tokens: List[str] = []
++    for tok in _TOKEN.findall(text):
++        if tok == "S":
++            tokens.append("S")
++        elif tok[0].isdigit():
++            tokens.append("N")
++        elif tok[0].isalpha() or tok[0] == "_":
++            tokens.append(tok.lower() if tok.lower() in _KEYWORDS else "I")
++        else:
++            tokens.append(tok)
++    return tokens
++
++
++def shingles(tokens: List[str]) -> FrozenSet[str]:
++    if len(tokens) < MIN_TOKENS:
++        return frozenset()
++    return frozenset(" ".join(tokens[i:i + K]) for i in range(len(tokens) - K + 1))
++
++
++def score(a: FrozenSet[str], b: FrozenSet[str]) -> Optional[int]:
++    """0-100 similarity, or None when either side is too small to compare."""
++    if not a or not b:
++        return None
++    return round(100 * len(a & b) / len(a | b))
++
++
++def label(percent: Optional[int]) -> str:
++    if percent is None:
++        return "n/a"
++    return "high" if percent >= HIGH else "medium" if percent >= MEDIUM else "low"
++
++
++def _best_submissions(db: Session, exam_id: int) -> Dict[int, Dict[int, models.CodeSubmission]]:
++    """problem_id -> {attempt_id: best submission}; later submissions win ties (same rule as scoring)."""
++    rows = (db.query(models.CodeSubmission).join(models.Attempt, models.Attempt.id == models.CodeSubmission.attempt_id)
++            .filter(models.CodeSubmission.exam_id == exam_id, models.Attempt.status != "voided")
++            .order_by(models.CodeSubmission.id).all())
++    out: Dict[int, Dict[int, models.CodeSubmission]] = defaultdict(dict)
++    for row in rows:
++        ratio = (row.passed / row.total) if row.total else 0
++        cur = out[row.problem_id].get(row.attempt_id)
++        if cur is None or ratio >= ((cur.passed / cur.total) if cur.total else 0):
++            out[row.problem_id][row.attempt_id] = row
++    return out
++
++
++def find_pairs(db: Session, exam_id: int, min_percent: int = MEDIUM) -> List[dict]:
++    """Suspicious pairs for a test, most similar first. Pairs from the same candidate are ignored."""
++    problems = {p.id: p for p in db.query(models.CodingProblem).filter(models.CodingProblem.exam_id == exam_id).all()}
++    names = {a.id: (a, u) for a, u in db.query(models.Attempt, models.User).join(models.User, models.User.id == models.Attempt.candidate_id)
++             .filter(models.Attempt.exam_id == exam_id).all()}
++    pairs: List[dict] = []
++    for problem_id, by_attempt in _best_submissions(db, exam_id).items():
++        items = sorted(by_attempt.items())[:MAX_PER_PROBLEM]
++        sh = {aid: shingles(normalize(s.source_code)) for aid, s in items}
++        for (a_id, a_sub), (b_id, b_sub) in combinations(items, 2):
++            if a_sub.candidate_id == b_sub.candidate_id:
++                continue
++            pct = score(sh[a_id], sh[b_id])
++            if pct is None or pct < min_percent:
++                continue
++            pairs.append({
++                "problem_id": problem_id, "problem": problems[problem_id].title if problem_id in problems else str(problem_id),
++                "percent": pct, "level": label(pct),
++                "a": {"attempt_id": a_id, "candidate": names[a_id][1].full_name, "passed": a_sub.passed, "total": a_sub.total},
++                "b": {"attempt_id": b_id, "candidate": names[b_id][1].full_name, "passed": b_sub.passed, "total": b_sub.total},
++            })
++    pairs.sort(key=lambda p: -p["percent"])
++    return pairs
++
++
++def matches_for_attempt(pairs: List[dict], attempt_id: int) -> List[dict]:
++    out = []
++    for p in pairs:
++        if p["a"]["attempt_id"] == attempt_id:
++            other = p["b"]
++        elif p["b"]["attempt_id"] == attempt_id:
++            other = p["a"]
++        else:
++            continue
++        out.append({"problem": p["problem"], "percent": p["percent"], "level": p["level"],
++                    "other_attempt_id": other["attempt_id"], "other_candidate": other["candidate"]})
++    return out
+diff --git a/backend/samples/question_library.json b/backend/samples/question_library.json
+new file mode 100644
+index 0000000..1cd7c82
+--- /dev/null
++++ b/backend/samples/question_library.json
+@@ -0,0 +1,739 @@
++{
++ "name": "ProctorAI starter library",
++ "version": 1,
++ "questions": [
++  {
++   "section": "Python",
++   "difficulty": "easy",
++   "question_type": "single",
++   "question_text": "What does `len([1, 2, [3, 4]])` return in Python?",
++   "options": [
++    "2",
++    "3",
++    "4",
++    "Error"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "The nested list counts as one element.",
++   "tags": [
++    "python"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "Python",
++   "difficulty": "easy",
++   "question_type": "single",
++   "question_text": "Which of these is immutable in Python?",
++   "options": [
++    "list",
++    "dict",
++    "tuple",
++    "set"
++   ],
++   "correct": [
++    2
++   ],
++   "explanation": "Tuples cannot be changed after creation.",
++   "tags": [
++    "python"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "Python",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "What is the output of `print(type(3 / 2))`?",
++   "options": [
++    "<class 'int'>",
++    "<class 'float'>",
++    "<class 'double'>",
++    "<class 'number'>"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "`/` is true division and always returns a float in Python 3.",
++   "tags": [
++    "python"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Python",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "What does `[x*x for x in range(4)]` produce?",
++   "options": [
++    "[0, 1, 4, 9]",
++    "[1, 4, 9, 16]",
++    "[0, 1, 2, 3]",
++    "[0, 2, 4, 6]"
++   ],
++   "correct": [
++    0
++   ],
++   "explanation": "range(4) yields 0,1,2,3.",
++   "tags": [
++    "python"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Python",
++   "difficulty": "medium",
++   "question_type": "multiple",
++   "question_text": "Which of these are valid ways to create an empty dictionary?",
++   "options": [
++    "{}",
++    "dict()",
++    "[]",
++    "()"
++   ],
++   "correct": [
++    0,
++    1
++   ],
++   "explanation": "`[]` is a list and `()` is a tuple.",
++   "tags": [
++    "python"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Python",
++   "difficulty": "hard",
++   "question_type": "single",
++   "question_text": "What does the following print?\n\ndef f(x, acc=[]):\n    acc.append(x)\n    return acc\nf(1); print(f(2))",
++   "options": [
++    "[2]",
++    "[1, 2]",
++    "[1]",
++    "Error"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "The default list is created once and shared between calls.",
++   "tags": [
++    "python",
++    "pitfall"
++   ],
++   "marks": 3
++  },
++  {
++   "section": "JavaScript",
++   "difficulty": "easy",
++   "question_type": "single",
++   "question_text": "Which keyword declares a block-scoped variable that cannot be reassigned?",
++   "options": [
++    "var",
++    "let",
++    "const",
++    "static"
++   ],
++   "correct": [
++    2
++   ],
++   "explanation": "`const` bindings cannot be reassigned.",
++   "tags": [
++    "javascript"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "JavaScript",
++   "difficulty": "easy",
++   "question_type": "single",
++   "question_text": "What is the result of `typeof null`?",
++   "options": [
++    "\"null\"",
++    "\"object\"",
++    "\"undefined\"",
++    "\"number\""
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "A long-standing quirk of the language.",
++   "tags": [
++    "javascript"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "JavaScript",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "What does `[1, 2, 3].map(n => n * 2)` return?",
++   "options": [
++    "[2, 4, 6]",
++    "[1, 2, 3]",
++    "6",
++    "undefined"
++   ],
++   "correct": [
++    0
++   ],
++   "explanation": "`map` returns a new array of the callback results.",
++   "tags": [
++    "javascript"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "JavaScript",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "What is logged by `console.log(0.1 + 0.2 === 0.3)`?",
++   "options": [
++    "true",
++    "false",
++    "undefined",
++    "NaN"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "Binary floating point cannot represent 0.1 and 0.2 exactly.",
++   "tags": [
++    "javascript",
++    "pitfall"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "JavaScript",
++   "difficulty": "hard",
++   "question_type": "single",
++   "question_text": "Which statement about `Promise.all` is correct?",
++   "options": [
++    "It resolves with the first promise that settles",
++    "It rejects as soon as any input promise rejects",
++    "It always waits for every promise, even rejected ones",
++    "It runs the promises one after another"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "`Promise.allSettled` is the variant that waits for all.",
++   "tags": [
++    "javascript",
++    "async"
++   ],
++   "marks": 3
++  },
++  {
++   "section": "SQL",
++   "difficulty": "easy",
++   "question_type": "single",
++   "question_text": "Which clause filters rows after grouping?",
++   "options": [
++    "WHERE",
++    "HAVING",
++    "ORDER BY",
++    "LIMIT"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "WHERE filters rows before grouping; HAVING filters groups.",
++   "tags": [
++    "sql"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "SQL",
++   "difficulty": "easy",
++   "question_type": "single",
++   "question_text": "Which statement removes all rows from a table but keeps the table?",
++   "options": [
++    "DROP TABLE t",
++    "DELETE FROM t",
++    "REMOVE t",
++    "ERASE t"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "DELETE without WHERE (or TRUNCATE) empties the table; DROP removes it.",
++   "tags": [
++    "sql"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "SQL",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "Which JOIN returns all rows from the left table, with NULLs where the right table has no match?",
++   "options": [
++    "INNER JOIN",
++    "LEFT JOIN",
++    "CROSS JOIN",
++    "SELF JOIN"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "LEFT (OUTER) JOIN keeps unmatched left rows.",
++   "tags": [
++    "sql"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "SQL",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "What does `SELECT COUNT(*) FROM t` count?",
++   "options": [
++    "Only non-NULL values of the first column",
++    "All rows",
++    "Distinct rows",
++    "Only rows where every column is non-NULL"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "COUNT(*) counts rows; COUNT(col) skips NULLs.",
++   "tags": [
++    "sql"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "SQL",
++   "difficulty": "hard",
++   "question_type": "single",
++   "question_text": "Which index type usually speeds up `WHERE email = 'a@b.c'` on a large table?",
++   "options": [
++    "No index",
++    "A B-tree index on email",
++    "A second copy of the table",
++    "A view"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "An index on the filtered column lets the database avoid a full scan.",
++   "tags": [
++    "sql",
++    "performance"
++   ],
++   "marks": 3
++  },
++  {
++   "section": "Data structures & algorithms",
++   "difficulty": "easy",
++   "question_type": "single",
++   "question_text": "Which data structure is first-in, first-out?",
++   "options": [
++    "Stack",
++    "Queue",
++    "Tree",
++    "Heap"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "A queue serves elements in arrival order.",
++   "tags": [
++    "dsa"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "Data structures & algorithms",
++   "difficulty": "easy",
++   "question_type": "single",
++   "question_text": "What is the time complexity of binary search on a sorted array of n items?",
++   "options": [
++    "O(n)",
++    "O(log n)",
++    "O(n log n)",
++    "O(1)"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "Each step halves the search range.",
++   "tags": [
++    "dsa",
++    "complexity"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "Data structures & algorithms",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "Average-case lookup in a well-sized hash table is:",
++   "options": [
++    "O(1)",
++    "O(log n)",
++    "O(n)",
++    "O(n log n)"
++   ],
++   "correct": [
++    0
++   ],
++   "explanation": "Hashing locates the bucket directly.",
++   "tags": [
++    "dsa",
++    "complexity"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Data structures & algorithms",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "Which traversal of a binary search tree visits keys in ascending order?",
++   "options": [
++    "Pre-order",
++    "In-order",
++    "Post-order",
++    "Level-order"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "In-order visits left, node, right.",
++   "tags": [
++    "dsa",
++    "trees"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Data structures & algorithms",
++   "difficulty": "medium",
++   "question_type": "multiple",
++   "question_text": "Which of these sorting algorithms have O(n log n) worst-case time?",
++   "options": [
++    "Merge sort",
++    "Heap sort",
++    "Quick sort (naive pivot)",
++    "Bubble sort"
++   ],
++   "correct": [
++    0,
++    1
++   ],
++   "explanation": "Naive quick sort is O(n²) in the worst case; bubble sort is O(n²).",
++   "tags": [
++    "dsa",
++    "sorting"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Data structures & algorithms",
++   "difficulty": "hard",
++   "question_type": "single",
++   "question_text": "Which algorithm finds shortest paths from one source in a graph with non-negative edge weights?",
++   "options": [
++    "Depth-first search",
++    "Dijkstra's algorithm",
++    "Kruskal's algorithm",
++    "Topological sort"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "Kruskal builds a minimum spanning tree, a different problem.",
++   "tags": [
++    "dsa",
++    "graphs"
++   ],
++   "marks": 3
++  },
++  {
++   "section": "Data structures & algorithms",
++   "difficulty": "hard",
++   "question_type": "true_false",
++   "question_text": "A stack can be used to check whether the brackets in an expression are balanced.",
++   "options": [],
++   "correct": [
++    "True"
++   ],
++   "explanation": "Push opening brackets; pop and compare on closing ones.",
++   "tags": [
++    "dsa",
++    "stack"
++   ],
++   "marks": 3
++  },
++  {
++   "section": "Computer science",
++   "difficulty": "easy",
++   "question_type": "single",
++   "question_text": "What does HTTP status code 404 mean?",
++   "options": [
++    "Server error",
++    "Not found",
++    "Unauthorized",
++    "Redirect"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "The server cannot find the requested resource.",
++   "tags": [
++    "web",
++    "http"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "Computer science",
++   "difficulty": "easy",
++   "question_type": "true_false",
++   "question_text": "HTTPS encrypts traffic between the browser and the server.",
++   "options": [],
++   "correct": [
++    "True"
++   ],
++   "explanation": "HTTPS is HTTP over TLS.",
++   "tags": [
++    "web",
++    "security"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "Computer science",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "Which HTTP method is defined as idempotent?",
++   "options": [
++    "POST",
++    "PUT",
++    "PATCH (always)",
++    "CONNECT"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "Repeating the same PUT leaves the resource in the same state.",
++   "tags": [
++    "web",
++    "http"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Computer science",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "What is a deadlock?",
++   "options": [
++    "A program that runs very slowly",
++    "Threads waiting on each other forever for resources",
++    "A crashed process",
++    "A full disk"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "Each thread holds a resource another one needs.",
++   "tags": [
++    "os",
++    "concurrency"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Computer science",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "Which ACID property guarantees that a committed transaction survives a crash?",
++   "options": [
++    "Atomicity",
++    "Consistency",
++    "Isolation",
++    "Durability"
++   ],
++   "correct": [
++    3
++   ],
++   "explanation": "Durability: committed data is persisted.",
++   "tags": [
++    "database"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Computer science",
++   "difficulty": "hard",
++   "question_type": "single",
++   "question_text": "In Git, what does `git rebase main` do on a feature branch?",
++   "options": [
++    "Deletes main",
++    "Replays the branch's commits on top of main",
++    "Merges main with a merge commit",
++    "Pushes to origin"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "Rebase rewrites the branch's commits onto the new base.",
++   "tags": [
++    "git"
++   ],
++   "marks": 3
++  },
++  {
++   "section": "Computer science",
++   "difficulty": "hard",
++   "question_type": "single",
++   "question_text": "Which security flaw does using parameterised queries primarily prevent?",
++   "options": [
++    "Cross-site scripting",
++    "SQL injection",
++    "Clickjacking",
++    "Denial of service"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "Parameters keep user input out of the SQL text.",
++   "tags": [
++    "security",
++    "sql"
++   ],
++   "marks": 3
++  },
++  {
++   "section": "Aptitude",
++   "difficulty": "easy",
++   "question_type": "single",
++   "question_text": "What is 15% of 240?",
++   "options": [
++    "30",
++    "36",
++    "24",
++    "40"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "240 × 0.15 = 36.",
++   "tags": [
++    "aptitude",
++    "maths"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "Aptitude",
++   "difficulty": "easy",
++   "question_type": "single",
++   "question_text": "What comes next: 2, 4, 8, 16, ...?",
++   "options": [
++    "24",
++    "30",
++    "32",
++    "64"
++   ],
++   "correct": [
++    2
++   ],
++   "explanation": "Each term doubles.",
++   "tags": [
++    "aptitude",
++    "series"
++   ],
++   "marks": 1
++  },
++  {
++   "section": "Aptitude",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "A train covers 120 km in 1.5 hours. Its average speed is:",
++   "options": [
++    "60 km/h",
++    "75 km/h",
++    "80 km/h",
++    "90 km/h"
++   ],
++   "correct": [
++    2
++   ],
++   "explanation": "120 ÷ 1.5 = 80.",
++   "tags": [
++    "aptitude",
++    "maths"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Aptitude",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "If 5 workers finish a job in 12 days, how many days do 10 workers need (same rate)?",
++   "options": [
++    "4",
++    "6",
++    "8",
++    "24"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "Work is constant: 5×12 = 10×d, so d = 6.",
++   "tags": [
++    "aptitude",
++    "maths"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Aptitude",
++   "difficulty": "medium",
++   "question_type": "single",
++   "question_text": "The average of 4, 8, 12 and 16 is:",
++   "options": [
++    "8",
++    "9",
++    "10",
++    "12"
++   ],
++   "correct": [
++    2
++   ],
++   "explanation": "(4+8+12+16)/4 = 10.",
++   "tags": [
++    "aptitude",
++    "maths"
++   ],
++   "marks": 2
++  },
++  {
++   "section": "Aptitude",
++   "difficulty": "hard",
++   "question_type": "single",
++   "question_text": "A price is raised by 20% and then reduced by 20%. Compared with the original, the final price is:",
++   "options": [
++    "The same",
++    "4% lower",
++    "4% higher",
++    "2% lower"
++   ],
++   "correct": [
++    1
++   ],
++   "explanation": "1.2 × 0.8 = 0.96.",
++   "tags": [
++    "aptitude",
++    "maths"
++   ],
++   "marks": 3
++  }
++ ]
++}
+\ No newline at end of file
+diff --git a/backend/tests/test_auth.py b/backend/tests/test_auth.py
+index 46e38a7..32175f3 100644
+--- a/backend/tests/test_auth.py
++++ b/backend/tests/test_auth.py
+@@ -141,3 +141,12 @@ def test_candidate_token_cannot_call_staff_endpoints(env):
+     cand = env.candidate(test["code"])
+     assert env.client.get("/tests", headers=cand["headers"]).status_code == 403
+     assert env.client.get("/org/dashboard", headers=cand["headers"]).status_code == 403
++
++
++def test_bare_postgres_urls_use_the_installed_psycopg2_driver(monkeypatch):
++    from app.config import Settings
++    for raw in ("postgresql://u:p@db/x", "postgres://u:p@db/x"):
++        monkeypatch.setenv("DATABASE_URL", raw)
++        s = Settings()
++        s.validate()
++        assert s.database_url == "postgresql+psycopg2://u:p@db/x"
+diff --git a/backend/tests/test_similarity_library.py b/backend/tests/test_similarity_library.py
+new file mode 100644
+index 0000000..30f3575
+--- /dev/null
++++ b/backend/tests/test_similarity_library.py
+@@ -0,0 +1,132 @@
++"""Code similarity screening and the built-in question library."""
++import pytest
++
++from app import similarity
++from tests.test_coding import PY, cenv, coding_test, start, submit  # noqa: F401  (cenv fixture)
++
++BASE = """
++import sys
++def solve(values):
++    total = 0
++    for value in values:
++        if value % 2 == 0:
++            total += value * 2
++        else:
++            total -= value
++    return total
++
++def main():
++    data = sys.stdin.read().split()
++    values = [int(x) for x in data]
++    print(solve(values))
++
++main()
++"""
++# same program, different names, comments and spacing
++RENAMED = """
++import sys
++# totally different comment
++def compute(items):
++    acc = 0
++    for item in items:
++        if item % 2 == 0:
++            acc += item * 2
++        else:
++            acc -= item
++    return acc
++
++
++def run():
++    raw = sys.stdin.read().split()
++    nums = [int(t) for t in raw]
++    print(compute(nums))
++
++
++run()
++"""
++DIFFERENT = """
++import sys
++from collections import Counter
++
++def run():
++    words = sys.stdin.read().split()
++    freq = Counter(words)
++    best = max(freq.values()) if freq else 0
++    winners = sorted(w for w, c in freq.items() if c == best)
++    print(len(freq), best)
++    for w in winners:
++        print(w)
++
++run()
++"""
++
++
++def test_renaming_variables_does_not_hide_a_copy():
++    a = similarity.shingles(similarity.normalize(BASE))
++    b = similarity.shingles(similarity.normalize(RENAMED))
++    assert similarity.score(a, b) >= similarity.HIGH
++
++
++def test_different_programs_score_low():
++    a = similarity.shingles(similarity.normalize(BASE))
++    c = similarity.shingles(similarity.normalize(DIFFERENT))
++    assert similarity.score(a, c) < similarity.MEDIUM
++
++
++def test_tiny_solutions_are_never_scored():
++    tiny = similarity.shingles(similarity.normalize("print(sum(map(int, input().split())))"))
++    assert tiny == frozenset() and similarity.score(tiny, tiny) is None
++
++
++def test_endpoint_flags_copies_and_is_tenant_scoped(cenv):
++    org = cenv.make_org()
++    test = coding_test(cenv, org)
++    a, b, c = (start(cenv, org, test, email=f"cand{i}@x.example.com") for i in range(3))
++    submit(cenv, a, BASE)
++    submit(cenv, b, RENAMED)
++    submit(cenv, c, DIFFERENT)
++    r = cenv.client.get(f"/tests/{test['id']}/similarity", headers=org["headers"])
++    assert r.status_code == 200
++    pairs = r.json()["pairs"]
++    assert len(pairs) == 1 and pairs[0]["level"] == "high"
++    ids = {pairs[0]["a"]["attempt_id"], pairs[0]["b"]["attempt_id"]}
++    rep = cenv.client.get(f"/attempts/{sorted(ids)[0]}", headers=org["headers"]).json()
++    assert rep["similarity"] and rep["similarity"][0]["level"] == "high"
++    # another organisation can neither see this test's pairs nor probe its existence
++    other = cenv.make_org()
++    assert cenv.client.get(f"/tests/{test['id']}/similarity", headers=other["headers"]).status_code == 404
++
++
++def test_same_candidate_resubmitting_is_not_a_match(cenv):
++    org = cenv.make_org()
++    test = coding_test(cenv, org)
++    a = start(cenv, org, test)
++    submit(cenv, a, BASE)
++    submit(cenv, a, RENAMED)
++    assert cenv.client.get(f"/tests/{test['id']}/similarity", headers=org["headers"]).json()["pairs"] == []
++
++
++# ---------------------------------------------------------------- library
++def test_library_import_is_idempotent_and_valid(env):
++    org = env.make_org()
++    overview = env.client.get("/bank/library", headers=org["headers"]).json()["sections"]
++    assert sum(s["questions"] for s in overview) >= 30 and all(s["imported"] == 0 for s in overview)
++    first = env.client.post("/bank/library/import", headers=org["headers"], json={}).json()
++    assert first["added"] >= 30 and first["skipped"] == 0
++    again = env.client.post("/bank/library/import", headers=org["headers"], json={}).json()
++    assert again["added"] == 0 and again["skipped"] == first["added"]
++    bank = env.client.get("/bank/questions?page_size=100", headers=org["headers"]).json()
++    assert bank["total"] == first["added"]
++
++
++def test_library_import_respects_sections_and_tenancy(env):
++    org, other = env.make_org(), env.make_org()
++    r = env.client.post("/bank/library/import", headers=org["headers"], json={"sections": ["SQL"]}).json()
++    assert 0 < r["added"] < 10
++    assert env.client.get("/bank/questions", headers=other["headers"]).json()["total"] == 0
++
++
++def test_library_is_admin_only(env):
++    org = env.make_org()
++    rev = env.add_member(org, "reviewer")["headers"]
++    assert env.client.post("/bank/library/import", headers=rev, json={}).status_code == 403
+diff --git a/docs/DEPLOYMENT.md b/docs/DEPLOYMENT.md
+index d0e505a..08518e0 100644
+--- a/docs/DEPLOYMENT.md
++++ b/docs/DEPLOYMENT.md
+@@ -31,5 +31,8 @@
+ 5. Back up the database and the evidence volume.
+ 6. Build with `WITH_AI=true` only after testing AI proctoring with real cameras and tuning thresholds.
+ 
++7. After the first deploy open `/` in a private window and confirm in the browser dev tools that the response carries `Content-Security-Policy`; enable the `Strict-Transport-Security` line in `frontend/security-headers.conf` once HTTPS works.
++8. Optional: import the built-in starter question library from *Question bank → Starter library*.
++
+ ## Smoke flow
+ Sign in as super admin → create an organization → activate the admin from the link → create and publish a test → open `/t/CODE` in a private window → join, start, answer, submit → check Results and Review.
+diff --git a/docs/KNOWN_GAPS.md b/docs/KNOWN_GAPS.md
+index 74a62be..374e856 100644
+--- a/docs/KNOWN_GAPS.md
++++ b/docs/KNOWN_GAPS.md
+@@ -1,6 +1,10 @@
+ # Known gaps — be honest before going live
+ 
+ **Not implemented**
++- Live pair-programming / interview room with audio-video, SQL-database and mock-API sandboxes, multi-file (React / Node) projects, Monaco-grade autocomplete (the editor is a plain textarea with line numbers and auto-indent).
++- Keystroke-level code playback: reviewers can replay the sequence of *submitted* versions with changed lines highlighted, not every keystroke.
++- Plagiarism matching against public web repositories. Similarity is checked only between candidates of the same test and is a screening aid, not proof.
++- Vendor-specific ATS connectors (Greenhouse, Lever, Workday). Signed webhooks and API keys exist; the mapping is left to the receiver.
+ - Online billing/payments (Stripe/Razorpay), invoices, self-serve plan upgrades. The super admin assigns plans manually.
+ - SSO/SAML/OIDC, MFA for staff.
+ - Native mobile apps; secure-browser/lockdown software (this is a web proctor).
+@@ -10,7 +14,7 @@
+ - AI proctoring with real MediaPipe/YOLO models and real webcams. Only landmark math and debouncing are unit-tested; head-turn and gaze thresholds are untuned and need calibration on real footage.
+ - Real SMTP delivery (messages are verified to reach the outbox/SMTP client in tests).
+ - Real Judge0 execution (tests use a fake).
+-- PostgreSQL migrations and Docker image builds/compose (tested on SQLite; no Docker daemon was available).
++- Docker image builds/compose and the nginx config (no Docker daemon or nginx binary was available). PostgreSQL 16 migrations, `alembic check` and a production-mode API smoke run were verified on a real Postgres.
+ - Browser behaviour beyond a Chromium smoke test: Safari/Firefox, mobile layouts, accessibility audit, load testing.
+ 
+ **Product notes**
+diff --git a/frontend/Dockerfile b/frontend/Dockerfile
+index 08912b5..ef31943 100644
+--- a/frontend/Dockerfile
++++ b/frontend/Dockerfile
+@@ -1,11 +1,11 @@
+ # ---- Build stage ----
+-FROM node:20-alpine AS build
++FROM node:22-alpine AS build
+ 
+ WORKDIR /app
+ 
+ # Install dependencies first (cached layer)
+ COPY package.json package-lock.json ./
+-RUN npm install
++RUN npm ci
+ 
+ # Copy source and build the production bundle
+ COPY . .
+@@ -19,6 +19,7 @@ COPY --from=build /app/dist /usr/share/nginx/html
+ 
+ # Copy custom nginx config (handles React Router)
+ COPY nginx.conf /etc/nginx/conf.d/default.conf
++COPY security-headers.conf /etc/nginx/snippets/security-headers.conf
+ 
+ EXPOSE 80
+ 
+diff --git a/frontend/index.html b/frontend/index.html
+index 0b09f75..55f3392 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -6,6 +6,9 @@
+   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+   <title>ProctorAI</title>
++  <meta name="theme-color" content="#f3f5f4">
++  <meta name="color-scheme" content="light dark">
++  <script src="/theme-init.js"></script>
+   <meta name="description" content="Online assessments with built-in proctoring.">
+ </head>
+ 
+diff --git a/frontend/nginx.conf b/frontend/nginx.conf
+index 5639d86..7b9d83c 100644
+--- a/frontend/nginx.conf
++++ b/frontend/nginx.conf
+@@ -3,11 +3,11 @@ server {
+     server_name _;
+     client_max_body_size 4m;              # webcam frames / ID photos arrive as base64 JSON
+ 
+-    add_header X-Content-Type-Options nosniff always;
+-    add_header X-Frame-Options DENY always;
+-    add_header Referrer-Policy no-referrer always;
+-    # Camera/microphone are needed by the exam room; everything else is off.
+-    add_header Permissions-Policy "camera=(self), microphone=(self), geolocation=(), payment=()" always;
++    include /etc/nginx/snippets/security-headers.conf;
++
++    gzip on;
++    gzip_types text/css application/javascript application/json image/svg+xml;
++    gzip_min_length 1024;
+ 
+     # API: /api/x  ->  backend /x
+     location /api/ {
+@@ -18,17 +18,20 @@ server {
+         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+         proxy_set_header X-Forwarded-Proto $scheme;
+         proxy_read_timeout 70s;
++        include /etc/nginx/snippets/security-headers.conf;
+     }
+ 
+     location /assets/ {
+         root /usr/share/nginx/html;
+         add_header Cache-Control "public, max-age=31536000, immutable";
++        include /etc/nginx/snippets/security-headers.conf;
+     }
+ 
+     location / {
+         root /usr/share/nginx/html;
+         index index.html;
+         add_header Cache-Control "no-cache";
++        include /etc/nginx/snippets/security-headers.conf;
+         try_files $uri $uri/ /index.html;   # React Router
+     }
+ }
+diff --git a/frontend/public/theme-init.js b/frontend/public/theme-init.js
+new file mode 100644
+index 0000000..891c1e7
+--- /dev/null
++++ b/frontend/public/theme-init.js
+@@ -0,0 +1,10 @@
++// Runs before first paint so the page never flashes the wrong theme. Kept as a file so a strict CSP can stay free of inline scripts.
++(function () {
++  try {
++    var m = localStorage.getItem('pai_theme');
++    if (m !== 'dark' && m !== 'system') m = 'light';
++    var dark = m === 'dark' || (m === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
++    document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
++    document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
++  } catch (e) { document.documentElement.setAttribute('data-theme', 'light'); }
++})();
+diff --git a/frontend/security-headers.conf b/frontend/security-headers.conf
+new file mode 100644
+index 0000000..14eeb7c
+--- /dev/null
++++ b/frontend/security-headers.conf
+@@ -0,0 +1,10 @@
++# Included in every location: nginx drops server-level add_header lines in any location that sets its own.
++add_header X-Content-Type-Options nosniff always;
++add_header X-Frame-Options DENY always;
++add_header Referrer-Policy no-referrer always;
++# No inline scripts anywhere; styles need 'unsafe-inline' because React sets style attributes.
++add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'" always;
++# Uncomment once the site is served over HTTPS (here or at the load balancer):
++# add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
++# Camera/microphone are needed by the exam room; everything else is off.
++add_header Permissions-Policy "camera=(self), microphone=(self), geolocation=(), payment=()" always;
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index f008dbb..e471430 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -1,5 +1,6 @@
+ import { lazy, Suspense } from 'react'
+-import { Route, Routes } from 'react-router-dom'
++import { Route, Routes, useLocation } from 'react-router-dom'
++import { ThemeFloat } from './lib/theme'
+ import { RequireRole } from './layouts/StaffLayout'
+ import { Loading } from './ui'
+ 
+@@ -25,6 +26,7 @@ const Tests = L(() => import('./pages/admin/Tests'))
+ const TestNew = L(() => import('./pages/admin/TestNew'))
+ const TestDetail = L(() => import('./pages/admin/TestDetail'))
+ const AttemptReport = L(() => import('./pages/admin/AttemptReport'))
++const ReportPrint = L(() => import('./pages/admin/ReportPrint'))
+ const Bank = L(() => import('./pages/admin/Bank'))
+ const ReviewQueue = L(() => import('./pages/admin/ReviewQueue'))
+ const Candidates = L(() => import('./pages/admin/Candidates'))
+@@ -37,8 +39,11 @@ const Join = L(() => import('./pages/candidate/Join'))
+ const ExamRoom = L(() => import('./pages/candidate/ExamRoom'))
+ 
+ export default function App() {
++  const { pathname } = useLocation()
++  const staff = pathname.startsWith('/app') || pathname.startsWith('/super') || pathname === '/account' || pathname === '/'
+   return (
+     <Suspense fallback={<Loading />}>
++      {!staff && <ThemeFloat />}
+       <Routes>
+         <Route path="/" element={<Landing />} />
+         <Route path="/login" element={<Login />} />
+@@ -69,6 +74,7 @@ export default function App() {
+           <Route path="tests/new" element={<TestNew />} />
+           <Route path="tests/:id/*" element={<TestDetail />} />
+           <Route path="attempts/:id" element={<AttemptReport />} />
++          <Route path="attempts/:id/report" element={<ReportPrint />} />
+           <Route path="bank" element={<Bank />} />
+           <Route path="review" element={<ReviewQueue />} />
+           <Route path="candidates" element={<Candidates />} />
+diff --git a/frontend/src/layouts/StaffLayout.jsx b/frontend/src/layouts/StaffLayout.jsx
+index 166effb..6abd6c4 100644
+--- a/frontend/src/layouts/StaffLayout.jsx
++++ b/frontend/src/layouts/StaffLayout.jsx
+@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
+ import { Link, NavLink, Navigate, Outlet, useLocation } from 'react-router-dom'
+ import { BookOpen, Building2, ClipboardList, CreditCard, FileClock, History, KeyRound, LayoutDashboard, LogOut, Mail, Menu, Settings, ShieldAlert, ShieldCheck, Users, UserCog, Inbox, UsersRound, Layers } from 'lucide-react'
+ import { useAuth } from '../lib/auth'
++import { ThemeToggle } from '../lib/theme'
+ import { Alert, Loading } from '../ui'
+ import { Button } from '../ui'
+ 
+@@ -60,6 +61,7 @@ function StaffLayout() {
+         </nav>
+         <div className="side-foot">
+           <div className="who">{user.full_name}<span>{user.email}</span></div>
++          <ThemeToggle onDark />
+           <NavLink to="/account" className="btn ghost" style={{ marginBottom: 4 }}><Settings size={16} />Account</NavLink>
+           <Button variant="ghost" icon={LogOut} onClick={logout}>Sign out</Button>
+         </div>
+diff --git a/frontend/src/lib/theme.jsx b/frontend/src/lib/theme.jsx
+new file mode 100644
+index 0000000..7c2e660
+--- /dev/null
++++ b/frontend/src/lib/theme.jsx
+@@ -0,0 +1,69 @@
++import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
++import { Monitor, Moon, Sun } from 'lucide-react'
++
++// Light is the default. "system" follows the operating system and updates live.
++const KEY = 'pai_theme'
++const MODES = ['light', 'dark', 'system']
++const Ctx = createContext({ mode: 'light', resolved: 'light', setMode: () => {} })
++
++const read = () => { try { const v = localStorage.getItem(KEY); return MODES.includes(v) ? v : 'light' } catch { return 'light' } }
++const systemDark = () => typeof matchMedia === 'function' && matchMedia('(prefers-color-scheme: dark)').matches
++const resolve = (mode) => (mode === 'system' ? (systemDark() ? 'dark' : 'light') : mode)
++
++function apply(resolved) {
++  const root = document.documentElement
++  root.setAttribute('data-theme', resolved)
++  root.style.colorScheme = resolved
++  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', resolved === 'dark' ? '#0d161d' : '#f3f5f4')
++}
++
++export function ThemeProvider({ children }) {
++  const [mode, setModeState] = useState(read)
++  const [resolved, setResolved] = useState(() => resolve(read()))
++
++  useEffect(() => {
++    const update = () => { const r = resolve(mode); setResolved(r); apply(r) }
++    update()
++    if (mode !== 'system' || typeof matchMedia !== 'function') return
++    const mq = matchMedia('(prefers-color-scheme: dark)')
++    mq.addEventListener('change', update)
++    return () => mq.removeEventListener('change', update)
++  }, [mode])
++
++  // keep several open tabs in sync
++  useEffect(() => {
++    const onStorage = (e) => { if (e.key === KEY) setModeState(read()) }
++    window.addEventListener('storage', onStorage)
++    return () => window.removeEventListener('storage', onStorage)
++  }, [])
++
++  const setMode = useCallback((m) => { setModeState(m); try { localStorage.setItem(KEY, m) } catch { /* private mode */ } }, [])
++  const value = useMemo(() => ({ mode, resolved, setMode }), [mode, resolved, setMode])
++  return <Ctx.Provider value={value}>{children}</Ctx.Provider>
++}
++
++// eslint-disable-next-line react-refresh/only-export-components
++export const useTheme = () => useContext(Ctx)
++
++const OPTIONS = [['light', 'Light', Sun], ['dark', 'Dark', Moon], ['system', 'Match system', Monitor]]
++
++// Three-way switch. `onDark` styles it for the always-dark sidebar.
++export function ThemeToggle({ className = '', onDark = false }) {
++  const { mode, setMode } = useTheme()
++  return (
++    <div className={`theme-toggle ${onDark ? 'on-dark' : ''} ${className}`} role="radiogroup" aria-label="Colour theme">
++      {OPTIONS.map(([id, label, Icon]) => (
++        <button key={id} type="button" role="radio" aria-checked={mode === id} aria-label={label} title={label} className={mode === id ? 'on' : ''} onClick={() => setMode(id)}><Icon size={15} /></button>
++      ))}
++    </div>
++  )
++}
++
++// A small floating switch for pages without a header (login, join, lobby). Hidden while the exam room has its own.
++export function ThemeFloat() {
++  const { resolved, setMode } = useTheme()
++  const Icon = resolved === 'dark' ? Sun : Moon
++  return (
++    <button type="button" className="theme-float" aria-label={resolved === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'} title={resolved === 'dark' ? 'Light theme' : 'Dark theme'} onClick={() => setMode(resolved === 'dark' ? 'light' : 'dark')}><Icon size={17} /></button>
++  )
++}
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index 7edcbef..74dbb7d 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -9,18 +9,22 @@ import '@fontsource/ibm-plex-mono/400.css'
+ import '@fontsource/ibm-plex-mono/600.css'
+ import './styles/app.css'
+ import './styles/pages.css'
++import './styles/report.css'
+ import App from './App.jsx'
+ import { AuthProvider } from './lib/auth'
++import { ThemeProvider } from './lib/theme'
+ import { UIProvider } from './ui'
+ 
+ createRoot(document.getElementById('root')).render(
+   <StrictMode>
+-    <BrowserRouter>
+-      <UIProvider>
+-        <AuthProvider>
+-          <App />
+-        </AuthProvider>
+-      </UIProvider>
+-    </BrowserRouter>
++    <ThemeProvider>
++      <BrowserRouter>
++        <UIProvider>
++          <AuthProvider>
++            <App />
++          </AuthProvider>
++        </UIProvider>
++      </BrowserRouter>
++    </ThemeProvider>
+   </StrictMode>,
+ )
+diff --git a/frontend/src/pages/admin/AttemptReport.jsx b/frontend/src/pages/admin/AttemptReport.jsx
+index 942986f..b73fc53 100644
+--- a/frontend/src/pages/admin/AttemptReport.jsx
++++ b/frontend/src/pages/admin/AttemptReport.jsx
+@@ -1,9 +1,8 @@
+-import { useEffect, useState } from 'react'
++import { useEffect, useMemo, useState } from 'react'
+ import { useNavigate, useParams } from 'react-router-dom'
+-import { Check, Clock, MessageSquare, Power, RotateCcw, X } from 'lucide-react'
++import { Check, Clock, FileText, MessageSquare, Power, RotateCcw, X } from 'lucide-react'
+ import { api } from '../../lib/api'
+-import { duration, fmtDateTime, num, pct } from '../../lib/format'
+-import { useAuth } from '../../lib/auth'
++import { duration, fmtDateTime, num, pct, toDate } from '../../lib/format'
+ import { useDocumentTitle } from '../../lib/hooks'
+ import { Alert, Async, Badge, Button, Modal, PageHeader, Panel, RiskMeter, Select, Stats, Tabs, Textarea, useLoad, useUI } from '../../ui'
+ import { TextDialog } from './test/Live'
+@@ -26,7 +25,6 @@ const REVIEW = [['cleared', 'Cleared — no concern'], ['suspicious', 'Suspiciou
+ export default function AttemptReport() {
+   const { id } = useParams()
+   const nav = useNavigate()
+-  const { user } = useAuth()
+   const { toast, error, confirm } = useUI()
+   const state = useLoad(() => api.get(`/attempts/${id}`), [id])
+   const [tab, setTab] = useState('answers')
+@@ -45,10 +43,12 @@ export default function AttemptReport() {
+         <>
+           <PageHeader title={a.candidate.name} crumbs={[{ label: 'Tests', to: '/app/tests' }, { label: a.test.title, to: `/app/tests/${a.test.id}/results` }, { label: a.candidate.name }]} subtitle={`${a.candidate.email}${a.attempt_no > 1 ? ` · attempt ${a.attempt_no}` : ''}`}>
+             <Badge status={a.status} dot />{a.final_result && <Badge status={a.final_result} />}
++            <Button icon={FileText} onClick={() => nav(`/app/attempts/${id}/report`)}>Download report</Button>
+             {live && <><Button icon={MessageSquare} onClick={() => setDlg('message')}>Message</Button><Button icon={Clock} onClick={() => setDlg('extend')}>Add time</Button><Button variant="danger" icon={Power} onClick={() => setDlg('terminate')}>End attempt</Button></>}
+             {a.can_void && a.status !== 'voided' && <Button icon={RotateCcw} onClick={async () => { if (await confirm({ title: 'Allow a retake?', message: 'This attempt is hidden from results and kept in the audit trail. The candidate can join again with the same code and e-mail.', confirmLabel: 'Allow retake', danger: true })) run(async () => { await api.post(`/attempts/${id}/void`); nav(`/app/tests/${a.test.id}/results`) }, 'Attempt voided') }}>Allow retake</Button>}
+           </PageHeader>
+ 
++          {a.similarity?.length > 0 && <Alert tone={a.similarity.some((x) => x.level === 'high') ? 'bad' : 'warn'}><b>Code similarity:</b> {a.similarity.map((x) => `${x.percent}% match with ${x.other_candidate} on “${x.problem}”`).join('; ')}. Compare the submissions in the Code tab — similar structure is a reason to look, not proof of copying.</Alert>}
+           {a.terminated_reason && <Alert tone="bad"><b>Ended early:</b> {a.terminated_reason}</Alert>}
+           <Stats items={[
+             { value: a.score == null ? '—' : `${num(a.score)}/${num(a.max_score)}`, label: 'Score', sub: a.percentage != null ? `${pct(a.percentage)} · pass mark ${a.test.pass_percentage}%` : undefined },
+@@ -88,7 +88,7 @@ export default function AttemptReport() {
+ 
+           {tab === 'snapshots' && (a.snapshots.length ? <Panel><div style={{ display: 'flex', flexWrap: 'wrap', gap: 12 }}>{a.snapshots.map((s) => <figure key={s.id} style={{ margin: 0 }}><Evidence id={s.id} alt={`${s.kind} photo`} onOpen={setZoom} style={{ width: 160, height: 120 }} /><figcaption className="sub">{s.kind === 'id' ? 'ID document' : s.kind === 'face' ? 'Face photo' : 'Periodic'} · {fmtDateTime(s.created_at)}</figcaption></figure>)}</div></Panel> : <Panel><p className="muted">No photos stored for this attempt.</p></Panel>)}
+ 
+-          {tab === 'code' && a.coding.map((c) => <Panel key={c.id} title={c.problem} actions={<><Badge>{c.language}</Badge><Badge tone={c.passed === c.total ? 'ok' : 'warn'}>{c.passed}/{c.total} · {c.verdict}</Badge></>} className="mb"><pre style={{ margin: 0, overflow: 'auto', fontFamily: 'var(--font-mono)', fontSize: 13 }}>{c.source_code}</pre></Panel>)}
++          {tab === 'code' && <CodeHistory coding={a.coding} startedAt={a.started_at} />}
+ 
+           {tab === 'env' && <Panel><dl className="kv"><dt>IP address</dt><dd>{a.environment.ip_address || '—'}</dd><dt>Browser</dt><dd>{a.environment.user_agent || '—'}</dd><dt>Consent given</dt><dd>{fmtDateTime(a.environment.consent_at)}</dd>
+             {Object.entries(a.environment.system_info || {}).map(([k, v]) => [<dt key={k + 'k'}>{k}</dt>, <dd key={k + 'v'}>{String(v)}</dd>])}
+@@ -116,3 +116,30 @@ function ReviewForm({ current, onSave }) {
+     </div>
+   )
+ }
++
++
++// Replay of a candidate's coding submissions, oldest to newest, with the lines that changed since the previous one marked.
++function CodeHistory({ coding, startedAt }) {
++  const groups = useMemo(() => { const m = new Map(); coding.forEach((c) => { if (!m.has(c.problem)) m.set(c.problem, []); m.get(c.problem).push(c) }); return [...m.entries()] }, [coding])
++  return groups.map(([problem, subs]) => <CodeReplay key={problem} problem={problem} subs={subs} startedAt={startedAt} />)
++}
++
++function CodeReplay({ problem, subs, startedAt }) {
++  const [i, setI] = useState(subs.length - 1)
++  const cur = subs[i], prev = i > 0 ? subs[i - 1] : null
++  const seen = useMemo(() => new Set((prev?.source_code || '').split('\n').map((l) => l.trim())), [prev])
++  const mins = (c) => (startedAt && c.created_at ? Math.max(0, Math.round((toDate(c.created_at) - toDate(startedAt)) / 60000)) : null)
++  return (
++    <Panel title={problem} className="mb" actions={<><Badge>{cur.language}</Badge><Badge tone={cur.passed === cur.total ? 'ok' : 'warn'}>{cur.passed}/{cur.total} · {cur.verdict}</Badge></>}>
++      {subs.length > 1 && (
++        <div className="replay-bar">
++          <Button size="sm" disabled={i === 0} onClick={() => setI(i - 1)}>Previous</Button>
++          <input type="range" min={0} max={subs.length - 1} value={i} onChange={(e) => setI(Number(e.target.value))} aria-label="Submission history" />
++          <Button size="sm" disabled={i === subs.length - 1} onClick={() => setI(i + 1)}>Next</Button>
++          <span className="muted">Submission {i + 1} of {subs.length}{mins(cur) != null ? ` · ${mins(cur)} min into the test` : ''}</span>
++        </div>
++      )}
++      <pre className="code-view">{cur.source_code.split('\n').map((line, n) => <span key={n} className={prev && line.trim() && !seen.has(line.trim()) ? 'added' : ''}><i>{n + 1}</i>{line || ' '}{'\n'}</span>)}</pre>
++    </Panel>
++  )
++}
+diff --git a/frontend/src/pages/admin/Bank.jsx b/frontend/src/pages/admin/Bank.jsx
+index a0ea427..f38484e 100644
+--- a/frontend/src/pages/admin/Bank.jsx
++++ b/frontend/src/pages/admin/Bank.jsx
+@@ -1,8 +1,8 @@
+ import { useState } from 'react'
+-import { Pencil, Plus, Trash2 } from 'lucide-react'
++import { Library, Pencil, Plus, Trash2 } from 'lucide-react'
+ import { api } from '../../lib/api'
+ import { useDocumentTitle, usePaged } from '../../lib/hooks'
+-import { Badge, Empty, IconButton, Button, Loading, PageHeader, Pager, Panel, SearchBox, useLoad, useUI } from '../../ui'
++import { Badge, Empty, IconButton, Button, Loading, Modal, PageHeader, Pager, Panel, SearchBox, useLoad, useUI } from '../../ui'
+ import QuestionEditor, { TYPE_LABEL } from './QuestionEditor'
+ 
+ export default function Bank() {
+@@ -11,9 +11,10 @@ export default function Bank() {
+   const list = usePaged('/bank/questions', { q: '', difficulty: '', question_type: '', tag: '' })
+   const tags = useLoad(() => api.get('/bank/tags'), [])
+   const [editor, setEditor] = useState(null)
++  const [lib, setLib] = useState(false)
+   return (
+     <>
+-      <PageHeader title="Question bank" subtitle="Reusable questions. Pull them into any test; changes here never alter tests that already copied a question."><Button variant="primary" icon={Plus} onClick={() => setEditor({})}>New question</Button></PageHeader>
++      <PageHeader title="Question bank" subtitle="Reusable questions. Pull them into any test; changes here never alter tests that already copied a question."><Button icon={Library} onClick={() => setLib(true)}>Starter library</Button><Button variant="primary" icon={Plus} onClick={() => setEditor({})}>New question</Button></PageHeader>
+       <div className="toolbar">
+         <SearchBox value={list.filters.q} onChange={(v) => list.setFilter('q', v)} placeholder="Search questions" />
+         <select className="input" aria-label="Type" value={list.filters.question_type} onChange={(e) => list.setFilter('question_type', e.target.value)}><option value="">All types</option>{Object.entries(TYPE_LABEL).map(([k, v]) => <option key={k} value={k}>{v}</option>)}</select>
+@@ -21,7 +22,7 @@ export default function Bank() {
+         {(tags.data?.length > 0) && <select className="input" aria-label="Tag" value={list.filters.tag} onChange={(e) => list.setFilter('tag', e.target.value)}><option value="">Any tag</option>{tags.data.map((t) => <option key={t.tag ?? t} value={t.tag ?? t}>#{t.tag ?? t}</option>)}</select>}
+       </div>
+       <Panel flush>
+-        {list.loading && !list.data ? <Loading /> : !list.items.length ? <Empty title="No questions in the bank" action={<Button variant="primary" onClick={() => setEditor({})}>Add a question</Button>}>Build a library once, then assemble tests from it in seconds. You can also save any test question to the bank.</Empty> : (
++        {list.loading && !list.data ? <Loading /> : !list.items.length ? <Empty title="No questions in the bank" action={<span className="row"><Button variant="primary" onClick={() => setLib(true)}>Import the starter library</Button><Button onClick={() => setEditor({})}>Add a question</Button></span>}>Build a library once, then assemble tests from it in seconds. You can also save any test question to the bank.</Empty> : (
+           <ul style={{ listStyle: 'none', margin: 0, padding: 0 }}>{list.items.map((q, i) => (
+             <li key={q.id} style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 12, padding: '14px 18px', borderTop: i ? '1px solid var(--line)' : 0 }}>
+               <div><div style={{ whiteSpace: 'pre-wrap' }}>{q.question_text}</div><div className="chips" style={{ marginTop: 8 }}><Badge tone="info">{TYPE_LABEL[q.question_type]}</Badge><Badge>{q.marks} mark{q.marks === 1 ? '' : 's'}</Badge><Badge>{q.difficulty}</Badge>{q.section && <Badge>{q.section}</Badge>}{q.tags.map((x) => <Badge key={x}>#{x}</Badge>)}</div></div>
+@@ -29,8 +30,34 @@ export default function Bank() {
+                 <IconButton icon={Trash2} label="Delete" onClick={async () => { if (await confirm({ title: 'Delete from bank?', message: 'Tests that already use a copy are not affected.', confirmLabel: 'Delete', danger: true })) { try { await api.del(`/bank/questions/${q.id}`); list.reload() } catch (e) { error(e) } } }} /></div></li>))}</ul>)}
+         <Pager page={list.page} pageSize={list.pageSize} total={list.total} onPage={list.setPage} />
+       </Panel>
++      {lib && <LibraryDialog onClose={(changed) => { setLib(false); if (changed) { list.reload(); tags.reload() } }} />}
+       {editor && <QuestionEditor initial={editor.id ? editor : undefined} title={editor.id ? 'Edit bank question' : 'New bank question'} onClose={() => { setEditor(null); list.reload(); tags.reload() }}
+         onSave={async (body) => { editor.id ? await api.put(`/bank/questions/${editor.id}`, body) : await api.post('/bank/questions', body); toast('Saved to the bank') }} />}
+     </>
+   )
+ }
++
++
++function LibraryDialog({ onClose }) {
++  const { toast, error } = useUI()
++  const data = useLoad(() => api.get('/bank/library'), [])
++  const [busy, setBusy] = useState('')
++  const [changed, setChanged] = useState(false)
++  const run = async (sections, key) => {
++    setBusy(key)
++    try { const r = await api.post('/bank/library/import', { sections }); toast(r.added ? `Added ${r.added} question${r.added === 1 ? '' : 's'} to your bank` : 'Everything here is already in your bank'); setChanged(r.added > 0 || changed); data.reload() }
++    catch (e) { error(e) } finally { setBusy('') }
++  }
++  const rows = data.data?.sections || []
++  const all = rows.reduce((n, r) => n + r.questions, 0), have = rows.reduce((n, r) => n + r.imported, 0)
++  return (
++    <Modal title="Starter question library" onClose={() => onClose(changed)} footer={<Button variant="primary" busy={busy === 'all'} disabled={!rows.length || have === all} onClick={() => run([], 'all')}>Import everything</Button>}>
++      <p className="muted-2 mb">Ready-made, reviewed multiple-choice questions. Imported questions become yours to edit; importing twice never creates duplicates.</p>
++      {data.loading && !data.data ? <Loading /> : rows.map((r) => (
++        <div key={r.section} className="row between" style={{ padding: '10px 0', borderTop: '1px solid var(--line)' }}>
++          <div><b>{r.section}</b><div className="muted" style={{ fontSize: 13 }}>{r.questions} questions · {r.imported} in your bank</div></div>
++          <Button size="sm" busy={busy === r.section} disabled={r.imported === r.questions} onClick={() => run([r.section], r.section)}>{r.imported === r.questions ? 'Imported' : 'Import'}</Button>
++        </div>))}
++    </Modal>
++  )
++}
+diff --git a/frontend/src/pages/admin/ReportPrint.jsx b/frontend/src/pages/admin/ReportPrint.jsx
+new file mode 100644
+index 0000000..74021b2
+--- /dev/null
++++ b/frontend/src/pages/admin/ReportPrint.jsx
+@@ -0,0 +1,173 @@
++import { useMemo } from 'react'
++import { Link, useParams } from 'react-router-dom'
++import { ArrowLeft, Printer, ShieldCheck } from 'lucide-react'
++import { api } from '../../lib/api'
++import { duration, fmtDateTime, num, pct, toDate } from '../../lib/format'
++import { useDocumentTitle } from '../../lib/hooks'
++import { Async, Button, useLoad } from '../../ui'
++import { Evidence } from './AttemptReport'
++
++const RISK = { low: 'Low', medium: 'Medium', high: 'High' }
++const CATEGORY = { browser: 'Browser & screen', device: 'Camera & microphone', audio: 'Audio', ai: 'AI vision', session: 'Session', admin: 'Proctor notes' }
++const DECISION = { pending: 'Awaiting review', cleared: 'Cleared — no concern', suspicious: 'Suspicious — needs a second look', disqualified: 'Disqualified' }
++
++const offset = (v, start) => {
++  const s = start && v ? Math.max(0, Math.round((toDate(v) - toDate(start)) / 1000)) : null
++  if (s == null) return '—'
++  return `+${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
++}
++
++function Timeline({ a, events }) {
++  const start = toDate(a.started_at)?.getTime()
++  const end = Math.max(toDate(a.submitted_at)?.getTime() || 0, ...events.map((e) => toDate(e.created_at).getTime()))
++  if (!start || !(end > start) || !events.length) return null
++  const x = (t) => 12 + ((t - start) / (end - start)) * 576
++  return (
++    <figure className="rp-timeline">
++      <svg viewBox="0 0 600 64" role="img" aria-label="Timeline of recorded events">
++        <line x1="12" x2="588" y1="32" y2="32" className="axis" />
++        {events.map((e) => { const cx = x(toDate(e.created_at).getTime()); return <g key={e.id}><line x1={cx} x2={cx} y1={e.severity === 2 ? 10 : 20} y2="32" className={`stem s${e.severity}`} /><circle cx={cx} cy={e.severity === 2 ? 10 : 20} r={e.severity === 2 ? 4.5 : 3.5} className={`rp-dot s${e.severity}`} /></g> })}
++        <text x="12" y="58">Start</text><text x="588" y="58" textAnchor="end">{duration(Math.round((end - start) / 1000))}</text>
++      </svg>
++      <figcaption><span><i className="rp-dot s2" />Serious</span><span><i className="rp-dot s1" />Minor</span></figcaption>
++    </figure>
++  )
++}
++
++export default function ReportPrint() {
++  const { id } = useParams()
++  const state = useLoad(() => api.get(`/attempts/${id}`), [id])
++  useDocumentTitle(state.data ? `${state.data.candidate.name} — assessment report` : 'Report')
++  return <Async state={state}>{(a) => <Report a={a} />}</Async>
++}
++
++function Report({ a }) {
++  const events = useMemo(() => a.violations.filter((v) => v.status !== 'dismissed'), [a])
++  const byCat = useMemo(() => { const m = {}; events.forEach((v) => { m[v.category] = (m[v.category] || 0) + 1 }); return m }, [events])
++  const serious = events.filter((v) => v.severity === 2)
++  const withPhoto = serious.filter((v) => v.snapshot_id).slice(0, 8)
++  const sections = useMemo(() => {
++    const m = new Map()
++    a.questions.forEach((q) => { const k = q.section || 'General'; const s = m.get(k) || { name: k, total: 0, correct: 0, awarded: 0, marks: 0 }; s.total++; s.correct += q.is_correct ? 1 : 0; s.awarded += q.awarded || 0; s.marks += q.marks || 0; m.set(k, s) })
++    return [...m.values()]
++  }, [a])
++  const showKey = a.questions.some((q) => q.correct_answer != null)
++  const fmt = (v) => (Array.isArray(v) ? v.join(', ') : v ?? '')
++  const risk = a.risk_level || 'low'
++  const final = a.status === 'submitted' || a.status === 'terminated'
++
++  return (
++    <div className="rp-wrap">
++      <div className="rp-bar no-print">
++        <Link to={`/app/attempts/${a.id}`} className="btn"><ArrowLeft size={16} />Back to attempt</Link>
++        <Button variant="primary" icon={Printer} onClick={() => window.print()}>Print / Save as PDF</Button>
++      </div>
++
++      <article className="report" aria-label="Assessment and proctoring report">
++        <header className="rp-head">
++          <div className="rp-brand"><span className="mark"><ShieldCheck size={18} /></span><div><b>{a.organization || 'ProctorAI'}</b><small>Assessment &amp; Proctoring Report</small></div></div>
++          <dl className="rp-meta"><div><dt>Report ID</dt><dd>PA-{String(a.id).padStart(6, '0')}</dd></div><div><dt>Generated</dt><dd>{fmtDateTime(new Date().toISOString())}</dd></div></dl>
++        </header>
++
++        <section className="rp-hero">
++          <div>
++            <h1>{a.candidate.name}</h1>
++            <p>{a.candidate.email}{a.attempt_no > 1 ? ` · attempt ${a.attempt_no}` : ''}</p>
++            <p className="rp-test">{a.test.title}</p>
++          </div>
++          <div className={`rp-verdict ${a.review.status}`}><small>Review decision</small><b>{DECISION[a.review.status] || a.review.status}</b></div>
++        </section>
++
++        {a.terminated_reason && <p className="rp-callout bad"><b>Attempt ended early:</b> {a.terminated_reason}</p>}
++
++        <section className="rp-tiles" aria-label="Summary">
++          <div><span>Score</span><b>{a.score == null ? '—' : `${num(a.score)} / ${num(a.max_score)}`}</b><small>{a.percentage != null ? `${pct(a.percentage)} · pass mark ${a.test.pass_percentage}%` : 'Not scored'}</small></div>
++          <div><span>Result</span><b className={a.final_result === 'pass' ? 'ok' : a.final_result === 'fail' ? 'bad' : ''}>{a.final_result ? (a.final_result === 'pass' ? 'Passed' : 'Failed') : '—'}</b><small>Rank {a.rank ?? '—'}</small></div>
++          <div><span>Time taken</span><b>{duration(a.time_taken_seconds)}</b><small>of {a.test.duration_minutes} min</small></div>
++          <div><span>Integrity risk</span><b className={`risk-${risk}`}>{RISK[risk]} · {a.risk_score}</b><small>{events.length} event{events.length === 1 ? '' : 's'}, {a.level2_count} serious</small></div>
++        </section>
++
++        <section>
++          <h2>Integrity summary</h2>
++          {events.length === 0 ? <p className="rp-muted">No proctoring events were recorded for this attempt.</p> : (
++            <>
++              <div className="rp-chips">{Object.entries(byCat).map(([k, n]) => <span key={k}>{CATEGORY[k] || k}<b>{n}</b></span>)}</div>
++              <Timeline a={a} events={events} />
++              <table className="rp-table"><thead><tr><th>Time</th><th>Event</th><th>Severity</th><th>Status</th></tr></thead><tbody>
++                {events.map((v) => <tr key={v.id}><td className="mono">{offset(v.created_at, a.started_at)}</td><td><b>{v.label}</b>{v.details ? <div className="sub">{v.details}</div> : null}</td><td><span className={`pill s${v.severity}`}>{v.severity === 2 ? 'Serious' : 'Minor'}</span></td><td>{v.status === 'confirmed' ? 'Confirmed' : 'Open'}</td></tr>)}
++              </tbody></table>
++              {a.violations.length > events.length && <p className="rp-muted">{a.violations.length - events.length} event(s) were dismissed by a reviewer and are excluded from the risk score.</p>}
++            </>
++          )}
++        </section>
++
++        {withPhoto.length > 0 && (
++          <section className="rp-keep">
++            <h2>Evidence</h2>
++            <div className="rp-evidence">{withPhoto.map((v) => (
++              <figure key={v.id}><Evidence id={v.snapshot_id} alt={`Evidence: ${v.label}`} style={{ width: '100%', height: 'auto', aspectRatio: '4 / 3' }} /><figcaption><b>{v.label}</b><span>{offset(v.created_at, a.started_at)}</span></figcaption></figure>
++            ))}</div>
++          </section>
++        )}
++
++        {a.similarity?.length > 0 && (
++          <section className="rp-keep">
++            <h2>Code similarity</h2>
++            <table className="rp-table"><thead><tr><th>Problem</th><th>Similar to</th><th>Match</th></tr></thead><tbody>
++              {a.similarity.map((s, i) => <tr key={i}><td>{s.problem}</td><td>{s.other_candidate}</td><td><span className={`pill sim-${s.level}`}>{s.percent}% · {s.level}</span></td></tr>)}
++            </tbody></table>
++            <p className="rp-muted">Screening aid only: token-level comparison within this test. Short or standard solutions can legitimately match.</p>
++          </section>
++        )}
++
++        {sections.length > 0 && (
++          <section className="rp-keep">
++            <h2>Performance by section</h2>
++            <table className="rp-table"><thead><tr><th>Section</th><th className="num">Correct</th><th className="num">Marks</th></tr></thead><tbody>
++              {sections.map((s) => <tr key={s.name}><td>{s.name}</td><td className="num">{s.correct} / {s.total}</td><td className="num">{num(s.awarded)} / {num(s.marks)}</td></tr>)}
++            </tbody></table>
++          </section>
++        )}
++
++        {a.coding.length > 0 && (
++          <section className="rp-keep">
++            <h2>Coding</h2>
++            <table className="rp-table"><thead><tr><th>Problem</th><th>Language</th><th>Verdict</th><th className="num">Tests passed</th></tr></thead><tbody>
++              {Object.values(a.coding.reduce((m, c) => { const b = m[c.problem]; if (!b || c.passed / (c.total || 1) >= b.passed / (b.total || 1)) m[c.problem] = c; return m }, {})).map((c) => <tr key={c.id}><td>{c.problem}</td><td>{c.language}</td><td>{c.verdict}</td><td className="num">{c.passed} / {c.total}</td></tr>)}
++            </tbody></table>
++            <p className="rp-muted">Best submission per problem. {a.coding.length} submission{a.coding.length === 1 ? '' : 's'} in total.</p>
++          </section>
++        )}
++
++        {a.questions.length > 0 && (
++          <section>
++            <h2>Answers</h2>
++            <table className="rp-table"><thead><tr><th style={{ width: 28 }}>#</th><th>Question</th><th>Answer</th>{showKey && <th>Correct</th>}<th className="num">Marks</th></tr></thead><tbody>
++              {a.questions.map((q, i) => <tr key={q.question_id}><td className="mono">{i + 1}</td><td>{q.text}</td><td className={q.answered ? (q.is_correct ? 'ok' : 'bad') : 'rp-muted'}>{q.answered ? fmt(q.answer) : 'Not answered'}</td>{showKey && <td>{fmt(q.correct_answer)}</td>}<td className="num">{q.awarded == null ? '—' : num(q.awarded)} / {num(q.marks)}</td></tr>)}
++            </tbody></table>
++          </section>
++        )}
++
++        <section className="rp-keep">
++          <h2>Session</h2>
++          <dl className="rp-kv">
++            <div><dt>Started</dt><dd>{fmtDateTime(a.started_at)}</dd></div><div><dt>Finished</dt><dd>{fmtDateTime(a.submitted_at)}</dd></div>
++            <div><dt>IP address</dt><dd>{a.environment.ip_address || '—'}</dd></div><div><dt>Consent given</dt><dd>{fmtDateTime(a.environment.consent_at)}</dd></div>
++            <div className="wide"><dt>Browser</dt><dd>{a.environment.user_agent || '—'}</dd></div>
++          </dl>
++        </section>
++
++        {final && (
++          <section className="rp-keep rp-decision">
++            <h2>Reviewer decision</h2>
++            <p><b>{DECISION[a.review.status]}</b>{a.review.reviewer ? ` — ${a.review.reviewer}, ${fmtDateTime(a.review.reviewed_at)}` : ''}</p>
++            {a.review.note && <blockquote>{a.review.note}</blockquote>}
++            <div className="rp-sign"><span>Reviewer signature</span><span>Date</span></div>
++          </section>
++        )}
++
++        <footer className="rp-foot">Risk scores and proctoring events are evidence for human review, not proof of misconduct. Generated by ProctorAI · Report PA-{String(a.id).padStart(6, '0')}.</footer>
++      </article>
++    </div>
++  )
++}
+diff --git a/frontend/src/pages/candidate/CodingPanel.jsx b/frontend/src/pages/candidate/CodingPanel.jsx
+index bdb4f12..ba6bfe6 100644
+--- a/frontend/src/pages/candidate/CodingPanel.jsx
++++ b/frontend/src/pages/candidate/CodingPanel.jsx
+@@ -20,6 +20,7 @@ export default function CodingPanel({ problems, attemptId }) {
+   const [custom, setCustom] = useState({})
+   const [busy, setBusy] = useState('')
+   const [err, setErr] = useState('')
++  const gutter = useRef(null)
+   const key = (pid) => `pai_code_${attemptId}_${pid}`
+   const store = useRef({ get: (k) => { try { return JSON.parse(sessionStorage.getItem(k)) } catch { return null } }, set: (k, v) => { try { sessionStorage.setItem(k, JSON.stringify(v)) } catch { /* ignore */ } } })
+ 
+@@ -57,8 +58,19 @@ export default function CodingPanel({ problems, attemptId }) {
+     } catch (e) { setErr(e.message) } finally { setBusy('') }
+   }
+   const onKey = (e) => {
+-    if (e.key === 'Tab') { e.preventDefault(); const t = e.target, s = t.selectionStart; update({ code: draft.code.slice(0, s) + '    ' + draft.code.slice(t.selectionEnd) }); requestAnimationFrame(() => { t.selectionStart = t.selectionEnd = s + 4 }) }
++    const t = e.target, code = draft.code ?? ''
++    const set = (value, caret) => { update({ code: value }); requestAnimationFrame(() => { t.selectionStart = t.selectionEnd = caret }) }
++    if (e.key === 'Tab') { e.preventDefault(); const s = t.selectionStart; set(code.slice(0, s) + '    ' + code.slice(t.selectionEnd), s + 4) }
++    else if (e.key === 'Enter' && t.selectionStart === t.selectionEnd) {      // keep the indentation of the current line; indent after an opening bracket or colon
++      e.preventDefault()
++      const s = t.selectionStart, lineStart = code.lastIndexOf('\n', s - 1) + 1
++      const line = code.slice(lineStart, s), indent = /^[ \t]*/.exec(line)[0]
++      const extra = /[{(\[:]\s*$/.test(line) ? '    ' : ''
++      set(code.slice(0, s) + '\n' + indent + extra + code.slice(s), s + 1 + indent.length + extra.length)
++    }
+   }
++  const text = draft.code ?? TEMPLATES[draft.lang] ?? ''
++  const lines = text.split('\n').length
+ 
+   return (
+     <div className="coding">
+@@ -76,7 +88,7 @@ export default function CodingPanel({ problems, attemptId }) {
+         <div className="coding-editor">
+           <div className="row between mb"><select className="input" style={{ width: 'auto' }} aria-label="Language" value={draft.lang} onChange={(e) => changeLang(Number(e.target.value))}>{langs.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}</select>
+             <span className="row"><Button icon={Play} busy={busy === 'run'} disabled={!!busy} onClick={() => go('run')}>Run</Button><Button variant="primary" icon={Send} busy={busy === 'submit'} disabled={!!busy} onClick={() => go('submit')}>Submit</Button></span></div>
+-          <textarea className="code-area" aria-label="Code editor" spellCheck={false} value={draft.code ?? TEMPLATES[draft.lang] ?? ''} onChange={(e) => update({ code: e.target.value })} onKeyDown={onKey} />
++          <div className="code-frame"><pre className="gutter" ref={gutter} aria-hidden>{Array.from({ length: lines }, (_, n) => n + 1).join('\n')}</pre><textarea className="code-area" aria-label="Code editor" spellCheck={false} wrap="off" autoCapitalize="off" autoCorrect="off" value={text} onChange={(e) => update({ code: e.target.value })} onKeyDown={onKey} onScroll={(e) => { if (gutter.current) gutter.current.scrollTop = e.target.scrollTop }} /></div>
+           <label className="check" style={{ margin: '8px 0' }}><input type="checkbox" checked={!!custom[active]?.on} onChange={(e) => setCustom({ ...custom, [active]: { ...custom[active], on: e.target.checked } })} />Run with my own input</label>
+           {custom[active]?.on && <textarea className="input mono" rows={3} aria-label="Custom input" value={custom[active].text || ''} onChange={(e) => setCustom({ ...custom, [active]: { ...custom[active], text: e.target.value } })} />}
+           {err && <Alert tone="bad" className="mt">{err}</Alert>}
+diff --git a/frontend/src/pages/candidate/ExamRoom.jsx b/frontend/src/pages/candidate/ExamRoom.jsx
+index b00f829..5d25fab 100644
+--- a/frontend/src/pages/candidate/ExamRoom.jsx
++++ b/frontend/src/pages/candidate/ExamRoom.jsx
+@@ -1,9 +1,11 @@
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+ import { Link } from 'react-router-dom'
+-import { Bell, Camera, ChevronLeft, ChevronRight, Flag, Maximize, Send, WifiOff, AlertTriangle } from 'lucide-react'
++import { Bell, ChevronLeft, ChevronRight, Flag, Maximize, Send, WifiOff } from 'lucide-react'
+ import { ApiError, cand, candToken, setCandidateExpiredHandler } from '../../lib/api'
+ import { clock } from '../../lib/format'
+ import { Alert, Button, Loading, Modal } from '../../ui'
++import { ThemeToggle } from '../../lib/theme'
++import { CamTile, ProctorAlerts } from './ProctorHud'
+ import { CodeEntry } from '../public/Landing'
+ import CodingPanel from './CodingPanel'
+ import Finished from './Finished'
+@@ -68,7 +70,7 @@ function Exam({ state, media, onDone }) {
+   const [view, setView] = useState(questions.length ? 'questions' : 'coding')
+   const [save, setSave] = useState('saved')           // saved | saving | offline
+   const [notices, setNotices] = useState((state.messages || []).map((m) => ({ id: 'm' + m.id, text: m.body, tone: 'info' })))
+-  const [warning, setWarning] = useState(null)
++  const [alerts, setAlerts] = useState([])
+   const [confirm, setConfirm] = useState(false)
+   const [submitting, setSubmitting] = useState(false)
+   const [fsLost, setFsLost] = useState(false)
+@@ -84,6 +86,10 @@ function Exam({ state, media, onDone }) {
+   const lastReport = useRef({})
+   const video = useRef(null)
+   const dirty = useRef(false)
++  const alertSeq = useRef(0)
++  const pushAlert = useCallback((o, auto) => setAlerts((a) => [...a.filter((x) => !(x.code === o.code && x.severity < 2)), { id: ++alertSeq.current, code: o.code, label: o.label, severity: o.severity, n: o.level2_count, max: o.max_level2, auto }]), [])
++  const dismissAlert = useCallback((id) => setAlerts((a) => a.filter((x) => x.id !== id)), [])
++  useEffect(() => { document.body.classList.add('in-exam'); return () => document.body.classList.remove('in-exam') }, [])
+ 
+   const needCam = cfg.webcam_required
+   const needGate = (needCam && !media.cam) || (cfg.fullscreen_required && !document.fullscreenElement)
+@@ -139,9 +145,9 @@ function Exam({ state, media, onDone }) {
+     try {
+       const o = await cand.post('/attempt/violations', { code, details, image })
+       if (o.terminated) { finishing.current = true; await onDone(); return }
+-      if (o.recorded && o.severity === 2) setWarning({ label: o.label, n: o.level2_count, max: o.max_level2, auto: cfg.auto_terminate })
++      if (o.recorded) pushAlert(o, cfg.auto_terminate)
+     } catch { /* offline: the heartbeat will keep trying; a missed flag is not the candidate's fault */ }
+-  }, [media, cfg.auto_terminate, onDone])
++  }, [media, cfg.auto_terminate, onDone, pushAlert])
+ 
+   /* ---------- heartbeat ---------- */
+   useEffect(() => {
+@@ -206,7 +212,7 @@ function Exam({ state, media, onDone }) {
+         if (r.terminated) { finishing.current = true; onDone(); return }
+         const live = r.findings || []
+         setHint(r.available && live.length ? live[0].label : '')
+-        if (r.outcome?.recorded && r.outcome.severity === 2) setWarning({ label: r.outcome.label, n: r.outcome.level2_count, max: r.outcome.max_level2, auto: cfg.auto_terminate && cfg.ai_can_terminate })
++        if (r.outcome?.recorded) pushAlert(r.outcome, cfg.auto_terminate && cfg.ai_can_terminate)
+       } catch { /* skip this frame */ } finally { busy = false }
+     }, cfg.analysis_interval_seconds * 1000)
+     return () => clearInterval(id)
+@@ -240,15 +246,15 @@ function Exam({ state, media, onDone }) {
+     <div className="room">
+       <header className="room-top">
+         <div className="grow truncate"><b>{state.test.title}</b><span className="muted" style={{ marginLeft: 10, fontSize: 13 }}>{answeredCount}/{questions.length} answered</span></div>
++        <ThemeToggle />
+         <span className={`save ${save}`} role="status">{save === 'saved' ? 'All answers saved' : save === 'saving' ? 'Saving…' : <><WifiOff size={14} /> Offline — saved on this device</>}</span>
+         <div className={`timer ${urgent ? 'urgent' : low ? 'low' : ''}`} role="timer" aria-label={`Time left ${clock(left)}`}>{clock(left)}</div>
+         <Button variant="primary" icon={Send} onClick={() => setConfirm(true)}>Submit</Button>
+       </header>
+ 
++      <ProctorAlerts alerts={alerts} onDismiss={dismissAlert} />
+       <div className="room-notices" aria-live="polite">
+-        {warning && <Alert tone="bad"><b>Warning: {warning.label}.</b> {warning.auto ? `Serious warning ${warning.n} of ${warning.max}. The test ends at ${warning.max}.` : 'This has been recorded for the organizer.'} <a href="#close" onClick={(e) => { e.preventDefault(); setWarning(null) }}>Dismiss</a></Alert>}
+         {notices.slice(-3).map((n) => <Alert key={n.id} tone={n.tone}><Bell size={14} /> <b>From the organizer:</b> {n.text} <a href="#close" onClick={(e) => { e.preventDefault(); setNotices((x) => x.filter((m) => m.id !== n.id)) }}>Dismiss</a></Alert>)}
+-        {hint && <Alert tone="warn"><AlertTriangle size={14} /> {hint}. Please look at the screen and keep only your face in view.</Alert>}
+       </div>
+ 
+       {questions.length > 0 && problems.length > 0 && <div className="tabs room-tabs"><button className={view === 'questions' ? 'active' : ''} onClick={() => setView('questions')}>Questions ({answeredCount}/{questions.length})</button><button className={view === 'coding' ? 'active' : ''} onClick={() => setView('coding')}>Coding ({problems.length})</button></div>}
+@@ -278,7 +284,7 @@ function Exam({ state, media, onDone }) {
+         </main>
+ 
+         <aside className="room-side">
+-          {needCam && <div className="cam"><video ref={video} muted playsInline autoPlay aria-label="Your camera" />{!media.cam && <div className="ph"><Camera size={20} />Camera off</div>}</div>}
++          {needCam && <CamTile video={video} camOn={media.cam} issue={hint} monitoring={!!cfg.ai_monitoring} />}
+           {view === 'questions' && <nav aria-label="Question navigator">{sections.map((g, gi) => (
+             <div key={gi}>{g.s && <div className="nav-sec">{g.s}</div>}<div className="qgrid">{g.items.map((i) => { const id = questions[i].id; return <button key={id} className={`qn ${i === idx ? 'cur' : ''} ${answers[id] != null ? 'ans' : ''} ${flagged.includes(id) ? 'flag' : ''}`} aria-label={`Question ${i + 1}${answers[id] != null ? ', answered' : ''}${flagged.includes(id) ? ', flagged' : ''}`} onClick={() => { setIdx(i); setView('questions') }}>{i + 1}</button> })}</div></div>))}
+             <div className="legend mt"><span><i style={{ background: 'var(--accent)' }} />Answered</span><span><i style={{ background: 'var(--warn)' }} />Flagged</span><span><i style={{ background: 'var(--neutral-soft)' }} />Not answered</span></div></nav>}
+diff --git a/frontend/src/pages/candidate/ProctorHud.jsx b/frontend/src/pages/candidate/ProctorHud.jsx
+new file mode 100644
+index 0000000..c70e867
+--- /dev/null
++++ b/frontend/src/pages/candidate/ProctorHud.jsx
+@@ -0,0 +1,87 @@
++import { useEffect, useRef } from 'react'
++import { AlertTriangle, AppWindow, Camera, CameraOff, ClipboardX, Expand, Keyboard, MousePointerClick, ScanFace, ShieldAlert, ShieldCheck, Users, Volume2, X } from 'lucide-react'
++
++// What the candidate is told for each recorded event. The server decides severity; this is wording only.
++const INFO = {
++  TAB_SWITCH: { icon: AppWindow, title: 'You left the exam tab', advice: 'Stay on this tab for the whole test.' },
++  WINDOW_BLUR: { icon: AppWindow, title: 'Exam window lost focus', advice: 'Click back into the test and avoid other windows.' },
++  FULLSCREEN_EXIT: { icon: Expand, title: 'You exited fullscreen', advice: 'Return to fullscreen and stay there.' },
++  COPY_PASTE: { icon: ClipboardX, title: 'Copy and paste are disabled', advice: 'Type your answers yourself.' },
++  RIGHT_CLICK: { icon: MousePointerClick, title: 'Right-click is disabled', advice: 'Use the buttons on the page.' },
++  SHORTCUT: { icon: Keyboard, title: 'That shortcut is blocked', advice: 'Keyboard shortcuts for developer tools or printing are not allowed.' },
++  DEVTOOLS: { icon: Keyboard, title: 'Developer tools suspected', advice: 'Close developer tools.' },
++  SCREEN_RESIZE: { icon: Expand, title: 'Window size changed', advice: 'Keep the window at its original size.' },
++  CAMERA_LOST: { icon: CameraOff, title: 'Your camera stopped', advice: 'Reconnect or allow the camera to continue.' },
++  MIC_LOST: { icon: Volume2, title: 'Your microphone stopped', advice: 'Reconnect or allow the microphone.' },
++  AUDIO_VOICE: { icon: Volume2, title: 'Talking detected', advice: 'Please stay quiet during the test.' },
++  NO_FACE: { icon: ScanFace, title: 'We cannot see your face', advice: 'Sit in front of the camera with your face fully visible.' },
++  MULTIPLE_FACES: { icon: Users, title: 'More than one person in view', advice: 'You must be alone during the test.' },
++  LOOKING_AWAY: { icon: ScanFace, title: 'Looking away from the screen', advice: 'Keep your eyes on the screen.' },
++  HEAD_TURNED: { icon: ScanFace, title: 'Head turned away', advice: 'Face the screen.' },
++  LIP_MOVEMENT: { icon: Volume2, title: 'Possible speaking detected', advice: 'Please do not speak during the test.' },
++  PROHIBITED_OBJECT: { icon: ShieldAlert, title: 'Prohibited object in view', advice: 'Remove phones, books and other devices from view.' },
++  CAMERA_COVERED: { icon: CameraOff, title: 'Camera view is blocked or too dark', advice: 'Uncover the camera and improve the lighting.' },
++}
++// eslint-disable-next-line react-refresh/only-export-components
++export const infoFor = (code, label) => ({ icon: AlertTriangle, title: label || 'Activity recorded', advice: 'This has been recorded for the organizer.', ...INFO[code] })
++
++const MINOR_MS = 7000
++
++/** Alert stack. `alerts`: [{ id, code, label, severity, n, max, auto }]. Serious alerts stay until acknowledged. */
++export function ProctorAlerts({ alerts, onDismiss }) {
++  return (
++    <div className="pa-stack" aria-live="assertive" aria-relevant="additions">
++      {alerts.slice(-3).map((a) => <AlertCard key={a.id} a={a} onDismiss={onDismiss} />)}
++    </div>
++  )
++}
++
++function AlertCard({ a, onDismiss }) {
++  const serious = a.severity === 2
++  const { icon: Icon, title, advice } = infoFor(a.code, a.label)
++  const ref = useRef(onDismiss); ref.current = onDismiss
++  useEffect(() => {
++    if (serious) return
++    const t = setTimeout(() => ref.current(a.id), MINOR_MS)
++    return () => clearTimeout(t)
++  }, [a.id, serious])
++  return (
++    <div className={`pa-card ${serious ? 'serious' : 'minor'}`} role={serious ? 'alertdialog' : 'status'} aria-label={title}>
++      <span className="pa-icon"><Icon size={20} /></span>
++      <div className="pa-body">
++        <div className="pa-kicker">{serious ? 'Serious warning' : 'Notice'}</div>
++        <b>{title}</b>
++        <p>{advice}</p>
++        {serious && a.max > 0 && (
++          <div className="pa-strikes" aria-label={`Serious warning ${a.n} of ${a.max}`}>
++            <span className="pips">{Array.from({ length: a.max }, (_, i) => <i key={i} className={i < a.n ? 'used' : ''} />)}</span>
++            <span>{a.n} of {a.max}{a.auto ? ' — the test ends at ' + a.max : ''}</span>
++          </div>
++        )}
++        {serious && <button type="button" className="pa-ack" onClick={() => onDismiss(a.id)}>I understand</button>}
++      </div>
++      {!serious && <button type="button" className="pa-x" aria-label="Dismiss" onClick={() => onDismiss(a.id)}><X size={14} /></button>}
++      {!serious && <span className="pa-timer" style={{ animationDuration: `${MINOR_MS}ms` }} />}
++    </div>
++  )
++}
++
++/** Live camera tile with a status chip and a face guide. `issue`: current live finding label, if any. */
++export function CamTile({ video, camOn, issue, monitoring }) {
++  const state = !camOn ? 'off' : issue ? 'check' : monitoring ? 'ok' : 'idle'
++  const text = { off: 'Camera off', check: issue, ok: 'Monitoring', idle: 'Camera on' }[state]
++  return (
++    <div className={`cam-tile ${state}`}>
++      <div className="cam"><video ref={video} muted playsInline autoPlay aria-label="Your camera" />
++        {!camOn && <div className="ph"><Camera size={20} />Camera off</div>}
++        {camOn && <span className="cam-guide" aria-hidden><i /><i /><i /><i /></span>}
++      </div>
++      <div className="cam-chip" role="status">
++        {state === 'ok' ? <ShieldCheck size={14} /> : state === 'off' ? <CameraOff size={14} /> : state === 'check' ? <AlertTriangle size={14} /> : <Camera size={14} />}
++        <span>{text}</span>{state === 'ok' && <i className="live-dot" aria-hidden />}
++      </div>
++      {state === 'check' && <p className="cam-tip">Look at the screen and keep only your face in view.</p>}
++    </div>
++  )
++}
++
+diff --git a/frontend/src/pages/public/Landing.jsx b/frontend/src/pages/public/Landing.jsx
+index 6f01660..7c631b0 100644
+--- a/frontend/src/pages/public/Landing.jsx
++++ b/frontend/src/pages/public/Landing.jsx
+@@ -4,6 +4,7 @@ import { Camera, Code2, KeyRound, ShieldCheck, Webhook, Eye, Lock, Check } from
+ import { pub } from '../../lib/api'
+ import { money, limitText } from '../../lib/format'
+ import { Alert, Button, Input, Textarea } from '../../ui'
++import { ThemeToggle } from '../../lib/theme'
+ 
+ export function CodeEntry({ autoFocus }) {
+   const nav = useNavigate()
+@@ -67,7 +68,7 @@ export default function Landing() {
+     <div className="landing">
+       <header className="l-nav">
+         <span className="brand"><span className="mark"><ShieldCheck size={16} /></span>ProctorAI</span>
+-        <nav><a href="#features">Features</a><a href="#pricing">Pricing</a><a href="#demo">Book a demo</a><Link className="btn sm" to="/login">Sign in</Link></nav>
++        <nav><a href="#features">Features</a><a href="#pricing">Pricing</a><a href="#demo">Book a demo</a><ThemeToggle /><Link className="btn sm" to="/login">Sign in</Link></nav>
+       </header>
+ 
+       <section className="l-hero">
+diff --git a/frontend/src/styles/pages.css b/frontend/src/styles/pages.css
+index 322aecd..93c43b7 100644
+--- a/frontend/src/styles/pages.css
++++ b/frontend/src/styles/pages.css
+@@ -63,8 +63,11 @@
+ .coding-grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 16px; align-items: start; }
+ .coding-statement { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 16px; white-space: pre-wrap; max-height: 70vh; overflow: auto; }
+ .coding-editor { display: grid; gap: 10px; }
+-.code-area { width: 100%; min-height: 340px; font: 14px/1.5 var(--font-mono); tab-size: 4; background: var(--ink); color: #e6edf1; border: 1px solid var(--ink-line); border-radius: var(--radius); padding: 12px; resize: vertical; }
+-.code-area:focus { outline: none; box-shadow: var(--focus); }
++.code-frame { display: flex; background: var(--ink); border: 1px solid var(--ink-line); border-radius: var(--radius); overflow: hidden; }
++.code-frame:focus-within { box-shadow: var(--focus); }
++.gutter { margin: 0; flex: none; min-width: 46px; padding: 12px 10px 12px 12px; text-align: right; overflow: hidden; user-select: none; font: 14px/1.5 var(--font-mono); color: var(--ink-mute); border-right: 1px solid var(--ink-line); }
++.code-area { flex: 1; min-width: 0; min-height: 340px; font: 14px/1.5 var(--font-mono); tab-size: 4; background: transparent; color: #e6edf1; border: 0; padding: 12px; resize: vertical; white-space: pre; overflow: auto; }
++.code-area:focus { outline: none; }
+ .coding-result { border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; background: var(--surface); }
+ .sample { background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px; margin-top: 8px; font: 13px var(--font-mono); }
+ .case { display: flex; justify-content: space-between; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+@@ -117,3 +120,72 @@ pre.bad { background: var(--bad-soft); color: var(--bad); padding: 10px; border-
+ .l-nav .brand { color: var(--text); font: 600 18px var(--font-display); display: inline-flex; align-items: center; gap: 10px; }
+ .l-nav .brand .mark { width: 26px; height: 26px; border-radius: 6px; background: var(--accent); color: var(--on-accent); display: grid; place-items: center; }
+ .l-nav nav a:not(.btn) { text-decoration: none; }
++
++/* ---------- theme switch ---------- */
++.theme-toggle { display: inline-flex; padding: 2px; gap: 2px; border-radius: 999px; border: 1px solid var(--line-strong); background: var(--surface-2); }
++.theme-toggle button { width: 28px; height: 26px; border: 0; border-radius: 999px; background: none; color: var(--text-3); display: grid; place-items: center; cursor: pointer; }
++.theme-toggle button:hover { color: var(--text); }
++.theme-toggle button.on { background: var(--accent); color: var(--on-accent); }
++.theme-toggle button:focus-visible, .theme-float:focus-visible { outline: none; box-shadow: var(--focus); }
++.theme-toggle.on-dark { border-color: var(--ink-line); background: var(--ink-2); margin: 0 8px 10px; }
++.theme-toggle.on-dark button { color: var(--ink-mute); }
++.theme-toggle.on-dark button.on { color: var(--on-accent); }
++.theme-float { position: fixed; left: 14px; bottom: 14px; z-index: 60; width: 38px; height: 38px; border-radius: 50%; border: 1px solid var(--line-strong); background: var(--surface); color: var(--text-2); display: grid; place-items: center; cursor: pointer; box-shadow: 0 4px 14px rgba(18, 32, 43, 0.14); }
++.theme-float:hover { color: var(--text); border-color: var(--accent); }
++body.in-exam .theme-float { display: none; }
++.l-nav nav { display: flex; align-items: center; gap: 14px; }
++
++/* ---------- proctoring alerts ---------- */
++.pa-stack { position: fixed; z-index: 120; top: 72px; left: 50%; transform: translateX(-50%); width: min(460px, calc(100vw - 24px)); display: grid; gap: 10px; pointer-events: none; }
++.pa-card { position: relative; overflow: hidden; pointer-events: auto; display: flex; gap: 12px; padding: 14px 16px; border-radius: var(--radius-lg); background: var(--surface); color: var(--text); border: 1px solid var(--line-strong); box-shadow: var(--shadow-pop); animation: pa-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1); }
++.pa-card::before { content: ''; position: absolute; inset: 0 auto 0 0; width: 5px; background: var(--warn); }
++.pa-card.serious { border-color: var(--bad); }
++.pa-card.serious::before { background: var(--bad); }
++.pa-icon { flex: none; width: 38px; height: 38px; border-radius: 10px; display: grid; place-items: center; background: var(--warn-soft); color: var(--warn); }
++.pa-card.serious .pa-icon { background: var(--bad-soft); color: var(--bad); }
++.pa-body { min-width: 0; flex: 1; }
++.pa-body b { display: block; font-size: 15px; line-height: 1.3; }
++.pa-body p { margin: 2px 0 0; font-size: 13px; color: var(--text-2); }
++.pa-kicker { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--warn); margin-bottom: 2px; }
++.pa-card.serious .pa-kicker { color: var(--bad); }
++.pa-strikes { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 12.5px; color: var(--text-2); }
++.pa-strikes .pips { display: inline-flex; gap: 5px; }
++.pa-strikes i { width: 22px; height: 7px; border-radius: 4px; background: var(--neutral-soft); border: 1px solid var(--line-strong); }
++.pa-strikes i.used { background: var(--bad); border-color: var(--bad); }
++.pa-ack { margin-top: 12px; padding: 7px 14px; border-radius: var(--radius); border: 0; background: var(--bad); color: #fff; font-weight: 600; cursor: pointer; }
++.pa-ack:focus-visible, .pa-x:focus-visible { outline: none; box-shadow: var(--focus); }
++.pa-x { flex: none; align-self: flex-start; width: 26px; height: 26px; border: 0; background: none; color: var(--text-3); border-radius: 6px; cursor: pointer; display: grid; place-items: center; }
++.pa-x:hover { background: var(--neutral-soft); color: var(--text); }
++.pa-timer { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--warn); transform-origin: left; animation: pa-drain linear forwards; }
++@keyframes pa-in { from { opacity: 0; transform: translateY(-10px) scale(0.98); } to { opacity: 1; transform: none; } }
++@keyframes pa-drain { from { transform: scaleX(1); } to { transform: scaleX(0); } }
++@media (prefers-reduced-motion: reduce) { .pa-card { animation: none; } .pa-timer { animation: none; display: none; } .live-dot { animation: none !important; } }
++
++/* ---------- camera tile ---------- */
++.cam-tile .cam { border-width: 2px; transition: border-color 0.2s, box-shadow 0.2s; }
++.cam-tile.ok .cam { border-color: var(--ok); }
++.cam-tile.check .cam { border-color: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
++.cam-tile.off .cam { border-color: var(--bad); }
++.cam-guide { position: absolute; inset: 14%; pointer-events: none; opacity: 0.7; }
++.cam-guide i { position: absolute; width: 16px; height: 16px; border: 2px solid rgba(255, 255, 255, 0.85); }
++.cam-guide i:nth-child(1) { top: 0; left: 0; border-right: 0; border-bottom: 0; border-top-left-radius: 6px; }
++.cam-guide i:nth-child(2) { top: 0; right: 0; border-left: 0; border-bottom: 0; border-top-right-radius: 6px; }
++.cam-guide i:nth-child(3) { bottom: 0; left: 0; border-right: 0; border-top: 0; border-bottom-left-radius: 6px; }
++.cam-guide i:nth-child(4) { bottom: 0; right: 0; border-left: 0; border-top: 0; border-bottom-right-radius: 6px; }
++.cam-tile.check .cam-guide i { border-color: var(--warn); }
++.cam-chip { margin-top: 8px; display: flex; align-items: center; gap: 7px; padding: 6px 10px; border-radius: var(--radius); font-size: 12.5px; font-weight: 600; background: var(--neutral-soft); color: var(--text-2); }
++.cam-tile.ok .cam-chip { background: var(--ok-soft); color: var(--ok); }
++.cam-tile.check .cam-chip { background: var(--warn-soft); color: var(--warn); }
++.cam-tile.off .cam-chip { background: var(--bad-soft); color: var(--bad); }
++.cam-chip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.live-dot { margin-left: auto; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); animation: pa-pulse 1.8s ease-out infinite; }
++@keyframes pa-pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 55%, transparent); } 100% { box-shadow: 0 0 0 8px transparent; } }
++.cam-tip { margin: 6px 2px 0; font-size: 12px; color: var(--text-2); }
++
++/* ---------- code replay ---------- */
++.replay-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
++.replay-bar input[type='range'] { flex: 1 1 160px; accent-color: var(--accent); }
++.code-view { margin: 0; overflow: auto; max-height: 60vh; padding: 12px 0; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius); font: 13px/1.55 var(--font-mono); tab-size: 4; }
++.code-view span { display: block; padding: 0 14px 0 0; white-space: pre; }
++.code-view span i { display: inline-block; width: 44px; padding-right: 12px; text-align: right; color: var(--text-3); font-style: normal; user-select: none; }
++.code-view span.added { background: var(--ok-soft); box-shadow: inset 3px 0 0 var(--ok); }
+diff --git a/frontend/src/styles/report.css b/frontend/src/styles/report.css
+new file mode 100644
+index 0000000..2198917
+--- /dev/null
++++ b/frontend/src/styles/report.css
+@@ -0,0 +1,65 @@
++/* Printable attempt report. Always light so the PDF reads the same whatever theme the reviewer uses. */
++.rp-wrap { max-width: 900px; margin: 0 auto; }
++.rp-bar { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
++.report {
++  --text: #14212b; --text-2: #475662; --text-3: #6b7883; --line: #dde3e1; --surface: #fff; --surface-2: #f6f8f7; --neutral-soft: #e8ecea;
++  --ok: #0f766e; --ok-soft: #d9efec; --warn: #9a6a0a; --warn-soft: #f7ecd2; --bad: #b8400b; --bad-soft: #fae0d2; --accent: #0f766e;
++  background: #fff; color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 40px 44px; font-size: 13px; line-height: 1.5;
++}
++.report h1 { font: 700 26px var(--font-display); margin: 0; letter-spacing: -0.01em; }
++.report h2 { font: 700 13px var(--font-body); text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-2); margin: 28px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
++.report p { margin: 0; }
++.rp-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; padding-bottom: 18px; border-bottom: 3px solid var(--accent); }
++.rp-brand { display: flex; gap: 12px; align-items: center; }
++.rp-brand .mark { width: 38px; height: 38px; border-radius: 9px; background: var(--accent); color: #fff; display: grid; place-items: center; }
++.rp-brand b { display: block; font-size: 15px; } .rp-brand small { color: var(--text-3); font-size: 12px; }
++.rp-meta { display: flex; gap: 22px; margin: 0; text-align: right; }
++.rp-meta dt { font-size: 11px; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; } .rp-meta dd { margin: 0; font-weight: 600; }
++.rp-hero { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 22px 0 6px; flex-wrap: wrap; }
++.rp-hero p { color: var(--text-2); } .rp-test { font-weight: 600; color: var(--text) !important; margin-top: 4px !important; }
++.rp-verdict { padding: 10px 16px; border-radius: 10px; background: var(--neutral-soft); min-width: 200px; }
++.rp-verdict small { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); }
++.rp-verdict b { font-size: 14px; }
++.rp-verdict.cleared { background: var(--ok-soft); color: var(--ok); } .rp-verdict.suspicious { background: var(--warn-soft); color: var(--warn); } .rp-verdict.disqualified { background: var(--bad-soft); color: var(--bad); }
++.rp-callout { margin: 14px 0 0 !important; padding: 10px 14px; border-radius: 8px; } .rp-callout.bad { background: var(--bad-soft); color: var(--bad); }
++.rp-tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 18px; }
++.rp-tiles > div { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: var(--surface-2); }
++.rp-tiles span { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); }
++.rp-tiles b { display: block; font: 700 20px var(--font-display); margin: 2px 0; } .rp-tiles small { color: var(--text-3); font-size: 12px; }
++.report .ok { color: var(--ok); } .report .bad { color: var(--bad); }
++.rp-tiles b.risk-low { color: var(--ok); } .rp-tiles b.risk-medium { color: var(--warn); } .rp-tiles b.risk-high { color: var(--bad); }
++.rp-muted { color: var(--text-3); margin-top: 8px !important; }
++.rp-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
++.rp-chips span { display: inline-flex; gap: 8px; align-items: center; padding: 3px 10px; border-radius: 999px; background: var(--neutral-soft); font-weight: 500; }
++.rp-chips b { background: var(--text); color: #fff; border-radius: 999px; padding: 0 7px; font-size: 11.5px; }
++.rp-timeline { margin: 6px 0 14px; } .rp-timeline svg { width: 100%; height: auto; display: block; }
++.rp-timeline .axis { stroke: var(--line); stroke-width: 2; } .rp-timeline text { font-size: 10px; fill: var(--text-3); }
++.rp-timeline .stem { stroke-width: 1.5; } .rp-timeline .stem.s2, .rp-dot.s2 { stroke: var(--bad); fill: var(--bad); } .rp-timeline .stem.s1, .rp-dot.s1 { stroke: var(--warn); fill: var(--warn); }
++.rp-timeline figcaption { display: flex; gap: 16px; font-size: 11.5px; color: var(--text-3); } .rp-timeline figcaption i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; stroke: none; }
++.rp-table { width: 100%; border-collapse: collapse; }
++.rp-table th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-3); padding: 6px 8px; border-bottom: 1px solid var(--line); background: var(--surface-2); }
++.rp-table td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
++.rp-table .num { text-align: right; white-space: nowrap; } .rp-table .mono { font-family: var(--font-mono); white-space: nowrap; }
++.rp-table tr { break-inside: avoid; } .report .sub { color: var(--text-3); font-size: 12px; }
++.pill { display: inline-block; padding: 1px 9px; border-radius: 999px; font-weight: 600; font-size: 11.5px; background: var(--neutral-soft); }
++.pill.s2, .pill.sim-high { background: var(--bad-soft); color: var(--bad); } .pill.s1, .pill.sim-medium { background: var(--warn-soft); color: var(--warn); }
++.rp-evidence { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; } .rp-evidence figure { margin: 0; break-inside: avoid; }
++.rp-evidence img { width: 100% !important; height: auto !important; aspect-ratio: 4 / 3; object-fit: cover; border-radius: 6px; }
++.rp-evidence figcaption { display: flex; flex-direction: column; font-size: 11.5px; margin-top: 4px; } .rp-evidence figcaption span { color: var(--text-3); }
++.rp-kv { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 24px; margin: 0; } .rp-kv .wide { grid-column: 1 / -1; }
++.rp-kv dt { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-3); } .rp-kv dd { margin: 0; word-break: break-word; }
++.rp-decision blockquote { margin: 8px 0 0; padding: 8px 14px; border-left: 3px solid var(--accent); background: var(--surface-2); white-space: pre-wrap; }
++.rp-sign { display: flex; gap: 40px; margin-top: 34px; } .rp-sign span { flex: 1; border-top: 1px solid var(--text-3); padding-top: 4px; font-size: 11.5px; color: var(--text-3); } .rp-sign span:last-child { flex: 0 0 160px; }
++.rp-foot { margin-top: 30px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 11px; color: var(--text-3); }
++.rp-keep { break-inside: avoid; }
++@media (max-width: 700px) { .report { padding: 22px 16px; } .rp-tiles, .rp-evidence { grid-template-columns: 1fr 1fr; } .rp-head { flex-direction: column; } .rp-meta { text-align: left; } }
++
++@media print {
++  @page { size: A4; margin: 14mm 12mm; }
++  html, body { background: #fff !important; }
++  .side, .topbar, .no-print, .toasts, .theme-float, .scrim { display: none !important; }
++  .shell { display: block !important; } .main { padding: 0 !important; max-width: none !important; }
++  .report { border: 0; border-radius: 0; padding: 0; font-size: 11.5px; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
++  .rp-tiles > div, .rp-verdict, .pill, .rp-chips span, .rp-table th, .rp-callout, .rp-decision blockquote { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
++  .report h2 { break-after: avoid; }
++}
+-- 
+2.43.0
+

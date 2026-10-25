@@ -42,7 +42,21 @@ services:
         sync: false
       - key: SMTP_PASSWORD
         sync: false
-      - key: MAIL_FROM
+      - key: BREVO_API_KEY         # recommended on Render: SMTP is blocked on the free tier, Brevo/Resend use HTTPS
+        sync: false
+      - key: RESEND_API_KEY        # alternative to Brevo
+        sync: false
+      - key: MAIL_FROM             # must be a sender/domain verified with your mail provider
         value: ORVEXA <no-reply@yourdomain.com>
+      - key: STAFF_EMAIL_VERIFICATION      # admins must verify their e-mail before creating tests
+        value: "true"
+      - key: CANDIDATE_EMAIL_VERIFICATION  # candidates enter a 6-digit e-mailed code before joining
+        value: "true"
+      - key: CODE_RUNNER           # auto = Judge0 if JUDGE0_URL is set, otherwise the built-in runner
+        value: auto
+      - key: JUDGE0_URL            # optional: self-hosted Judge0 (recommended for high-stakes coding exams)
+        sync: false
+      - key: JUDGE0_EXTRA_HEADERS  # optional JSON, e.g. {"X-RapidAPI-Key":"...","X-RapidAPI-Host":"judge0-ce.p.rapidapi.com"}
+        sync: false
       - key: WEB_CONCURRENCY
         value: "1"

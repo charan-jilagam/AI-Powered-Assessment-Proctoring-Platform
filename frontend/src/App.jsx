@@ -1,5 +1,5 @@
 import { lazy, Suspense } from 'react'
-import { Route, Routes, useLocation } from 'react-router-dom'
+import { Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import { ThemeFloat } from './lib/theme'
 import { RequireRole } from './layouts/StaffLayout'
 import { Loading } from './ui'
@@ -11,6 +11,8 @@ const Forgot = L(() => import('./pages/public/Forgot'))
 const SetPassword = L(() => import('./pages/public/SetPassword'))
 const NotFound = L(() => import('./pages/public/NotFound'))
 const Account = L(() => import('./pages/public/Account'))
+const VerifyEmail = L(() => import('./pages/public/VerifyEmail'))
+const Guide = L(() => import('./pages/public/Guide'))
 
 const SuperOverview = L(() => import('./pages/super/Overview'))
 const Orgs = L(() => import('./pages/super/Orgs'))
@@ -40,13 +42,18 @@ const ExamRoom = L(() => import('./pages/candidate/ExamRoom'))
 
 export default function App() {
   const { pathname } = useLocation()
-  const staff = pathname.startsWith('/app') || pathname.startsWith('/super') || pathname === '/account' || pathname === '/'
+  const staff = pathname.startsWith('/app') || pathname.startsWith('/super') || pathname === '/account' || pathname === '/' || pathname.startsWith('/guide')
   return (
     <Suspense fallback={<Loading />}>
       {!staff && <ThemeFloat />}
       <Routes>
         <Route path="/" element={<Landing />} />
-        <Route path="/login" element={<Login />} />
+        {/* The bare site address and the old /login link both open the landing page; the sign-in form lives at /signin. */}
+        <Route path="/login" element={<Navigate to="/" replace />} />
+        <Route path="/signin" element={<Login />} />
+        <Route path="/verify-email" element={<VerifyEmail />} />
+        <Route path="/guide" element={<Guide />} />
+        <Route path="/guide/:role" element={<Guide />} />
         <Route path="/forgot-password" element={<Forgot />} />
         <Route path="/reset-password" element={<SetPassword mode="reset" />} />
         <Route path="/accept-invite" element={<SetPassword mode="invite" />} />

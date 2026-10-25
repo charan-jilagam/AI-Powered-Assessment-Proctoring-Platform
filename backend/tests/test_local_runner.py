@@ -100,3 +100,62 @@ def test_java_main_class():
 def test_node():
     code = "const [a,b]=require('fs').readFileSync(0,'utf8').trim().split(/\\s+/).map(Number);console.log(a+b)"
     assert judge0.judge(code, 63, CASES, 10.0, 256)["verdict"] == "Accepted"
+
+
+# ---------------------------------------------------------------- more languages (each runs only where its toolchain is installed)
+SUM_PROGRAMS = {
+    63: "const [a,b]=require('fs').readFileSync(0,'utf8').trim().split(/\\s+/).map(Number);console.log(a+b)",
+    74: "const [a, b]: number[] = require('fs').readFileSync(0, 'utf8').trim().split(/\\s+/).map(Number);\nconsole.log(a + b)",
+    60: 'package main\nimport "fmt"\nfunc main(){var a,b int;fmt.Scan(&a,&b);fmt.Println(a+b)}',
+    72: "a,b=gets.split.map(&:to_i);puts a+b",
+    68: "<?php fscanf(STDIN,'%d %d',$a,$b);echo $a+$b,\"\\n\";",
+    85: 'my ($a,$b)=split " ",<STDIN>;print $a+$b,"\\n";',
+    46: "read a b; echo $((a+b))",
+    50: '#include <stdio.h>\nint main(){int a,b;scanf("%d %d",&a,&b);printf("%d\\n",a+b);return 0;}',
+    54: '#include <iostream>\nint main(){int a,b;std::cin>>a>>b;std::cout<<a+b<<"\\n";}',
+    62: "import java.util.*;public class Main{public static void main(String[] x){Scanner s=new Scanner(System.in);System.out.println(s.nextInt()+s.nextInt());}}",
+}
+
+
+@pytest.mark.parametrize("lid", sorted(SUM_PROGRAMS))
+def test_each_installed_language_runs_and_judges(lid):
+    if lid not in local_runner.available_languages():
+        pytest.skip("toolchain not installed on this machine")
+    out = judge0.judge(SUM_PROGRAMS[lid], lid, CASES, 3.0, 256)
+    assert out["verdict"] == "Accepted", out
+    judged_wrong = judge0.judge(SUM_PROGRAMS[lid], lid, [{"input": "1 1\n", "expected": "3\n", "is_sample": True}], 3.0, 256)
+    assert judged_wrong["verdict"] == "Wrong Answer"
+
+
+def test_compile_error_is_reported_for_compiled_languages():
+    if 50 not in local_runner.available_languages():
+        pytest.skip("gcc not installed")
+    out = judge0.run_custom("int main( { return 0 }", 50, "", 2.0, 256)
+    assert out["verdict"] == "Compilation Error" and out["compile_output"]
+
+
+def test_unknown_language_is_an_internal_error_not_a_crash():
+    out = judge0.run_custom("x", 9999, "", 2.0, 256)
+    assert out["verdict"] == "Internal Error"
+
+
+def test_work_dirs_are_not_listable_and_are_cleaned_up():
+    import stat
+    judge0.run_custom("print(1)", PY, "", 2.0, 256)
+    assert not os.listdir(local_runner._RUN_ROOT)                      # nothing left behind
+    assert stat.S_IMODE(os.stat(local_runner._RUN_ROOT).st_mode) == 0o711   # traverse-only: names cannot be listed
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() != 0, reason="needs root to switch users")
+def test_candidate_code_runs_as_an_unprivileged_user_when_isolation_is_on(monkeypatch):
+    monkeypatch.setattr(local_runner, "RUNNER_UID", 10002)
+    monkeypatch.setattr(local_runner, "RUNNER_GID", 10002)
+    local_runner.isolation_active.cache_clear()
+    try:
+        assert local_runner.isolation_active() is True
+        code = f"import os\nprint(os.getuid())\ntry:\n    open('/proc/{os.getpid()}/environ','rb').read()\n    print('READ')\nexcept PermissionError:\n    print('denied')\n"
+        out = judge0.run_custom(code, PY, "", 2.0, 256)
+        assert out["stdout"].split() == ["10002", "denied"]
+        assert judge0.judge(SUM_PY, PY, CASES, 2.0, 256)["verdict"] == "Accepted"
+    finally:
+        local_runner.isolation_active.cache_clear()

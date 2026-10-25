@@ -30,7 +30,7 @@ export default function SetPassword({ mode }) {
   const ok = rules(pw).every(([, v]) => v) && pw === pw2
   async function submit(e) {
     e.preventDefault(); setBusy(true); setErr('')
-    try { await pub.post('/auth/reset-password', { token, new_password: pw }); nav('/login', { replace: true, state: { notice: 'Password saved. Sign in with your new password.' } }) }
+    try { await pub.post('/auth/reset-password', { token, new_password: pw }); nav('/signin', { replace: true, state: { notice: 'Password saved. Sign in with your new password.' } }) }
     catch (x) { setErr(x.message); setBusy(false) }
   }
   return (

@@ -202,6 +202,14 @@ require_org_staff = require_roles(ROLE_ADMIN, ROLE_REVIEWER)
 require_any_staff = require_roles(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_REVIEWER)
 
 
+def require_verified_admin(user: models.User = Depends(require_org_admin)) -> models.User:
+    """Org admin whose e-mail address has been verified. Needed to create tests, questions and coding problems."""
+    if settings.staff_email_verification and not user.email_verified_at:
+        raise ApiError(403, "Verify your e-mail address before creating tests. We sent you a link; you can request a new one from the banner at the top of the page.",
+                       "email_not_verified")
+    return user
+
+
 def get_current_org(user: models.User = Depends(require_org_staff), db: Session = Depends(get_db)) -> models.Organization:
     org = db.get(models.Organization, user.org_id)
     if org is None:

@@ -1,9 +1,11 @@
+import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { Plus } from 'lucide-react'
 import { fmtDateTime } from '../../lib/format'
 import { useAuth } from '../../lib/auth'
 import { useDocumentTitle, usePaged } from '../../lib/hooks'
-import { Badge, CodeTicket, Empty, Loading, PageHeader, Pager, Panel, SearchBox } from '../../ui'
+import { api } from '../../lib/api'
+import { Badge, Button, CodeTicket, Empty, Loading, PageHeader, Pager, Panel, SearchBox, useUI } from '../../ui'
 
 export default function Tests() {
   useDocumentTitle('Tests')
@@ -11,6 +13,12 @@ export default function Tests() {
   const nav = useNavigate()
   const list = usePaged('/tests', { q: '', status: '' })
   const isAdmin = user.role === 'admin'
+  const { toast, error } = useUI()
+  const [busy, setBusy] = useState(false)
+  async function loadSamples() {
+    setBusy(true)
+    try { const r = await api.post('/tests/samples'); toast(r.created?.length ? 'Trial tests added' : 'Trial tests are already there'); list.reload?.() } catch (e) { error(e) } finally { setBusy(false) }
+  }
   return (
     <>
       <PageHeader title="Tests" subtitle="Each test has its own code. Candidates enter the code to sign in.">{isAdmin && <Link className="btn primary" to="/app/tests/new"><Plus size={16} />New test</Link>}</PageHeader>
@@ -20,13 +28,13 @@ export default function Tests() {
       </div>
       <Panel flush>
         {list.loading && !list.data ? <Loading /> : !list.items.length ? (
-          <Empty title={list.filters.q || list.filters.status ? 'No tests match' : 'Create your first test'} action={isAdmin && !list.filters.q ? <Link className="btn primary" to="/app/tests/new">New test</Link> : null}>
+          <Empty title={list.filters.q || list.filters.status ? 'No tests match' : 'Create your first test'} action={isAdmin && !list.filters.q ? <span className="row"><Link className="btn primary" to="/app/tests/new">New test</Link><Button busy={busy} onClick={loadSamples}>Add the 2 trial tests</Button></span> : null}>
             {list.filters.q || list.filters.status ? 'Try a different search or status.' : 'Add questions, publish it, and share the generated code with candidates.'}</Empty>
         ) : (
           <div className="table-wrap"><table className="t"><thead><tr><th>Test</th><th>Code</th><th>Status</th><th className="num">Questions</th><th className="num">Minutes</th><th className="num">Attempts</th><th>Window</th></tr></thead><tbody>
             {list.items.map((t) => (
               <tr key={t.id} className="click" onClick={() => nav(`/app/tests/${t.id}`)}>
-                <td><Link className="name" to={`/app/tests/${t.id}`} onClick={(e) => e.stopPropagation()}>{t.title}</Link>{t.has_password && <span className="sub"> · password</span>}{t.access_mode === 'invite' && <span className="sub"> · invite only</span>}</td>
+                <td><Link className="name" to={`/app/tests/${t.id}`} onClick={(e) => e.stopPropagation()}>{t.title}</Link>{t.is_sample && <span className="badge info" style={{ marginLeft: 8 }}>Trial</span>}{t.has_password && <span className="sub"> · password</span>}{t.access_mode === 'invite' && <span className="sub"> · invite only</span>}</td>
                 <td onClick={(e) => e.stopPropagation()}><CodeTicket small code={t.code} display={t.code_display} /></td>
                 <td><Badge status={t.status} /></td>
                 <td className="num">{t.question_count}{t.coding_problem_count ? ` + ${t.coding_problem_count} coding` : ''}</td><td className="num">{t.duration_minutes}</td>

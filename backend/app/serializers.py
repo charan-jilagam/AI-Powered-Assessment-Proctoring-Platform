@@ -11,6 +11,7 @@ def user_out(u: models.User) -> Dict[str, Any]:
         "id": u.id, "full_name": u.full_name, "email": u.email, "role": u.role, "org_id": u.org_id,
         "is_active": u.is_active, "must_change_password": u.must_change_password,
         "last_login_at": u.last_login_at, "created_at": u.created_at,
+        "email_verified": bool(u.email_verified_at),
     }
 
 
@@ -23,6 +24,8 @@ def org_brief(org: Optional[models.Organization]) -> Optional[Dict[str, Any]]:
         "brand_color": org.brand_color, "logo_url": org.logo_url,
         "plan_code": org.plan.code if org.plan else None, "plan_name": org.plan.name if org.plan else None,
         "block_reason": org_block_reason(org),
+        "allowed_domains": list(org.allowed_domains or []),
+        "candidate_domain_lock": bool(org.candidate_domain_lock),
         "features": {k: bool(limits[k]) for k in ("ai_proctoring", "coding_enabled", "api_access", "webhooks_enabled")},
     }
 

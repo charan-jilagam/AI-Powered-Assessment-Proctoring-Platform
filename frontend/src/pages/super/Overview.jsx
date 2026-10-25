@@ -16,6 +16,7 @@ export default function Overview() {
         const mrr = Object.entries(d.mrr || {}).map(([c, v]) => money(v, c)).join(' + ') || money(0)
         return (
           <>
+            {d.mail && d.mail.verification_required && !d.mail.configured && <Alert tone="bad"><b>E-mail is not configured.</b> Verification links, invitations and candidate codes cannot be delivered. Set <code>BREVO_API_KEY</code>, <code>RESEND_API_KEY</code> or <code>SMTP_HOST</code> and <code>MAIL_FROM</code> on the server (see the deployment guide). Until then, mark staff as verified by hand on each organization page.</Alert>}
             {d.new_demo_requests > 0 && <Alert tone="info"><Link to="/super/leads">{d.new_demo_requests} new demo request{d.new_demo_requests > 1 ? 's' : ''}</Link> waiting for a reply.</Alert>}
             <Stats items={[
               { value: o.total, label: 'Organizations', sub: `${o.active} active · ${o.trial} on trial` },

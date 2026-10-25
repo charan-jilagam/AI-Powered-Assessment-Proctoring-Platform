@@ -4,7 +4,7 @@ import { Ban, KeyRound, Pause, Play, Plus } from 'lucide-react'
 import { api } from '../../lib/api'
 import { fmtDate, fmtDateTime, limitText, toLocalInput, fromLocalInput } from '../../lib/format'
 import { useDocumentTitle } from '../../lib/hooks'
-import { Alert, Async, Badge, Button, Input, Meter, Modal, PageHeader, Panel, Select, Textarea, useLoad, useUI } from '../../ui'
+import { Alert, Async, Badge, Button, Check_, Input, Meter, Modal, PageHeader, Panel, Select, Textarea, useLoad, useUI } from '../../ui'
 import { AddStaffModal, LinkModal } from '../../ui/staff'
 
 const LIMITS = [['max_admins', 'Team seats'], ['max_active_tests', 'Active tests'], ['max_candidates_per_month', 'Candidates per month'], ['evidence_retention_days', 'Evidence retention (days)']]
@@ -54,12 +54,19 @@ export default function OrgDetail() {
           </Panel>
         </div>
 
+        <Panel className="mt" title="E-mail domains" actions={<Button size="sm" onClick={() => setModal('domains')}>Edit</Button>}>
+          {o.allowed_domains?.length ? <div className="chips">{o.allowed_domains.map((d) => <span key={d} className="chip">@{d}</span>)}</div> : <p className="muted-2">No restriction: team members may use any e-mail address.</p>}
+          <p className="hint mt">{o.allowed_domains?.length ? `Admins and team members must use these domains (subdomains count). Candidates are ${o.candidate_domain_lock ? 'restricted to them as well' : 'not restricted unless the org admin turns the lock on'}.` : 'Add your client’s domains, for example sconexsoft.com, to keep accounts on company addresses.'}</p>
+        </Panel>
+
         <Panel className="mt" title="Staff" actions={<Button size="sm" icon={Plus} onClick={() => setModal('staff')}>Add admin</Button>} flush>
-          <div className="table-wrap"><table className="t"><thead><tr><th>Name</th><th>Role</th><th>Status</th><th>Last sign-in</th><th /></tr></thead>
+          <div className="table-wrap"><table className="t"><thead><tr><th>Name</th><th>Role</th><th>Status</th><th>E-mail</th><th>Last sign-in</th><th /></tr></thead>
             <tbody>{o.users.map((u) => (
               <tr key={u.id}><td><b>{u.full_name}</b><div className="sub">{u.email}</div></td><td><Badge status={u.role} tone="info" /></td>
-                <td>{u.is_active ? <Badge status="active" /> : <Badge status="suspended">Disabled</Badge>}</td><td className="muted">{fmtDateTime(u.last_login_at)}</td>
+                <td>{u.is_active ? <Badge status="active" /> : <Badge status="suspended">Disabled</Badge>}</td><td>{u.email_verified ? <Badge tone="ok">Verified</Badge> : <Badge tone="warn">Not verified</Badge>}</td><td className="muted">{fmtDateTime(u.last_login_at)}</td>
                 <td className="num nowrap">
+                  {!u.email_verified && <><Button size="sm" onClick={async () => { try { await api.post(`/superadmin/organizations/${id}/users/${u.id}/send-verification`); toast('Verification e-mail sent') } catch (e) { error(e) } }}>Send verification</Button>{' '}
+                  <Button size="sm" onClick={async () => { if (await confirm({ title: `Mark ${u.email} as verified?`, message: 'Only do this if you have confirmed the address another way. They will be able to create tests immediately.', confirmLabel: 'Mark verified' })) { try { await api.post(`/superadmin/organizations/${id}/users/${u.id}/verify-email`); toast('Marked as verified'); state.reload() } catch (e) { error(e) } } }}>Mark verified</Button>{' '}</>}
                   <Button size="sm" icon={KeyRound} onClick={async () => { try { const r = await api.post(`/superadmin/organizations/${id}/users/${u.id}/reset-link`); setModal({ link: r.reset_url, title: `Reset link for ${u.full_name}` }) } catch (e) { error(e) } }}>Reset link</Button>{' '}
                   <Button size="sm" onClick={async () => { try { await api.patch(`/superadmin/organizations/${id}/users/${u.id}`, { is_active: !u.is_active }); state.reload() } catch (e) { error(e) } }}>{u.is_active ? 'Disable' : 'Enable'}</Button>
                 </td></tr>))}</tbody></table></div>
@@ -73,6 +80,7 @@ export default function OrgDetail() {
         {modal === 'suspend' && <SuspendModal onClose={() => setModal(null)} onSave={(reason) => { patch({ status: 'suspended', suspended_reason: reason }, 'Suspended'); setModal(null) }} />}
         {modal === 'plan' && <PlanModal org={o} plans={plans.data || []} onClose={() => setModal(null)} onSave={(b) => { patch(b); setModal(null) }} />}
         {modal === 'limits' && <LimitsModal org={o} onClose={() => setModal(null)} onSave={(b) => { patch({ limits_override: b }, 'Limits updated'); setModal(null) }} />}
+        {modal === 'domains' && <DomainsModal org={o} onClose={() => setModal(null)} onSave={(b) => { patch(b, 'Domains saved'); setModal(null) }} />}
         {modal === 'notes' && <NotesModal org={o} onClose={() => setModal(null)} onSave={(v) => { patch({ internal_notes: v }); setModal(null) }} />}
         {modal === 'staff' && <AddStaffModal title={`Add a user to ${o.name}`} onClose={() => { setModal(null); state.reload() }} onSubmit={(b) => api.post(`/superadmin/organizations/${id}/admins`, b)} />}
         {modal?.link && <LinkModal title={modal.title} url={modal.link} onClose={() => setModal(null)} />}
@@ -116,5 +124,16 @@ function LimitsModal({ org, onClose, onSave }) {
     <p className="muted-2 mb">Leave a field empty to use the plan's value. Use -1 for unlimited.</p>
     <div className="grid c2">{LIMITS.map(([k, l]) => <Input key={k} label={l} type="number" min="-1" placeholder={`Plan: ${limitText(org.limits[k] ?? 0)}`} value={lim[k]} onChange={(e) => setLim({ ...lim, [k]: e.target.value })} />)}</div>
     <div className="grid c2">{FEATURES.map(([k, l]) => <Select key={k} label={l} value={feat[k] === null ? '' : String(feat[k])} onChange={(e) => setFeat({ ...feat, [k]: e.target.value === '' ? null : e.target.value === 'true' })}><option value="">Use plan ({org.limits[k] ? 'on' : 'off'})</option><option value="true">Always on</option><option value="false">Always off</option></Select>)}</div>
+  </Modal>
+}
+
+function DomainsModal({ org, onClose, onSave }) {
+  const [text, setText] = useState((org.allowed_domains || []).join(', '))
+  const [lock, setLock] = useState(!!org.candidate_domain_lock)
+  const list = text.split(/[\s,;]+/).map((d) => d.trim().replace(/^@/, '')).filter(Boolean)
+  return <Modal title="Allowed e-mail domains" onClose={onClose} footer={<><Button onClick={onClose}>Cancel</Button><Button variant="primary" onClick={() => onSave({ allowed_domains: list, candidate_domain_lock: list.length ? lock : false })}>Save</Button></>}>
+    <Input label="Domains" placeholder="sconexsoft.com, sconexsoft.in" value={text} onChange={(e) => setText(e.target.value)} hint="Comma separated, without @. Subdomains such as mail.sconexsoft.com are accepted too. Leave empty for no restriction." />
+    {list.length > 0 && <Check_ label="Also restrict candidates to these domains" checked={lock} onChange={(e) => setLock(e.target.checked)} />}
+    <Alert tone="info" className="mt">Existing users are not removed if their address is outside the list; the rule applies when new users are added.</Alert>
   </Modal>
 }

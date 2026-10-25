@@ -1,9 +1,13 @@
-"""E-mail: every message is stored in email_outbox; it is also sent over SMTP when SMTP_HOST is configured."""
+"""E-mail: every message is stored in email_outbox and also delivered by the configured transport:
+Brevo or Resend over HTTPS (BREVO_API_KEY / RESEND_API_KEY), or SMTP (SMTP_HOST). With none configured it is only stored."""
 import html
 import logging
 import smtplib
 from email.message import EmailMessage
+from email.utils import parseaddr
 from typing import List, Optional
+
+import httpx
 
 from app import models
 from app.background import after_commit
@@ -45,13 +49,48 @@ def queue_email(db, to_email: str, subject: str, body_html: str, org_id: Optiona
     """Record the e-mail inside the caller's transaction; it is sent once that transaction commits."""
     row = models.EmailOutbox(
         org_id=org_id, to_email=to_email, subject=subject[:255], body_html=body_html,
-        status="queued" if settings.smtp_host else "logged",
+        status="queued" if settings.mail_enabled else "logged",
     )
     db.add(row)
     db.flush()
-    if settings.smtp_host:
+    if settings.mail_enabled:
         after_commit(db, deliver, row.id)
     return row
+
+
+def _send_http(provider: str, to_email: str, subject: str, body_html: str) -> None:
+    """Deliver through a transactional-mail HTTPS API. Raises on any non-2xx answer."""
+    name, address = parseaddr(settings.mail_from)
+    if provider == "brevo":
+        response = httpx.post(
+            "https://api.brevo.com/v3/smtp/email", timeout=15,
+            headers={"api-key": settings.brevo_api_key, "accept": "application/json", "content-type": "application/json"},
+            json={"sender": {"name": name or "ORVEXA", "email": address}, "to": [{"email": to_email}],
+                  "subject": subject, "htmlContent": body_html},
+        )
+    else:  # resend
+        response = httpx.post(
+            "https://api.resend.com/emails", timeout=15,
+            headers={"Authorization": f"Bearer {settings.resend_api_key}"},
+            json={"from": settings.mail_from, "to": [to_email], "subject": subject, "html": body_html},
+        )
+    if response.status_code >= 300:
+        raise RuntimeError(f"{provider} answered {response.status_code}: {response.text[:200]}")
+
+
+def _send_smtp(to_email: str, subject: str, body_html: str) -> None:
+    msg = EmailMessage()
+    msg["From"] = settings.mail_from
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content("This message needs an HTML-capable mail client.")
+    msg.add_alternative(body_html, subtype="html")
+    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as smtp:
+        if settings.smtp_starttls:
+            smtp.starttls()
+        if settings.smtp_user:
+            smtp.login(settings.smtp_user, settings.smtp_password)
+        smtp.send_message(msg)
 
 
 def deliver(outbox_id: int) -> None:
@@ -62,22 +101,15 @@ def deliver(outbox_id: int) -> None:
         row = db.get(models.EmailOutbox, outbox_id)
         if row is None or row.status != "queued":
             return
-        msg = EmailMessage()
-        msg["From"] = settings.mail_from
-        msg["To"] = row.to_email
-        msg["Subject"] = row.subject
-        msg.set_content("This message needs an HTML-capable mail client.")
-        msg.add_alternative(row.body_html, subtype="html")
         try:
-            with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=15) as smtp:
-                if settings.smtp_starttls:
-                    smtp.starttls()
-                if settings.smtp_user:
-                    smtp.login(settings.smtp_user, settings.smtp_password)
-                smtp.send_message(msg)
+            provider = settings.mail_provider
+            if provider == "smtp":
+                _send_smtp(row.to_email, row.subject, row.body_html)
+            elif provider:
+                _send_http(provider, row.to_email, row.subject, row.body_html)
             row.status, row.sent_at, row.error = "sent", utcnow(), None
         except Exception as exc:  # noqa: BLE001 - record any transport failure
-            log.warning("SMTP delivery failed for outbox %s: %s", outbox_id, exc)
+            log.warning("mail delivery failed for outbox %s: %s", outbox_id, exc)
             row.status, row.error = "failed", str(exc)[:290]
         db.commit()
     finally:

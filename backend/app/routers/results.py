@@ -294,7 +294,7 @@ def attempt_report(attempt_id: int, user: models.User = Depends(auth.require_org
         "test": {"id": exam.id, "title": exam.title, "pass_percentage": exam.pass_percentage, "duration_minutes": exam.duration_minutes},
         "review": {"status": a.review_status, "note": a.review_note, "reviewer": reviewer.full_name if reviewer else None, "reviewed_at": a.reviewed_at},
         "questions": questions,
-        "coding": [{"id": s.id, "problem": p.title, "language": judge0.SUPPORTED_LANGUAGES.get(s.language_id, str(s.language_id)), "verdict": s.verdict,
+        "coding": [{"id": s.id, "problem": p.title, "language": judge0.language_name(s.language_id), "verdict": s.verdict,
                     "passed": s.passed, "total": s.total, "created_at": s.created_at, "source_code": s.source_code} for s, p in subs],
         "violations": [{"id": v.id, "code": v.code, "label": v.label, "severity": v.severity, "category": v.category, "details": v.details,
                         "status": v.status, "created_at": v.created_at, "snapshot_id": snap_by_violation.get(v.id)} for v in violations],

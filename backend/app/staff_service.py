@@ -1,6 +1,7 @@
 """Creating staff accounts (org admins, reviewers) and issuing the one-time links that activate them."""
 from datetime import timedelta
-from typing import Optional
+import re
+from typing import Iterable, List, Optional
 
 from app.mongo import func
 from app.mongo import Session
@@ -14,6 +15,45 @@ from app.timeutil import utcnow
 
 def normalize_email(email: str) -> str:
     return email.strip().lower()
+
+
+_DOMAIN_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+MAX_DOMAINS = 10
+
+
+def normalize_domains(raw: Optional[Iterable[str]]) -> List[str]:
+    """['@SconexSoft.com', 'sconexsoft.com ', 'mail.acme.io'] -> ['sconexsoft.com', 'mail.acme.io'] (validated, de-duplicated)."""
+    out: List[str] = []
+    for item in raw or []:
+        d = str(item).strip().lower().lstrip("@")
+        if not d:
+            continue
+        if not _DOMAIN_RE.match(d):
+            raise ApiError(400, f"'{item}' is not a valid e-mail domain. Use the part after the @, for example sconexsoft.com.", "bad_domain")
+        if d not in out:
+            out.append(d)
+    if len(out) > MAX_DOMAINS:
+        raise ApiError(400, f"At most {MAX_DOMAINS} domains per organization.", "too_many_domains")
+    return out
+
+
+def email_domain(email: str) -> str:
+    return normalize_email(email).rpartition("@")[2]
+
+
+def domain_allowed(domains: Optional[Iterable[str]], email: str) -> bool:
+    """True when the organization has no domain list, or the address is at one of its domains (sub-domains count)."""
+    allowed = [d for d in (domains or []) if d]
+    if not allowed:
+        return True
+    host = email_domain(email)
+    return any(host == d or host.endswith("." + d) for d in allowed)
+
+
+def ensure_staff_domain(org: models.Organization, email: str) -> None:
+    if not domain_allowed(org.allowed_domains, email):
+        raise ApiError(400, f"{email} is not at this organization's e-mail domain(s): {', '.join('@' + d for d in org.allowed_domains)}. "
+                            "Use a work address, or ask the platform owner to add the domain.", "email_domain_not_allowed")
 
 
 def find_staff_by_email(db: Session, email: str) -> Optional[models.User]:
@@ -44,6 +84,25 @@ def activation_url(raw_token: str, purpose: str) -> str:
     return f"{settings.frontend_url}/{page}?token={raw_token}"
 
 
+def verification_url(raw_token: str) -> str:
+    return f"{settings.frontend_url}/verify-email?token={raw_token}"
+
+
+def send_verification(db: Session, user: models.User, org: Optional[models.Organization] = None) -> str:
+    """E-mail the account owner a one-time link that proves the mailbox is theirs. Returns the link (caller commits)."""
+    raw = issue_token(db, user, "verify", hours=settings.verify_token_hours)
+    url = verification_url(raw)
+    mailer.queue_email(
+        db, user.email, "Verify your e-mail address",
+        mailer.render("Verify your e-mail address",
+                      [f"Hi {user.full_name},", "Please confirm that this is your e-mail address. Until you do, you can look around "
+                       "but cannot create tests.", f"The link works once and expires in {settings.verify_token_hours} hours."],
+                      cta_label="Verify my e-mail", cta_url=url, org_name=org.name if org else None, brand=org.brand_color if org else None),
+        org_id=user.org_id,
+    )
+    return url
+
+
 def create_staff(
     db: Session,
     *,
@@ -58,6 +117,7 @@ def create_staff(
     """Create an org staff user. Returns {"user", "invite_url", "temp_password"} (caller commits)."""
     if role not in ORG_STAFF_ROLES:
         raise ApiError(400, "Role must be admin or reviewer", "bad_role")
+    ensure_staff_domain(org, email)
     if find_staff_by_email(db, email):
         raise conflict("A staff account with this email already exists", "email_taken")
 
@@ -85,4 +145,6 @@ def create_staff(
             ),
             org_id=org.id,
         )
+    if settings.staff_email_verification:
+        send_verification(db, user, org)
     return result

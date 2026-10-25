@@ -19,7 +19,7 @@ Data is isolated per organization on every query; see `backend/tests/test_tenanc
 
 **Platform (super admin):** organizations with trial/active/suspended/cancelled status · plans (seats, active tests, candidates/month, AI proctoring, coding, API, webhooks, evidence retention) with per-org overrides · platform admins · demo-request leads · e-mail outbox · audit log · platform usage dashboard.
 
-**Test authoring (admin):** single / multiple / true-false / short-text questions · sections · negative marking · per-question marks and difficulty · shuffle questions and options · reusable question bank with tags · CSV import · built-in 36-question starter library (Python, JavaScript, SQL, DSA, CS fundamentals, aptitude) · coding problems (Judge0) with hidden test cases · duplicate test · publish/close/archive · regenerate code.
+**Test authoring (admin):** single / multiple / true-false / short-text questions · sections · negative marking · per-question marks and difficulty · shuffle questions and options · reusable question bank with tags · CSV import · built-in 36-question starter library (Python, JavaScript, SQL, DSA, CS fundamentals, aptitude) · coding problems with hidden test cases, added by hand **or imported from JSON** (format shown in the app) · 30+ languages (Judge0 or the built-in runner) · two ready-made trial tests per organization · e-mail verification for admins and candidates · per-organization allowed e-mail domains · in-app user guides at `/guide` · duplicate test · publish/close/archive · regenerate code.
 
 **Access control:** 8-character code and share link `/t/{code}` · optional access password · invite-only mode with per-candidate links · start/end window · max attempts · custom candidate fields · one live session per attempt (a second join ends the first).
 
@@ -57,7 +57,7 @@ cd frontend && npm install && npm run dev                       # http://localho
 ## Tests
 
 ```bash
-cd backend && pip install -r requirements-dev.txt && pytest -q     # 283 tests (MongoDB faked with mongomock)
+cd backend && pip install -r requirements-dev.txt && pytest -q     # 342 tests (MongoDB faked with mongomock)
 cd frontend && npm run lint && npm run build
 ```
 

@@ -3,16 +3,10 @@ import { Play, Send } from 'lucide-react'
 import { cand } from '../../lib/api'
 import { Alert, Badge, Button } from '../../ui'
 
-const TEMPLATES = {
-  71: 'import sys\n\n\ndef main():\n    data = sys.stdin.read().split()\n    # your code here\n\n\nmain()\n',
-  54: '#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n    ios::sync_with_stdio(false);\n    cin.tie(nullptr);\n    // your code here\n    return 0;\n}\n',
-  50: '#include <stdio.h>\n\nint main(void) {\n    // your code here\n    return 0;\n}\n',
-  62: 'import java.util.*;\n\npublic class Main {\n    public static void main(String[] args) {\n        Scanner sc = new Scanner(System.in);\n        // your code here\n    }\n}\n',
-  63: 'const lines = require("fs").readFileSync("/dev/stdin", "utf8").split("\\n");\n// your code here\n',
-}
+import { isStarter, starter } from './codeTemplates'
 
 export default function CodingPanel({ problems, attemptId }) {
-  const [langs, setLangs] = useState([{ id: 71, name: 'Python' }])
+  const [langs, setLangs] = useState([{ id: 71, name: 'Python', family: 'python' }])
   const [active, setActive] = useState(problems[0]?.id)
   const [drafts, setDrafts] = useState({})
   const [results, setResults] = useState({})
@@ -41,9 +35,11 @@ export default function CodingPanel({ problems, attemptId }) {
 
   const problem = problems.find((p) => p.id === active)
   if (!problem) return <p className="muted">No coding problems.</p>
-  const draft = drafts[active] || { lang: langs[0].id, code: TEMPLATES[langs[0].id] || '' }
+  const pyFirst = langs.find((l) => l.family === 'python') || langs[0]
+  const langOf = (id) => langs.find((l) => l.id === id)
+  const draft = drafts[active] || { lang: pyFirst.id, code: starter(pyFirst) }
   const update = (patch) => { const n = { ...draft, ...patch }; setDrafts((d) => ({ ...d, [active]: n })); store.current.set(key(active), n) }
-  const changeLang = (id) => update({ lang: id, code: !draft.code?.trim() || Object.values(TEMPLATES).includes(draft.code) ? TEMPLATES[id] || '' : draft.code })
+  const changeLang = (id) => update({ lang: id, code: !draft.code?.trim() || isStarter(draft.code) ? starter(langOf(id)) : draft.code })
   const res = results[active]
 
   async function go(kind) {
@@ -69,7 +65,7 @@ export default function CodingPanel({ problems, attemptId }) {
       set(code.slice(0, s) + '\n' + indent + extra + code.slice(s), s + 1 + indent.length + extra.length)
     }
   }
-  const text = draft.code ?? TEMPLATES[draft.lang] ?? ''
+  const text = draft.code ?? starter(langOf(draft.lang)) ?? ''
   const lines = text.split('\n').length
 
   return (

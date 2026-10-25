@@ -41,9 +41,11 @@ def usage_snapshot(db: Session, org: models.Organization) -> Dict[str, Any]:
     seats = db.query(func.count(models.User.id)).filter(
         models.User.org_id == org.id, models.User.role.in_([ROLE_ADMIN, ROLE_REVIEWER]), models.User.is_active.is_(True)
     ).scalar() or 0
-    active_tests = db.query(func.count(models.Exam.id)).filter(
-        models.Exam.org_id == org.id, models.Exam.status == EXAM_PUBLISHED
+    published = db.query(func.count(models.Exam.id)).filter(models.Exam.org_id == org.id, models.Exam.status == EXAM_PUBLISHED).scalar() or 0
+    published_samples = db.query(func.count(models.Exam.id)).filter(
+        models.Exam.org_id == org.id, models.Exam.status == EXAM_PUBLISHED, models.Exam.is_sample.is_(True)
     ).scalar() or 0
+    active_tests = max(0, published - published_samples)   # trial sample tests are free
     candidates_this_month = db.query(func.count(models.Attempt.id)).filter(
         models.Attempt.org_id == org.id, models.Attempt.started_at >= month_start(), models.Attempt.status != ATT_VOIDED
     ).scalar() or 0

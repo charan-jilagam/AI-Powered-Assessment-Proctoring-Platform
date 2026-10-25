@@ -64,6 +64,7 @@ def exam_summary(db: Session, exam: models.Exam) -> Dict[str, Any]:
         "question_count": q_count, "coding_problem_count": coding_count, "total_marks": float(marks),
         "attempts": counts, "attempts_total": sum(counts.values()),
         "created_at": exam.created_at, "published_at": exam.published_at,
+        "is_sample": bool(exam.is_sample),
     }
 
 

@@ -35,7 +35,7 @@ export function RequireRole({ role }) {
   const { status, user, notice } = useAuth()
   const loc = useLocation()
   if (status === 'loading') return <Loading />
-  if (status === 'anon') return <Navigate to="/login" state={{ from: loc.pathname + loc.search, notice }} replace />
+  if (status === 'anon') return <Navigate to="/signin" state={{ from: loc.pathname + loc.search, notice }} replace />
   if (role === 'super' && user.role !== 'super_admin') return <Navigate to="/app" replace />
   if (role === 'org' && user.role === 'super_admin') return <Navigate to="/super" replace />
   return <StaffLayout />
@@ -101,6 +101,34 @@ function Bell() {
   )
 }
 
+function VerifyBanner() {
+  const { user, refresh } = useAuth()
+  const [state, setState] = useState({ busy: false, msg: '', link: '', bad: false })
+  async function resend() {
+    setState({ busy: true, msg: '', link: '', bad: false })
+    try {
+      const r = await api.post('/auth/send-verification')
+      if (r.status === 'already_verified') { await refresh(); return }
+      setState({ busy: false, msg: `Verification link sent to ${user.email}. It stays valid for 48 hours.`, link: r.dev_link || '', bad: false })
+    } catch (e) { setState({ busy: false, msg: e.message, link: '', bad: true }) }
+  }
+  async function check() {
+    setState((s) => ({ ...s, busy: true }))
+    try { await refresh() } finally { setState((s) => ({ ...s, busy: false, msg: s.msg || 'Not verified yet. Open the link in your e-mail first.' })) }
+  }
+  return (
+    <Alert tone={state.bad ? 'bad' : 'warn'}>
+      <b>Verify your e-mail to create tests.</b> We sent a link to {user.email}. Until you open it you can look around but not create, import or publish tests.
+      <div className="row wrap" style={{ marginTop: 8, gap: 8 }}>
+        <Button size="sm" onClick={resend} busy={state.busy}>Resend verification e-mail</Button>
+        <Button size="sm" variant="ghost" onClick={check} disabled={state.busy}>I have verified</Button>
+      </div>
+      {state.msg && <div style={{ marginTop: 6 }}>{state.msg}</div>}
+      {state.link && <div style={{ marginTop: 6, wordBreak: 'break-all' }}>Dev link: <a href={state.link}>{state.link}</a></div>}
+    </Alert>
+  )
+}
+
 function StaffLayout() {
   const { user, org, logout } = useAuth()
   const [open, setOpen] = useState(false)
@@ -141,6 +169,7 @@ function StaffLayout() {
             {menu && (
               <div className="pop" role="menu" style={{ width: 220 }} onMouseLeave={() => setMenu(false)}>
                 <Link to="/account" onClick={() => setMenu(false)}><Settings size={16} />Account &amp; password</Link>
+                <Link to="/guide" target="_blank" onClick={() => setMenu(false)}><BookOpen size={16} />User guide</Link>
                 <button type="button" className="item" onClick={logout}><LogOut size={16} />Sign out</button>
               </div>
             )}
@@ -148,6 +177,7 @@ function StaffLayout() {
         </div>
         <main className="main">
           {!isSuper && org?.block_reason && <Alert tone="bad">{org.block_reason}</Alert>}
+          {user.role === 'admin' && user.email_verified === false && <VerifyBanner />}
           {user.must_change_password && loc.pathname !== '/account' && <Alert tone="warn">You are using a temporary password. <Link to="/account">Set your own password</Link>.</Alert>}
           <Outlet />
         </main>
