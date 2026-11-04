@@ -65,7 +65,7 @@ FACE_MODEL_URL = os.getenv(
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
 )
 YOLO_ASSET_URL = "https://github.com/ultralytics/assets/releases/download/v8.3.0/"
-_YOLO_STOCK_NAME = re.compile(r"^yolo(v8|11)[nsmlx]\.pt$")
+_YOLO_STOCK_NAME = re.compile(r"^yolo(v8|11)[nsmlx](-pose)?\.pt$")
 
 
 def _resolve_yolo_path() -> str:
@@ -80,6 +80,8 @@ def _resolve_yolo_path() -> str:
 
 
 YOLO_MODEL_PATH = _resolve_yolo_path()
+POSE_MODEL_PATH = os.getenv("YOLO_POSE_MODEL_PATH", os.path.join(_BACKEND_DIR, "yolov8n-pose.pt"))
+POSE_ENABLED = _env_bool("AI_POSE_DETECTION", True)         # body keypoints: hand-at-ear / hand-holding-something checks
 AUTODOWNLOAD = _env_bool("AI_MODEL_AUTODOWNLOAD", True)
 RETRY_AFTER_SECONDS = 300           # after a failed load, try again this much later instead of staying dead until restart
 
@@ -92,8 +94,20 @@ DETECT_IMGSZ = _env_int("AI_DETECT_IMGSZ", 640)
 TILE_IMGSZ = _env_int("AI_TILE_IMGSZ", 640)
 TILED_DETECTION = _env_bool("AI_TILED_DETECTION", True)
 MAX_ANALYSIS_SIDE = 1280            # larger frames are scaled down to this (cheap safety valve, keeps aspect ratio)
-YOLO_FLOOR_CONF = 0.20              # what the model returns; each class is then filtered by its own threshold below
-PHONE_CONFIDENCE = _env_float("AI_PHONE_CONFIDENCE", 0.30)
+YOLO_FLOOR_CONF = 0.10              # what the model returns; each class is then filtered by its own threshold (phones go down to PHONE_WEAK_CONFIDENCE)
+PHONE_CONFIDENCE = _env_float("AI_PHONE_CONFIDENCE", 0.25)
+# A phone that is mostly hidden (cupped in a hand, pressed to the ear, cut by the frame edge) never scores highly, so
+# weak sightings are accepted - but only where a phone is plausible: next to a hand or beside the head, or touching the
+# frame edge. A weak box floating elsewhere in the room is still ignored.
+PHONE_WEAK_CONFIDENCE = _env_float("AI_PHONE_WEAK_CONFIDENCE", 0.12)
+PHONE_EDGE_CONFIDENCE = 0.18        # a box touching the frame edge is a phone that is partly out of view
+ZOOM_PHONE_CONFIDENCE = _env_float("AI_PHONE_ZOOM_CONFIDENCE", 0.22)
+HAND_ZOOM = _env_bool("AI_HAND_ZOOM", True)    # re-inspect an enlarged crop around every hand and either side of the head
+ZOOM_IMGSZ = 416
+POSE_CONFIDENCE = 0.35
+KEYPOINT_CONFIDENCE = 0.30
+HAND_ZONE_HEADS = 1.25              # a hand zone reaches this many head-widths from the wrist
+EAR_REACH_HEADS = 0.95              # wrist this close to an ear (in head-widths) = hand raised to the ear
 PERSON_CONFIDENCE = _env_float("AI_PERSON_CONFIDENCE", 0.45)
 TILE_PERSON_CONFIDENCE = 0.65       # a person found ONLY on a tile must be more certain: zooming in also makes blurry
                                     # backgrounds look like people (measured 0.56 on a blurred crowd, 0.7+ on a real far person)
@@ -140,9 +154,11 @@ FLAT_FRAME_STD = 7.0                # a hand / paper / lens cap over the camera 
 
 _lock = threading.Lock()            # guards model loading and the (non thread-safe) MediaPipe task object
 _yolo_lock = threading.Lock()       # ultralytics predictors are not thread-safe either
+_pose_lock = threading.Lock()
 _state: Dict[str, Any] = {
     "loaded": False, "error": None, "landmarker": None, "yolo": None, "cv2": None, "np": None, "mp": None,
     "landmarker_error": None, "yolo_error": None, "yolo_classes": None, "attempted_at": None,
+    "pose": None, "pose_error": None,
 }
 
 Box = Tuple[float, float, float, float]   # x1, y1, x2, y2 as fractions of the frame (0..1)
@@ -196,6 +212,10 @@ def tile_windows(width: int, height: int, grid: Tuple[int, int] = TILE_GRID, ove
     return out
 
 
+def touches_edge(b: Box, margin: float = 0.008) -> bool:
+    return b[0] <= margin or b[1] <= margin or b[2] >= 1 - margin or b[3] >= 1 - margin
+
+
 def kind_of(name: str) -> str:
     return "phone" if name == PHONE_LABEL else "person" if name == PERSON_LABEL else "object"
 
@@ -211,12 +231,14 @@ def select_detections(raw: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if name == PERSON_LABEL:
             threshold, min_area = PERSON_CONFIDENCE, MIN_PERSON_AREA
         elif name == PHONE_LABEL:
-            threshold, min_area = PHONE_CONFIDENCE, MIN_PHONE_AREA
+            threshold, min_area = PHONE_WEAK_CONFIDENCE, MIN_PHONE_AREA
         elif name in PROHIBITED_OBJECTS:
             threshold, min_area = OBJECT_CONFIDENCE, MIN_OBJECT_AREA
         else:
             continue
         if d["conf"] >= threshold and _area(d["box"]) >= min_area:
+            if name == PHONE_LABEL and d["conf"] < PHONE_CONFIDENCE and not (d["conf"] >= PHONE_EDGE_CONFIDENCE and touches_edge(d["box"])):
+                d = dict(d, weak=True)      # kept only if it sits where a phone is plausible (see resolve_weak_phones)
             keep.append(d)
     return keep
 
@@ -230,7 +252,9 @@ def dedupe_detections(dets: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for group, limit in ((people, 0.65), (others, 0.5)):
         kept: List[Dict[str, Any]] = []
         for d in group:
-            if all(iou(d["box"], k["box"]) < limit for k in kept):
+            # a phone box lying mostly INSIDE a stronger phone box is a fragment of that phone (a tile or a zoom crop saw part of it)
+            fragment = d["name"] == PHONE_LABEL and any(k["name"] == PHONE_LABEL and covered_share(d["box"], k["box"]) >= 0.7 for k in kept)
+            if not fragment and all(iou(d["box"], k["box"]) < limit for k in kept):
                 kept.append(d)
         out.extend(kept)
     return out
@@ -269,14 +293,138 @@ def count_people(person_boxes: Sequence[Box], face_boxes: Sequence[Box]) -> int:
 
 def object_findings(dets: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
-    phones = [d for d in dets if d["name"] == PHONE_LABEL]
+    phones = [d for d in dets if d["name"] == PHONE_LABEL and not d.get("weak")]
     if phones:
         best = int(round(max(p["conf"] for p in phones) * 100))
         what = "Mobile phone" if len(phones) == 1 else f"{len(phones)} mobile phones"
-        out.append({"code": "PHONE_DETECTED", "detail": f"{what} detected (confidence {best}%)"})
+        hint = " - held in hand or partly hidden" if all(p.get("via") or p["conf"] < PHONE_CONFIDENCE for p in phones) else ""
+        out.append({"code": "PHONE_DETECTED", "detail": f"{what} detected (confidence {best}%){hint}"})
     names = sorted({d["name"] for d in dets if d["name"] in PROHIBITED_OBJECTS})
     if names:
         out.append({"code": "PROHIBITED_OBJECT", "detail": "; ".join(PROHIBITED_OBJECTS[n] for n in names)})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# body pose (pure): where the hands are, and whether one is raised to an ear
+# ---------------------------------------------------------------------------
+# A "person" here is {"box", "conf", "kp": [(x, y, confidence) x 17]} from the COCO pose model, x/y as frame fractions.
+KP_NOSE, KP_LEYE, KP_REYE, KP_LEAR, KP_REAR, KP_LSHO, KP_RSHO, KP_LWRI, KP_RWRI = 0, 1, 2, 3, 4, 5, 6, 9, 10
+
+
+def _kp(person: Dict[str, Any], index: int, aspect: float) -> Optional[Tuple[float, float]]:
+    """A keypoint in 'height units' (x scaled by the aspect ratio so distances are the same in both axes), or None."""
+    try:
+        x, y, c = person["kp"][index]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+    return (x * aspect, y) if c >= KEYPOINT_CONFIDENCE and 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0 else None
+
+
+def _dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def head_width(person: Dict[str, Any], aspect: float) -> Optional[float]:
+    """Head width in height units, from the ears, else the eyes, else the shoulders. None when none of those is visible."""
+    lear, rear = _kp(person, KP_LEAR, aspect), _kp(person, KP_REAR, aspect)
+    if lear and rear and _dist(lear, rear) > 0.01:
+        return _dist(lear, rear) * 1.1
+    leye, reye = _kp(person, KP_LEYE, aspect), _kp(person, KP_REYE, aspect)
+    if leye and reye and _dist(leye, reye) > 0.005:
+        return _dist(leye, reye) * 2.4
+    lsho, rsho = _kp(person, KP_LSHO, aspect), _kp(person, KP_RSHO, aspect)
+    if lsho and rsho and _dist(lsho, rsho) > 0.02:
+        return _dist(lsho, rsho) * 0.45
+    return None
+
+
+def hand_zones(people: Sequence[Dict[str, Any]], aspect: float) -> List[Dict[str, Any]]:
+    """A square (frame fractions) around every visible wrist: the place a hand-held phone must be."""
+    zones = []
+    for person in people:
+        head = head_width(person, aspect) or max(0.0, (person["box"][2] - person["box"][0]) * aspect * 0.3)
+        if head <= 0:
+            continue
+        for index in (KP_LWRI, KP_RWRI):
+            wrist = _kp(person, index, aspect)
+            if wrist is None:
+                continue
+            half = HAND_ZONE_HEADS * head
+            cx, cy = wrist[0] / aspect, wrist[1]
+            zones.append({"box": (max(0.0, cx - half / aspect), max(0.0, cy - half), min(1.0, cx + half / aspect), min(1.0, cy + half)),
+                          "kind": "hand", "wrist": (cx, cy)})
+    return zones
+
+
+def head_zones(faces: Sequence[Dict[str, Any]], aspect: float) -> List[Dict[str, Any]]:
+    """The face plus a full face-width either side: where a phone pressed to the ear or held beside the cheek appears."""
+    zones = []
+    for f in faces:
+        x1, y1, x2, y2 = f["box"]
+        w, h = x2 - x1, y2 - y1
+        zones.append({"box": (max(0.0, x1 - w), max(0.0, y1 - 0.25 * h), min(1.0, x2 + w), min(1.0, y2 + 0.5 * h)), "kind": "head"})
+    return zones
+
+
+def _faces_camera(person: Dict[str, Any], confident: float = 0.5) -> bool:
+    """Nose and at least one eye clearly seen: a person with their back to the camera has guessed face keypoints."""
+    try:
+        kp = person["kp"]
+        return kp[KP_NOSE][2] >= confident and max(kp[KP_LEYE][2], kp[KP_REYE][2]) >= confident
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
+def call_posture(person: Dict[str, Any], aspect: float) -> Optional[Dict[str, Any]]:
+    """Is one hand raised to an ear, the way a phone is held for a call? Returns {"wrist": (x, y), "distance": heads} or None.
+
+    Needs a visible wrist near an ear (or, when no ear is visible, the nose-to-cheek area on the same side) and the wrist at
+    roughly ear / mouth height - a hand on the keyboard, on the chin, or waving above the head does not qualify."""
+    head = head_width(person, aspect)
+    if not head or not _faces_camera(person):
+        return None
+    nose = _kp(person, KP_NOSE, aspect)
+    ears = [e for e in (_kp(person, KP_LEAR, aspect), _kp(person, KP_REAR, aspect)) if e]
+    best = None
+    for index in (KP_LWRI, KP_RWRI):
+        wrist = _kp(person, index, aspect)
+        if wrist is None:
+            continue
+        refs = ears or ([nose] if nose else [])
+        if not refs:
+            continue
+        reach = min(_dist(wrist, r) for r in refs) / head
+        limit = EAR_REACH_HEADS if ears else 0.8
+        level = nose[1] if nose else min(r[1] for r in refs)
+        at_head_height = level - 1.3 * head <= wrist[1] <= level + 0.9 * head
+        if reach <= limit and at_head_height and (best is None or reach < best["distance"]):
+            best = {"wrist": (wrist[0] / aspect, wrist[1]), "distance": round(reach, 2)}
+    return best
+
+
+def zoom_regions(zones: Sequence[Dict[str, Any]], min_side: float = 0.06) -> List[Box]:
+    """The boxes to re-inspect at higher magnification (de-duplicated, never smaller than `min_side`)."""
+    out: List[Box] = []
+    for z in zones:
+        b = z["box"]
+        if _area(b) <= 0 or any(iou(b, o) > 0.6 for o in out):
+            continue
+        out.append(b)
+    return [b for b in out if (b[2] - b[0]) >= min_side * 0.5 and (b[3] - b[1]) >= min_side * 0.5]
+
+
+def resolve_weak_phones(dets: Sequence[Dict[str, Any]], zones: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep a weak phone sighting only when it sits inside a hand or head zone; promote it to a normal sighting then.
+    Phones that were never weak are untouched, weak ones elsewhere are dropped."""
+    out = []
+    for d in dets:
+        if not d.get("weak"):
+            out.append(d)
+            continue
+        cx, cy = (d["box"][0] + d["box"][2]) / 2, (d["box"][1] + d["box"][3]) / 2
+        if any(z["box"][0] <= cx <= z["box"][2] and z["box"][1] <= cy <= z["box"][3] for z in zones):
+            out.append(dict({k: v for k, v in d.items() if k != "weak"}, via="context"))
     return out
 
 
@@ -375,11 +523,13 @@ def covered_reason(mean: float, std: float) -> Optional[str]:
     return None
 
 
-def build_findings(faces: Optional[Sequence[Dict[str, Any]]], dets: Optional[Sequence[Dict[str, Any]]], aspect: float = 1.0) -> Dict[str, Any]:
+def build_findings(faces: Optional[Sequence[Dict[str, Any]]], dets: Optional[Sequence[Dict[str, Any]]], aspect: float = 1.0,
+                   pose: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Fuse the face and object/person results of ONE frame into findings.
 
     `faces`: [{"landmarks", "box", "blend"?}] or None when face analysis did not run.
-    `dets`:  filtered detections or None when object detection did not run."""
+    `dets`:  filtered detections or None when object detection did not run.
+    `pose`:  body keypoints per person (see `call_posture`) or None when the pose model did not run."""
     findings: List[Dict[str, Any]] = []
     person_boxes = [d["box"] for d in dets if d["name"] == PERSON_LABEL] if dets is not None else None
     face_count = len(faces) if faces is not None else None
@@ -408,6 +558,19 @@ def build_findings(faces: Optional[Sequence[Dict[str, Any]]], dets: Optional[Seq
         findings.extend(interpret_landmarks(main["landmarks"], main.get("blend"), aspect))
     if dets:
         findings.extend(object_findings(dets))
+    if pose:
+        speaking = any(f["code"] == "LIP_MOVEMENT" for f in findings)
+        visible_phones = [d["box"] for d in (dets or []) if d["name"] == PHONE_LABEL and not d.get("weak")]
+        for person in pose:
+            posture = call_posture(person, aspect)
+            if posture is None:
+                continue
+            # a phone box already found next to that hand is reported as PHONE_DETECTED; do not report the same thing twice
+            if any(_center_inside(b, z["box"]) for z in hand_zones([person], aspect) for b in visible_phones):
+                continue
+            findings.append({"code": "PHONE_CALL_SUSPECTED", "speaking": speaking,
+                             "detail": "Hand held to the ear" + (" while speaking" if speaking else "") + " - possible phone call"})
+            break
     return {"findings": findings, "face_count": face_count or 0, "person_count": people or 0,
             "phone_count": sum(1 for d in (dets or []) if d["name"] == PHONE_LABEL)}
 
@@ -448,7 +611,10 @@ def _yolo_url(path: str) -> Optional[str]:
 def ensure_models() -> Dict[str, str]:
     """Download any missing model file. Used at image-build time; raises nothing, reports per model."""
     report = {}
-    for label, path, url in (("face", FACE_MODEL_PATH, FACE_MODEL_URL), ("yolo", YOLO_MODEL_PATH, _yolo_url(YOLO_MODEL_PATH))):
+    wanted = [("face", FACE_MODEL_PATH, FACE_MODEL_URL), ("yolo", YOLO_MODEL_PATH, _yolo_url(YOLO_MODEL_PATH))]
+    if POSE_ENABLED:
+        wanted.append(("pose", POSE_MODEL_PATH, _yolo_url(POSE_MODEL_PATH)))
+    for label, path, url in wanted:
         try:
             _ensure_file(path, url)
             report[label] = "ok"
@@ -486,12 +652,22 @@ def _load_yolo() -> None:
     _state.update(yolo=model, yolo_classes=classes)
 
 
+def _load_pose() -> None:
+    from ultralytics import YOLO
+
+    _ensure_file(POSE_MODEL_PATH, _yolo_url(POSE_MODEL_PATH))
+    model = YOLO(POSE_MODEL_PATH)
+    if getattr(model, "task", "pose") != "pose":
+        raise RuntimeError(f"{os.path.basename(POSE_MODEL_PATH)} is not a pose model")
+    _state["pose"] = model
+
+
 def _load() -> None:
     """Import and build the models once. A failure is remembered (and retried later), never repeated on every frame."""
     with _lock:
         if _state["loaded"]:
             return
-        _state.update(loaded=True, attempted_at=time.time(), error=None, landmarker_error=None, yolo_error=None)
+        _state.update(loaded=True, attempted_at=time.time(), error=None, landmarker_error=None, yolo_error=None, pose_error=None)
         try:
             import cv2
             import numpy as np
@@ -500,7 +676,8 @@ def _load() -> None:
             _state["error"] = str(exc)
             log.warning("AI proctoring unavailable: %s", exc)
             return
-        for key, loader in (("landmarker_error", _load_landmarker), ("yolo_error", _load_yolo)):
+        loaders = [("landmarker_error", _load_landmarker), ("yolo_error", _load_yolo)] + ([("pose_error", _load_pose)] if POSE_ENABLED else [])
+        for key, loader in loaders:
             try:
                 loader()
             except Exception as exc:  # noqa: BLE001 - missing lib, missing model, blocked download
@@ -540,6 +717,9 @@ def status() -> Dict[str, Any]:
         "face_error": _state["landmarker_error"],
         "object_error": _state["yolo_error"],
         "tiled_detection": TILED_DETECTION,
+        "pose_detection": _state["pose"] is not None,       # hand-at-ear / hand-held-phone checks; the rest works without it
+        "pose_error": _state["pose_error"],
+        "hand_zoom": HAND_ZOOM,
     }
 
 
@@ -602,20 +782,65 @@ def _predict(images, imgsz: int) -> List[List[Dict[str, Any]]]:
     return out
 
 
-def _detect_objects(img) -> List[Dict[str, Any]]:
-    """Phones, people and other prohibited objects anywhere in the frame (full-frame pass + tile pass)."""
+def _detect_pose(img) -> List[Dict[str, Any]]:
+    """Body keypoints of everyone in the frame: [{"box", "conf", "kp": [(x, y, c) x 17]}], all as frame fractions."""
+    model = _state["pose"]
+    with _pose_lock:
+        result = model.predict([img], imgsz=DETECT_IMGSZ, conf=POSE_CONFIDENCE, verbose=False)[0]
+    if result.keypoints is None or result.boxes is None:
+        return []
+    xy, kc = result.keypoints.xyn.tolist(), result.keypoints.conf
+    kc = kc.tolist() if kc is not None else [[1.0] * len(p) for p in xy]
+    return [{"box": tuple(float(v) for v in b), "conf": float(c), "kp": [(float(p[0]), float(p[1]), float(k)) for p, k in zip(pts, confs)]}
+            for b, c, pts, confs in zip(result.boxes.xyxyn.tolist(), result.boxes.conf.tolist(), xy, kc)]
+
+
+def _zoom_phones(img, regions: Sequence[Box]) -> List[Dict[str, Any]]:
+    """Look again at hands and the sides of the head, enlarged: a phone half-hidden by fingers is a handful of pixels in the
+    whole frame but fills the crop. Only phones are taken from here, with their own (low) confidence bar."""
     height, width = img.shape[:2]
-    full = select_detections(_predict([img], DETECT_IMGSZ)[0])
-    if not (TILED_DETECTION and width >= MIN_TILED_WIDTH):
-        return dedupe_detections(full)
-    windows = tile_windows(width, height)
-    tiled: List[Dict[str, Any]] = []
-    for (x1, y1, x2, y2), found in zip(windows, _predict([img[y1:y2, x1:x2] for x1, y1, x2, y2 in windows], TILE_IMGSZ)):
-        for d in select_detections(found):
+    crops, origins = [], []
+    for x1, y1, x2, y2 in regions:
+        px1, py1, px2, py2 = int(x1 * width), int(y1 * height), int(math.ceil(x2 * width)), int(math.ceil(y2 * height))
+        if px2 - px1 >= 24 and py2 - py1 >= 24:
+            crops.append(img[py1:py2, px1:px2])
+            origins.append((px1, py1, px2, py2))
+    if not crops:
+        return []
+    found: List[Dict[str, Any]] = []
+    for (px1, py1, px2, py2), dets in zip(origins, _predict(crops, ZOOM_IMGSZ)):
+        for d in dets:
+            if d["name"] != PHONE_LABEL or d["conf"] < ZOOM_PHONE_CONFIDENCE:
+                continue
             bx1, by1, bx2, by2 = d["box"]
-            d = dict(d, box=((x1 + bx1 * (x2 - x1)) / width, (y1 + by1 * (y2 - y1)) / height, (x1 + bx2 * (x2 - x1)) / width, (y1 + by2 * (y2 - y1)) / height))
-            tiled.append(d)
-    return merge_passes(full, tiled)
+            box = ((px1 + bx1 * (px2 - px1)) / width, (py1 + by1 * (py2 - py1)) / height, (px1 + bx2 * (px2 - px1)) / width, (py1 + by2 * (py2 - py1)) / height)
+            if _area(box) >= MIN_PHONE_AREA:
+                found.append(dict(d, box=box, via="zoom"))
+    return found
+
+
+def _detect_objects(img, pose: Optional[Sequence[Dict[str, Any]]] = None, faces: Optional[Sequence[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Phones, people and other prohibited objects anywhere in the frame (full-frame pass + tile pass), then a zoomed look
+    at every hand and the sides of every head. A weak phone sighting is kept only where a phone makes sense (in or next to a hand,
+    beside the head, or cut by the frame edge)."""
+    height, width = img.shape[:2]
+    aspect = width / height
+    full = select_detections(_predict([img], DETECT_IMGSZ)[0])
+    tiled: List[Dict[str, Any]] = []
+    if TILED_DETECTION and width >= MIN_TILED_WIDTH:
+        windows = tile_windows(width, height)
+        for (x1, y1, x2, y2), found in zip(windows, _predict([img[y1:y2, x1:x2] for x1, y1, x2, y2 in windows], TILE_IMGSZ)):
+            for d in select_detections(found):
+                bx1, by1, bx2, by2 = d["box"]
+                tiled.append(dict(d, box=((x1 + bx1 * (x2 - x1)) / width, (y1 + by1 * (y2 - y1)) / height,
+                                          (x1 + bx2 * (x2 - x1)) / width, (y1 + by2 * (y2 - y1)) / height)))
+    zones = hand_zones(pose or [], aspect) + head_zones(faces or [], aspect)
+    dets = merge_passes(full, tiled) if tiled else dedupe_detections(full)
+    dets = resolve_weak_phones(dets, zones)
+    if HAND_ZOOM and zones:
+        zoomed = _zoom_phones(img, zoom_regions(zones))
+        dets = dedupe_detections(dets + [z for z in zoomed if all(iou(z["box"], d["box"]) < 0.3 for d in dets if d["name"] == PHONE_LABEL)])
+    return dets
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +859,7 @@ def hud_boxes(dets: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _annotate(img, dets: Sequence[Dict[str, Any]], faces: Optional[Sequence[Dict[str, Any]]]) -> Optional[str]:
+def _annotate(img, dets: Sequence[Dict[str, Any]], faces: Optional[Sequence[Dict[str, Any]]], hands: Sequence[Tuple[float, float]] = ()) -> Optional[str]:
     """JPEG data URL of the frame with every detection boxed, so a reviewer sees exactly what the AI saw."""
     try:
         cv2 = _state["cv2"]
@@ -646,6 +871,9 @@ def _annotate(img, dets: Sequence[Dict[str, Any]], faces: Optional[Sequence[Dict
             cv2.rectangle(out, p1, p2, _COLORS[kind], 2 if kind != "face" else 1)
             if text:
                 cv2.putText(out, text, (p1[0], max(14, p1[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _COLORS[kind], 2, cv2.LINE_AA)
+        for hx, hy in hands:         # the hand the AI believes is raised to an ear
+            cv2.circle(out, (int(hx * width), int(hy * height)), max(14, width // 40), _COLORS["phone"], 3)
+            cv2.putText(out, "hand at ear", (int(hx * width) + 18, int(hy * height)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _COLORS["phone"], 2, cv2.LINE_AA)
         budget = int(settings.max_image_bytes * 0.9)
         for scale in (1.0, 0.75, 0.5):
             frame = out if scale == 1.0 else cv2.resize(out, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
@@ -696,18 +924,25 @@ def analyze_frame(data_url: str, *, detect_objects: bool = True) -> Dict[str, An
                 faces = _detect_faces(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
             except Exception as exc:  # noqa: BLE001 - one failing model must not blank the other
                 log.warning("face analysis failed: %s", exc)
+        pose: Optional[List[Dict[str, Any]]] = None
+        if detect_objects and _state["pose"] is not None:
+            try:
+                pose = _detect_pose(img)
+            except Exception as exc:  # noqa: BLE001 - pose is an extra; objects and faces must still be judged
+                log.warning("pose analysis failed: %s", exc)
         dets: Optional[List[Dict[str, Any]]] = None
         if detect_objects and _state["yolo"] is not None:
             try:
-                dets = _detect_objects(img)
+                dets = _detect_objects(img, pose, faces)
             except Exception as exc:  # noqa: BLE001
                 log.warning("object detection failed: %s", exc)
 
-        fused = build_findings(faces, dets, aspect=width / height)
+        fused = build_findings(faces, dets, aspect=width / height, pose=pose)
         result.update(face_count=fused["face_count"], person_count=fused["person_count"], phone_count=fused["phone_count"], findings=fused["findings"])
         result["boxes"] = hud_boxes(dets or [])
-        if any(f["code"] in ("PHONE_DETECTED", "PROHIBITED_OBJECT", "MULTIPLE_PERSONS", "MULTIPLE_FACES") for f in fused["findings"]):
-            result["evidence_image"] = _annotate(img, dets or [], faces)
+        if any(f["code"] in ("PHONE_DETECTED", "PHONE_CALL_SUSPECTED", "PROHIBITED_OBJECT", "MULTIPLE_PERSONS", "MULTIPLE_FACES") for f in fused["findings"]):
+            hands = [c["wrist"] for c in (call_posture(p, width / height) for p in pose or []) if c]
+            result["evidence_image"] = _annotate(img, dets or [], faces, hands)
     except Exception as exc:  # noqa: BLE001 - one bad frame must never break an exam
         log.warning("frame analysis failed: %s", exc)
         result["findings"] = []

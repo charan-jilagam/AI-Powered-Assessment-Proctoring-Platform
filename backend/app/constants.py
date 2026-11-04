@@ -86,6 +86,7 @@ VIOLATION_CATALOG = {
     "HEAD_TURNED":       (1, "ai", "Head turned away from screen", 2),
     "LIP_MOVEMENT":      (1, "ai", "Lip movement - possible speaking", 2),
     "PHONE_DETECTED":    (2, "ai", "Mobile phone detected in the camera view", 10),
+    "PHONE_CALL_SUSPECTED": (2, "ai", "Hand held to the ear - possible phone call", 6),
     "PROHIBITED_OBJECT": (2, "ai", "Prohibited object detected", 7),
     "CAMERA_COVERED":   (2, "ai", "Camera view is covered or too dark", 7),
     # session integrity (raised by the server itself)

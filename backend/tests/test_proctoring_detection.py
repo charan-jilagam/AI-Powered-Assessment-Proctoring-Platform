@@ -60,13 +60,15 @@ def test_phone_is_accepted_at_a_low_confidence_but_other_things_are_not():
     big = (0.2, 0.2, 0.3, 0.4)
     kept = P.select_detections([
         det("cell phone", 0.31, big),       # phones are small and half hidden by a hand: low bar
-        det("cell phone", 0.25, big),       # still too weak
+        det("cell phone", 0.20, big),       # weak: only kept where a hand or head is next to it (see resolve_weak_phones)
+        det("cell phone", 0.05, big),       # below even the weak bar
         det("person", 0.40, (0.1, 0.1, 0.6, 0.9)),   # a person needs more than that
         det("person", 0.46, (0.1, 0.1, 0.6, 0.9)),
         det("book", 0.45, big),
         det("book", 0.55, big),
     ])
-    assert [(d["name"], d["conf"]) for d in kept] == [("cell phone", 0.31), ("person", 0.46), ("book", 0.55)]
+    assert [(d["name"], d["conf"], bool(d.get("weak"))) for d in kept] == [
+        ("cell phone", 0.31, False), ("cell phone", 0.20, True), ("person", 0.46, False), ("book", 0.55, False)]
 
 
 def test_tiny_specks_and_irrelevant_classes_are_ignored():
@@ -360,7 +362,7 @@ def live(monkeypatch):
     monkeypatch.setitem(P._state, "yolo", object())
     box = {"faces": [face(MY_FACE)], "dets": [det("person", 0.9, ME)]}
     monkeypatch.setattr(P, "_detect_faces", lambda rgb: box["faces"])
-    monkeypatch.setattr(P, "_detect_objects", lambda img: box["dets"])
+    monkeypatch.setattr(P, "_detect_objects", lambda img, *a: box["dets"])
     return box
 
 
@@ -420,7 +422,7 @@ def test_without_the_face_model_phones_and_people_are_still_detected(live, scene
 
 def test_very_large_frames_are_scaled_down_but_never_cropped(live, scene, monkeypatch):
     seen = {}
-    monkeypatch.setattr(P, "_detect_objects", lambda img: seen.setdefault("shape", img.shape) and [])
+    monkeypatch.setattr(P, "_detect_objects", lambda img, *a: seen.setdefault("shape", img.shape) and [])
     big = cv2.resize(scene, (2560, 1440), interpolation=cv2.INTER_LINEAR)
     P.analyze_frame(data_url(big))
     h, w = seen["shape"][:2]
@@ -591,13 +593,15 @@ def test_only_stock_yolo_weights_are_auto_downloaded():
 
 def fresh_state():
     return {"loaded": False, "error": None, "landmarker": None, "yolo": None, "cv2": None, "np": None, "mp": None,
-            "landmarker_error": None, "yolo_error": None, "yolo_classes": None, "attempted_at": None}
+            "landmarker_error": None, "yolo_error": None, "yolo_classes": None, "attempted_at": None,
+            "pose": None, "pose_error": None}
 
 
 def test_one_model_failing_to_load_leaves_the_other_working(monkeypatch):
     monkeypatch.setattr(P, "_state", fresh_state())
     monkeypatch.setattr(P, "_load_landmarker", lambda: (_ for _ in ()).throw(RuntimeError("face model blocked")))
     monkeypatch.setattr(P, "_load_yolo", lambda: P._state.update(yolo=object()))
+    monkeypatch.setattr(P, "_load_pose", lambda: None)
     P._load()
     st = P.status()
     assert st["available"] is True and st["face_analysis"] is False and st["person_detection"] is True and "blocked" in st["face_error"]

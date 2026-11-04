@@ -37,7 +37,10 @@ STREAK_REQUIRED = {"NO_FACE": 2, "MULTIPLE_FACES": 2, "LOOKING_AWAY": 3, "HEAD_T
 # Object and person sightings FLICKER: a phone half hidden by a hand drops out of every other frame, a second person leans
 # in and out of view. Requiring them in consecutive frames lets exactly that behaviour slip through, so these codes are
 # confirmed by "N sightings within the last M frames" instead.
-WINDOW_RULES = {"PHONE_DETECTED": (2, 4), "PROHIBITED_OBJECT": (2, 4), "MULTIPLE_PERSONS": (2, 4), "MULTIPLE_FACES": (2, 4)}
+WINDOW_RULES = {"PHONE_DETECTED": (2, 4), "PROHIBITED_OBJECT": (2, 4), "MULTIPLE_PERSONS": (2, 4), "MULTIPLE_FACES": (2, 4),
+                # a hand at the ear is also what scratching or resting your head looks like, so on its own it must persist
+                # (4 of the last 6 frames); together with a moving mouth it is a phone call and needs only 2 of 4
+                "PHONE_CALL_SUSPECTED": (4, 6), "PHONE_CALL_SPEAKING": (2, 4)}
 
 
 def apply_exam_policy(findings, cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -54,6 +57,8 @@ def apply_exam_policy(findings, cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]
             continue
         if competitive and key == "NO_FACE" and f.get("body_visible"):
             key = "NO_FACE_BODY"
+        if key == "PHONE_CALL_SUSPECTED" and f.get("speaking"):
+            key = "PHONE_CALL_SPEAKING"
         present[key] = f
     return present
 
