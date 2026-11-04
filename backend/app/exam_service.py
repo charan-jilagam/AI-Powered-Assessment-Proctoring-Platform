@@ -65,6 +65,7 @@ def exam_summary(db: Session, exam: models.Exam) -> Dict[str, Any]:
         "attempts": counts, "attempts_total": sum(counts.values()),
         "created_at": exam.created_at, "published_at": exam.published_at,
         "is_sample": bool(exam.is_sample),
+        "question_sets": exam.question_sets or 1, "omr_enabled": bool(exam.omr_enabled), "calculator": exam.calculator or "off",
     }
 
 
@@ -77,6 +78,7 @@ def exam_detail(db: Session, exam: models.Exam) -> Dict[str, Any]:
         questions_per_attempt=exam.questions_per_attempt,
         shuffle_questions=exam.shuffle_questions,
         shuffle_options=exam.shuffle_options,
+        omr_institute=exam.omr_institute, omr_note=exam.omr_note,
         pass_percentage=exam.pass_percentage,
         result_visibility=exam.result_visibility,
         proctoring={**DEFAULT_PROCTORING, **(exam.proctoring or {})},
@@ -146,6 +148,7 @@ def duplicate_exam(db: Session, src: models.Exam, user: models.User) -> models.E
         instructions=src.instructions, code=new_code(db), status=EXAM_DRAFT, duration_minutes=src.duration_minutes,
         access_mode=src.access_mode, access_password_hash=src.access_password_hash, questions_per_attempt=src.questions_per_attempt,
         shuffle_questions=src.shuffle_questions, shuffle_options=src.shuffle_options, pass_percentage=src.pass_percentage,
+        question_sets=src.question_sets or 1, omr_enabled=bool(src.omr_enabled), calculator=src.calculator or "off", omr_institute=src.omr_institute, omr_note=src.omr_note,
         result_visibility=src.result_visibility, proctoring=dict(src.proctoring or {}), candidate_fields=list(src.candidate_fields or []),
     )
     db.add(copy)

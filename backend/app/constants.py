@@ -80,9 +80,12 @@ VIOLATION_CATALOG = {
     # AI vision
     "NO_FACE":           (2, "ai", "No face detected", 5),
     "MULTIPLE_FACES":    (2, "ai", "Multiple faces detected", 8),
+    "MULTIPLE_PERSONS":  (2, "ai", "Another person detected in the camera view", 8),
     "LOOKING_AWAY":      (1, "ai", "Candidate looking away from screen", 2),
+    "LOOKING_DOWN":      (1, "ai", "Candidate looking down (possible phone or notes)", 3),
     "HEAD_TURNED":       (1, "ai", "Head turned away from screen", 2),
     "LIP_MOVEMENT":      (1, "ai", "Lip movement - possible speaking", 2),
+    "PHONE_DETECTED":    (2, "ai", "Mobile phone detected in the camera view", 10),
     "PROHIBITED_OBJECT": (2, "ai", "Prohibited object detected", 7),
     "CAMERA_COVERED":   (2, "ai", "Camera view is covered or too dark", 7),
     # session integrity (raised by the server itself)
@@ -109,6 +112,7 @@ DEFAULT_PROCTORING = {
     "block_right_click": True,
     "auto_terminate": True,
     "ai_can_terminate": False,   # AI findings are for human review unless the org opts in
+    "competitive_exam": False,   # rough work on paper is expected: looking down is not flagged
     "max_level2_violations": 3,
     "snapshot_interval_seconds": 60,
     "analysis_interval_seconds": 3,

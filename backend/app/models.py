@@ -232,6 +232,11 @@ class Exam(Model):
     questions_per_attempt = Field()              # None = every question
     shuffle_questions = Field(default=True)
     shuffle_options = Field(default=True)
+    question_sets = Field(default=1)             # 1 = no sets; 2..6 = fixed papers Set A, B, C ... (same paper for everyone in a set)
+    calculator = Field(default="off")             # on-screen calculator for candidates: off | basic | scientific
+    omr_enabled = Field(default=False)           # candidates get a live OMR answer sheet next to the questions
+    omr_institute = Field()                      # name printed at the top of the OMR sheet (defaults to the organization)
+    omr_note = Field()                           # extra line under the institute name (address, exam centre ...)
     pass_percentage = Field(default=40.0)
     result_visibility = Field(default="score")
     proctoring = Field(factory=dict)
@@ -308,6 +313,7 @@ class Attempt(Model):
     answer_key = Field(factory=dict)             # NEVER sent to clients
     answers = Field(factory=dict)
     flagged = Field(factory=list)
+    paper_set = Field()                          # "A", "B" ... when the test uses fixed question sets
 
     score = Field()
     max_score = Field()

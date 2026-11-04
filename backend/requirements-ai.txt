@@ -1,5 +1,11 @@
-# Optional: server-side AI proctoring (face / gaze / lips / object detection).
+# Optional: server-side AI proctoring (face / gaze / head pose / object + person detection).
 # The platform runs without these; AI analysis is simply reported as "unavailable".
+#
+# Two models are used and are downloaded automatically (at image build with WITH_AI=true, or on first use):
+#   face_landmarker.task  MediaPipe face landmarks + blendshapes   (~4 MB)
+#   yolov8s.pt            YOLOv8 COCO weights: phones, people, books, laptops, screens (~22 MB; yolov8n.pt = ~6 MB, faster, weaker)
+# See docs/AI_PROCTORING.md. Tip for small images: install CPU-only PyTorch first, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 numpy>=1.26
 opencv-python-headless>=4.9
 mediapipe>=0.10

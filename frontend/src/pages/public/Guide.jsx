@@ -73,10 +73,10 @@ const GUIDES = {
         'Link expired or lost? Use **Resend verification e-mail** in the banner. Still stuck? Ask the platform owner to verify you manually.',
         'Your organization may only allow addresses from its own e-mail domains (for example `@yourcompany.com`). This applies to you and to every team member you add.',
       ] },
-      { title: 'Try the two trial tests', items: [
-        'Every new organization starts with **two ready-made trial tests**: “[Trial] General Aptitude & Tech Basics” (10 questions, all question types) and “[Trial] Coding Challenge” (3 questions and 2 coding problems).',
+      { title: 'Try the trial tests', items: [
+        'Every new organization starts with **three ready-made trial tests**: “[Trial] General Aptitude & Tech Basics” (10 questions, all question types), “[Trial] Aptitude Test with OMR (Sets A, B, C)” (40 MCQs with a live OMR sheet and three fixed sets) and “[Trial] Coding Challenge” (3 questions and 2 coding problems).',
         'Open **Tests**, copy a trial test’s code, and take it yourself in another browser window to see exactly what candidates see. Then open **Results** to see scoring and the proctoring report.',
-        'Trial tests are labelled **Trial**, are already published, and do not count against your plan’s active-test limit. Edit or delete them freely. Missing? Press **Add the 2 trial tests** on the Tests page.',
+        'Trial tests are labelled **Trial**, are already published, and do not count against your plan’s active-test limit. Edit or delete them freely. Missing? Press **Add trial tests** on the Tests page.',
       ] },
       { title: 'Create a test', steps: [
         'Go to **Tests → New test**. Enter a title, duration and passing score. A unique 8-character **test code** is created for you.',
@@ -89,6 +89,17 @@ const GUIDES = {
         '**From the question bank:** reuse questions you saved earlier, or the built-in starter library (Python, JavaScript, SQL, data structures, CS fundamentals, aptitude).',
         '**CSV import:** download the template on the Questions tab, fill it in, upload. It is all-or-nothing and tells you which rows to fix.',
         '**Questions per candidate** draws a random subset; **shuffle** mixes questions and options so neighbours see different orders.',
+        '**Question sets:** in **Settings → Questions** choose 2 to 6 sets (A, B, C ...). Each candidate is dealt one set, evenly, and everyone in a set gets the identical paper. Set A keeps your order; the others are fixed re-orderings inside each section.',
+      ] },
+      { title: 'Calculator and competitive exams', items: [
+        'In **Settings → Candidate tools** choose an on-screen **basic or scientific calculator**. Candidates get a draggable *Calculator* button in the exam room and cannot use anything else.',
+        'For competitive-style papers switch on **Settings → Proctoring → Competitive exam**: candidates may look down at rough work, so *looking down* is not flagged. Phones, other people, a covered camera and turning away are still flagged. Keep **Require webcam** and **AI face monitoring** on so the whole camera view is watched.',
+      ] },
+      { title: 'OMR answer sheets', items: [
+        'Turn on **Settings → OMR answer sheet** and candidates get an **OMR sheet** button in the exam room. The sheet shows your institute name, the candidate’s details, the test, the date and the set. Clicking an option or a bubble fills both, always in sync.',
+        'Candidates can download their own sheet as a PDF (also after submitting). Switch the toggle off and they see no OMR sheet.',
+        'On the test’s **Results** tab press **OMR sheets** to download every candidate’s sheet in one PDF, as a ZIP of single PDFs, or a **blank template** to print. Admins can also download **evaluated** copies that colour right and wrong answers and print the score. One sheet is also available on each candidate’s report.',
+        'Multi-answer questions are marked with `*`; true/false use T and F bubbles; short-answer questions are listed under “Written answers”. Names in non-Latin scripts print as `?` on the PDF.',
       ] },
       { title: 'Coding problems: by hand or from JSON', steps: [
         'Open the test’s **Coding** tab. Press **Add problem** to type one in: title, statement, input/output format, points, time and memory limits, and test cases.',

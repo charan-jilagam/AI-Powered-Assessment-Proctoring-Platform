@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react'
-import { AlertTriangle, AppWindow, Camera, CameraOff, ClipboardX, Expand, Keyboard, MousePointerClick, ScanFace, ShieldAlert, ShieldCheck, Users, Volume2, X } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { AlertTriangle, AppWindow, Camera, CameraOff, ClipboardX, Expand, Keyboard, MousePointerClick, ScanFace, ShieldAlert, ShieldCheck, Smartphone, Users, Volume2, X } from 'lucide-react'
 
 // What the candidate is told for each recorded event. The server decides severity; this is wording only.
 const INFO = {
@@ -16,7 +16,10 @@ const INFO = {
   AUDIO_VOICE: { icon: Volume2, title: 'Talking detected', advice: 'Please stay quiet during the test.' },
   NO_FACE: { icon: ScanFace, title: 'We cannot see your face', advice: 'Sit in front of the camera with your face fully visible.' },
   MULTIPLE_FACES: { icon: Users, title: 'More than one person in view', advice: 'You must be alone during the test.' },
+  MULTIPLE_PERSONS: { icon: Users, title: 'Another person is in the camera view', advice: 'You must be alone. Nobody else may be visible anywhere in the camera, even at the edge.' },
+  PHONE_DETECTED: { icon: Smartphone, title: 'Mobile phone in the camera view', advice: 'Put your phone away, out of the room or out of sight, for the rest of the test.' },
   LOOKING_AWAY: { icon: ScanFace, title: 'Looking away from the screen', advice: 'Keep your eyes on the screen.' },
+  LOOKING_DOWN: { icon: ScanFace, title: 'Looking down', advice: 'Keep your head and eyes facing the screen, not your lap or desk.' },
   HEAD_TURNED: { icon: ScanFace, title: 'Head turned away', advice: 'Face the screen.' },
   LIP_MOVEMENT: { icon: Volume2, title: 'Possible speaking detected', advice: 'Please do not speak during the test.' },
   PROHIBITED_OBJECT: { icon: ShieldAlert, title: 'Prohibited object in view', advice: 'Remove phones, books and other devices from view.' },
@@ -66,21 +69,34 @@ function AlertCard({ a, onDismiss }) {
   )
 }
 
-/** Live camera tile with a status chip and a face guide. `issue`: current live finding label, if any. */
-export function CamTile({ video, camOn, issue, monitoring }) {
+/** Live camera tile with a status chip. It shows the camera's ENTIRE view, uncropped, because the whole view is monitored.
+ *  `issue`: current live finding label, if any. `boxes`: what the AI currently sees, as fractions of the frame. */
+export function CamTile({ video, camOn, issue, monitoring, boxes = [] }) {
+  const [ratio, setRatio] = useState(16 / 9)   // follows the real camera, so the preview is never cropped or stretched
   const state = !camOn ? 'off' : issue ? 'check' : monitoring ? 'ok' : 'idle'
   const text = { off: 'Camera off', check: issue, ok: 'Monitoring', idle: 'Camera on' }[state]
+  const people = boxes.filter((b) => b.kind === 'person').length
+  // the candidate's own outline is noise; show people only when there is more than one
+  const shown = camOn ? boxes.filter((b) => b.kind !== 'person' || people > 1) : []
+  const sync = (e) => { const v = e.currentTarget; if (v.videoWidth && v.videoHeight) setRatio(v.videoWidth / v.videoHeight) }
   return (
     <div className={`cam-tile ${state}`}>
-      <div className="cam"><video ref={video} muted playsInline autoPlay aria-label="Your camera" />
+      <div className="cam" style={{ aspectRatio: ratio }}>
+        <video ref={video} muted playsInline autoPlay aria-label="Your camera" onLoadedMetadata={sync} onResize={sync} />
         {!camOn && <div className="ph"><Camera size={20} />Camera off</div>}
         {camOn && <span className="cam-guide" aria-hidden><i /><i /><i /><i /></span>}
+        {shown.map((b, i) => (
+          // the preview is mirrored, so mirror the box too
+          <span key={i} className={`cam-box ${b.kind}${b.y < 0.07 ? ' edge' : ''}`} style={{ left: `${(1 - b.x - b.w) * 100}%`, top: `${b.y * 100}%`, width: `${b.w * 100}%`, height: `${b.h * 100}%` }}><em>{b.label}</em></span>
+        ))}
       </div>
       <div className="cam-chip" role="status">
         {state === 'ok' ? <ShieldCheck size={14} /> : state === 'off' ? <CameraOff size={14} /> : state === 'check' ? <AlertTriangle size={14} /> : <Camera size={14} />}
         <span>{text}</span>{state === 'ok' && <i className="live-dot" aria-hidden />}
       </div>
-      {state === 'check' && <p className="cam-tip">Look at the screen and keep only your face in view.</p>}
+      {state === 'check'
+        ? <p className="cam-tip">The whole camera view is monitored. Look at the screen, and keep phones, notes and other people out of view.</p>
+        : camOn && <p className="cam-tip">Everything this camera can see is monitored, including the edges.</p>}
     </div>
   )
 }

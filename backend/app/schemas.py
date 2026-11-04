@@ -62,6 +62,7 @@ class ProctoringConfig(BaseModel):
     block_right_click: bool = DEFAULT_PROCTORING["block_right_click"]
     auto_terminate: bool = DEFAULT_PROCTORING["auto_terminate"]
     ai_can_terminate: bool = DEFAULT_PROCTORING["ai_can_terminate"]
+    competitive_exam: bool = DEFAULT_PROCTORING["competitive_exam"]
     max_level2_violations: int = Field(DEFAULT_PROCTORING["max_level2_violations"], ge=1, le=20)
     snapshot_interval_seconds: int = Field(DEFAULT_PROCTORING["snapshot_interval_seconds"], ge=0, le=600)
     analysis_interval_seconds: int = Field(DEFAULT_PROCTORING["analysis_interval_seconds"], ge=2, le=30)
@@ -136,6 +137,11 @@ class ExamIn(BaseModel):
     questions_per_attempt: Optional[int] = Field(default=None, ge=1)
     shuffle_questions: bool = True
     shuffle_options: bool = True
+    question_sets: int = Field(default=1, ge=1, le=6)
+    omr_enabled: bool = False
+    calculator: Literal["off", "basic", "scientific"] = "off"
+    omr_institute: Optional[str] = Field(default=None, max_length=160)
+    omr_note: Optional[str] = Field(default=None, max_length=300)
     pass_percentage: float = Field(default=40.0, ge=0, le=100)
     result_visibility: Literal["none", "score", "full"] = "score"
     proctoring: ProctoringConfig = ProctoringConfig()
@@ -157,6 +163,11 @@ class ExamPatch(BaseModel):
     questions_per_attempt: Optional[int] = Field(default=None, ge=0)       # 0 clears it (= all questions)
     shuffle_questions: Optional[bool] = None
     shuffle_options: Optional[bool] = None
+    question_sets: Optional[int] = Field(default=None, ge=1, le=6)
+    omr_enabled: Optional[bool] = None
+    calculator: Optional[Literal["off", "basic", "scientific"]] = None
+    omr_institute: Optional[str] = Field(default=None, max_length=160)
+    omr_note: Optional[str] = Field(default=None, max_length=300)
     pass_percentage: Optional[float] = Field(default=None, ge=0, le=100)
     result_visibility: Optional[Literal["none", "score", "full"]] = None
     proctoring: Optional[ProctoringConfig] = None

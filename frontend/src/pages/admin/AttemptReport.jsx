@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { Check, Clock, FileText, MessageSquare, Power, RotateCcw, X } from 'lucide-react'
+import { Check, Clock, FileText, Grid3x3, MessageSquare, Power, RotateCcw, X } from 'lucide-react'
 import { api } from '../../lib/api'
 import { duration, fmtDateTime, num, pct, toDate } from '../../lib/format'
 import { useDocumentTitle } from '../../lib/hooks'
@@ -44,6 +44,8 @@ export default function AttemptReport() {
           <PageHeader title={a.candidate.name} crumbs={[{ label: 'Tests', to: '/app/tests' }, { label: a.test.title, to: `/app/tests/${a.test.id}/results` }, { label: a.candidate.name }]} subtitle={`${a.candidate.email}${a.attempt_no > 1 ? ` · attempt ${a.attempt_no}` : ''}`}>
             <Badge status={a.status} dot />{a.final_result && <Badge status={a.final_result} />}
             <Button icon={FileText} onClick={() => nav(`/app/attempts/${id}/report`)}>Download report</Button>
+            {a.questions?.length > 0 && <Button icon={Grid3x3} onClick={() => api.download(`/attempts/${id}/omr.pdf?tz=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`, `OMR-${a.candidate.name.replace(/[^\w]+/g, '-')}.pdf`).catch(error)}>OMR sheet</Button>}
+            {a.can_void && a.questions?.length > 0 && <Button icon={Grid3x3} onClick={() => api.download(`/attempts/${id}/omr.pdf?evaluated=true&tz=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`, `OMR-evaluated-${a.candidate.name.replace(/[^\w]+/g, '-')}.pdf`).catch(error)}>Evaluated OMR</Button>}
             {live && <><Button icon={MessageSquare} onClick={() => setDlg('message')}>Message</Button><Button icon={Clock} onClick={() => setDlg('extend')}>Add time</Button><Button variant="danger" icon={Power} onClick={() => setDlg('terminate')}>End attempt</Button></>}
             {a.can_void && a.status !== 'voided' && <Button icon={RotateCcw} onClick={async () => { if (await confirm({ title: 'Allow a retake?', message: 'This attempt is hidden from results and kept in the audit trail. The candidate can join again with the same code and e-mail.', confirmLabel: 'Allow retake', danger: true })) run(async () => { await api.post(`/attempts/${id}/void`); nav(`/app/tests/${a.test.id}/results`) }, 'Attempt voided') }}>Allow retake</Button>}
           </PageHeader>

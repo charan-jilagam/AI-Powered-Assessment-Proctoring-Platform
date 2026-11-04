@@ -34,6 +34,10 @@ WORKDIR /app
 COPY backend/requirements.txt backend/requirements-ai.txt ./
 RUN pip install -r requirements.txt && if [ "$WITH_AI" = "true" ]; then pip install -r requirements-ai.txt; fi
 COPY backend/ ./
+# Fetch the AI model files now, not while the first candidate waits (the app also downloads any missing file on first use).
+# APP_ENV is overridden for THIS command only: the app refuses to load its settings in production without real secrets.
+RUN if [ "$WITH_AI" = "true" ]; then APP_ENV=development MONGODB_URI=mongodb://build.invalid python -m app.proctoring download-models \
+    || echo "WARNING: could not download the AI models at build time; they will be downloaded on first use"; fi
 COPY --from=web /web/dist /app/static
 # The server runs as root ON PURPOSE: candidate code is executed by switching to the unprivileged user RUNNER_UID
 # (with no capabilities), so it cannot read the server's environment/secrets, /data, or other candidates' files.

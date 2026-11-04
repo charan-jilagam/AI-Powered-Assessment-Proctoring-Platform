@@ -1,0 +1,2038 @@
+diff --git a/Dockerfile b/Dockerfile
+index 165aaa2..e1b760a 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -34,6 +34,10 @@ WORKDIR /app
+ COPY backend/requirements.txt backend/requirements-ai.txt ./
+ RUN pip install -r requirements.txt && if [ "$WITH_AI" = "true" ]; then pip install -r requirements-ai.txt; fi
+ COPY backend/ ./
++# Fetch the AI model files now, not while the first candidate waits (the app also downloads any missing file on first use).
++# APP_ENV is overridden for THIS command only: the app refuses to load its settings in production without real secrets.
++RUN if [ "$WITH_AI" = "true" ]; then APP_ENV=development MONGODB_URI=mongodb://build.invalid python -m app.proctoring download-models \
++    || echo "WARNING: could not download the AI models at build time; they will be downloaded on first use"; fi
+ COPY --from=web /web/dist /app/static
+ # The server runs as root ON PURPOSE: candidate code is executed by switching to the unprivileged user RUNNER_UID
+ # (with no capabilities), so it cannot read the server's environment/secrets, /data, or other candidates' files.
+diff --git a/backend/app/constants.py b/backend/app/constants.py
+index 2872f76..606d487 100644
+--- a/backend/app/constants.py
++++ b/backend/app/constants.py
+@@ -80,9 +80,12 @@ VIOLATION_CATALOG = {
+     # AI vision
+     "NO_FACE":           (2, "ai", "No face detected", 5),
+     "MULTIPLE_FACES":    (2, "ai", "Multiple faces detected", 8),
++    "MULTIPLE_PERSONS":  (2, "ai", "Another person detected in the camera view", 8),
+     "LOOKING_AWAY":      (1, "ai", "Candidate looking away from screen", 2),
++    "LOOKING_DOWN":      (1, "ai", "Candidate looking down (possible phone or notes)", 3),
+     "HEAD_TURNED":       (1, "ai", "Head turned away from screen", 2),
+     "LIP_MOVEMENT":      (1, "ai", "Lip movement - possible speaking", 2),
++    "PHONE_DETECTED":    (2, "ai", "Mobile phone detected in the camera view", 10),
+     "PROHIBITED_OBJECT": (2, "ai", "Prohibited object detected", 7),
+     "CAMERA_COVERED":   (2, "ai", "Camera view is covered or too dark", 7),
+     # session integrity (raised by the server itself)
+diff --git a/backend/app/main.py b/backend/app/main.py
+index f4600d3..b6bace0 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -64,6 +64,8 @@ async def lifespan(_: FastAPI):
+         log.exception("startup seeding failed (is MongoDB reachable?)")
+     finally:
+         db.close()
++    if settings.env != "test":
++        proctoring.warm_up_async()   # load / download the AI models now, not while the first candidate waits
+     task = asyncio.create_task(_sweeper()) if settings.run_sweeper else None
+     yield
+     if task:
+@@ -174,7 +176,10 @@ def ready():
+         db_ok = False
+     ai = proctoring._state
+     body = {"status": "healthy" if db_ok else "degraded", "database": "connected" if db_ok else "unreachable", "version": VERSION,
+-            "ai_proctoring": {"enabled": settings.ai_proctoring_enabled, "loaded": ai["loaded"] and ai["error"] is None, "error": ai["error"]},
++            "ai_proctoring": {"enabled": settings.ai_proctoring_enabled, "loaded": ai["loaded"] and ai["error"] is None, "error": ai["error"],
++                              # per model, read from state only: a health check must never trigger (or wait for) a model load
++                              "face_model": ai["landmarker"] is not None, "object_model": ai["yolo"] is not None,
++                              "face_error": ai["landmarker_error"], "object_error": ai["yolo_error"]},
+             "mail": {"provider": settings.mail_provider or None, "configured": settings.mail_enabled},
+             "code_runner": {"engine": judge0.CODE_RUNNER, "languages": len(judge0.get_languages()) if judge0.CODE_RUNNER == "local" else None,
+                             "isolated": local_runner.isolation_active() if judge0.CODE_RUNNER == "local" else None}}
+diff --git a/backend/app/proctoring.py b/backend/app/proctoring.py
+index 2960617..d48d446 100644
+--- a/backend/app/proctoring.py
++++ b/backend/app/proctoring.py
+@@ -1,58 +1,320 @@
+-"""Server-side AI proctoring: face presence, multiple faces, gaze, head pose, lip movement, prohibited objects.
++"""Server-side AI proctoring over the WHOLE camera frame.
+ 
+-Heavy libraries (OpenCV, MediaPipe, YOLO) are imported lazily on the first frame, never at import time, so the
+-API starts fast, tests run without them, and a deployment without the AI extras degrades to "AI unavailable"
+-instead of crashing. The decision logic (`interpret_landmarks`) is pure and unit-tested; the model plumbing is thin.
++What it looks at (nothing is cropped or masked - every pixel of the frame is analysed):
++  * mobile phones and other prohibited objects  - YOLO on the full frame, plus an overlapping tile pass so a phone
++    that is only a few dozen pixels wide (held low, on the desk, partly hidden by a hand) is still found
++  * people                                      - YOLO `person` boxes fused with MediaPipe face landmarks (faces are
++    searched on the full frame and on tiles), so someone standing behind the candidate, sitting at the edge of the
++    frame, turned away or only partly visible is counted, not just a second frontal face
++  * face presence, gaze, head turn / head down, speaking - MediaPipe face landmarks and blendshapes
++  * blocked or dark camera
++
++Heavy libraries (OpenCV, MediaPipe, YOLO) are imported lazily on the first frame, never at import time, so the API
++starts fast, tests run without them, and a deployment without the AI extras degrades to "AI unavailable" instead of
++crashing. The two models load independently: if the face model cannot be fetched, phone/person detection still works,
++and vice versa. All decision logic (`build_findings`, `count_people`, `interpret_landmarks`, ...) is pure and unit-tested;
++the model plumbing (`_detect_faces`, `_detect_objects`) is thin.
++
++Models are downloaded on first use if they are missing (set AI_MODEL_AUTODOWNLOAD=false to disable, or run
++`python -m app.proctoring download-models` at build time - the Dockerfile does this when WITH_AI=true).
+ """
+ import base64
+ import logging
++import math
+ import os
++import re
++import shutil
++import sys
++import tempfile
+ import threading
+-from typing import Any, Dict, List, Optional
++import time
++import urllib.request
++from typing import Any, Dict, List, Optional, Sequence, Tuple
+ 
+ from app.config import settings
+ 
+ log = logging.getLogger("orvexa.ai")
+ 
++
++# ---------------------------------------------------------------------------
++# configuration
++# ---------------------------------------------------------------------------
++def _env_float(name: str, default: float) -> float:
++    try:
++        return float(os.getenv(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++def _env_int(name: str, default: int) -> int:
++    try:
++        return int(os.getenv(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++def _env_bool(name: str, default: bool) -> bool:
++    raw = os.getenv(name)
++    return default if raw is None else raw.strip().lower() in ("1", "true", "yes", "on")
++
++
+ _BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))
+ FACE_MODEL_PATH = os.getenv("FACE_MODEL_PATH", os.path.join(_BACKEND_DIR, "face_landmarker.task"))
+-YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", os.path.join(_BACKEND_DIR, "yolov8n.pt"))
++FACE_MODEL_URL = os.getenv(
++    "FACE_MODEL_URL",
++    "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
++)
++YOLO_ASSET_URL = "https://github.com/ultralytics/assets/releases/download/v8.3.0/"
++_YOLO_STOCK_NAME = re.compile(r"^yolo(v8|11)[nsmlx]\.pt$")
++
++
++def _resolve_yolo_path() -> str:
++    explicit = os.getenv("YOLO_MODEL_PATH")
++    if explicit:
++        return explicit
++    for name in ("yolov8s.pt", "yolov8n.pt"):  # prefer the stronger model, accept an already-installed nano
++        candidate = os.path.join(_BACKEND_DIR, name)
++        if os.path.exists(candidate):
++            return candidate
++    return os.path.join(_BACKEND_DIR, "yolov8s.pt")
++
++
++YOLO_MODEL_PATH = _resolve_yolo_path()
++AUTODOWNLOAD = _env_bool("AI_MODEL_AUTODOWNLOAD", True)
++RETRY_AFTER_SECONDS = 300           # after a failed load, try again this much later instead of staying dead until restart
+ 
+-# COCO classes treated as prohibited during an exam
++# Detection tuning. Phones are small and are often half hidden by a hand, so they use a deliberately LOW confidence;
++# the server then requires repeated sightings (see routers/candidate.py) before it records anything.
++# Both passes run at 640, the scale YOLOv8 was trained at. Running the whole frame at a larger size looks tempting for
++# small objects but makes people who sit close to the camera LESS recognisable (measured: one person fell from 0.91 to
++# 0.39 confidence at 960), so small objects are handled by the tile pass instead, which zooms in ~1.6x at native scale.
++DETECT_IMGSZ = _env_int("AI_DETECT_IMGSZ", 640)
++TILE_IMGSZ = _env_int("AI_TILE_IMGSZ", 640)
++TILED_DETECTION = _env_bool("AI_TILED_DETECTION", True)
++MAX_ANALYSIS_SIDE = 1280            # larger frames are scaled down to this (cheap safety valve, keeps aspect ratio)
++YOLO_FLOOR_CONF = 0.20              # what the model returns; each class is then filtered by its own threshold below
++PHONE_CONFIDENCE = _env_float("AI_PHONE_CONFIDENCE", 0.30)
++PERSON_CONFIDENCE = _env_float("AI_PERSON_CONFIDENCE", 0.45)
++TILE_PERSON_CONFIDENCE = 0.65       # a person found ONLY on a tile must be more certain: zooming in also makes blurry
++                                    # backgrounds look like people (measured 0.56 on a blurred crowd, 0.7+ on a real far person)
++OBJECT_CONFIDENCE = _env_float("AI_OBJECT_CONFIDENCE", 0.50)
++MIN_PHONE_AREA = 0.0003             # fraction of the frame (about 20x25 px on a 960x540 frame)
++MIN_PERSON_AREA = 0.02
++MIN_OBJECT_AREA = 0.002
++TILE_GRID = (2, 2)
++TILE_OVERLAP = 0.25
++MIN_TILED_WIDTH = 640               # tiling a small frame adds cost but no extra detail
++
++PHONE_LABEL = "cell phone"
++PERSON_LABEL = "person"
++# Other COCO classes treated as prohibited. Keyboards and mice are deliberately NOT here: an external webcam sits on
++# the monitor and sees the candidate's own keyboard and mouse, so flagging them only produced false alarms.
+ PROHIBITED_OBJECTS = {
+-    "cell phone": "Mobile phone detected",
+     "book": "Book detected",
+     "laptop": "Second laptop detected",
+     "tv": "Extra screen detected",
+     "remote": "Remote / device detected",
+-    "keyboard": "Extra keyboard detected",
+-    "mouse": "Extra mouse detected",
+ }
+-OBJECT_CONFIDENCE = 0.5
++WANTED_CLASSES = {PHONE_LABEL, PERSON_LABEL, *PROHIBITED_OBJECTS}
+ 
+ # MediaPipe face-mesh landmark indices
+ LEFT_IRIS = [474, 475, 476, 477]
+ RIGHT_IRIS = [469, 470, 471, 472]
+ UPPER_LIP = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291]
+ LOWER_LIP = [146, 91, 181, 84, 17, 314, 405, 321, 375, 291]
++FACE_TOP, FACE_CHIN, CHEEK_LEFT, CHEEK_RIGHT = 10, 152, 234, 454
+ 
+ GAZE_LEFT_THRESHOLD = 0.35
+ GAZE_RIGHT_THRESHOLD = 0.65
+-LIP_OPEN_THRESHOLD = 0.05
++LIP_OPEN_THRESHOLD = 0.05           # legacy: lip gap in image units, used only when face height / blendshapes are unavailable
++LIP_OPEN_FACE_RATIO = 0.12          # lip gap as a share of face height (independent of how far the candidate sits)
++JAW_OPEN_SCORE = 0.35               # blendshape score for "mouth clearly open"
+ HEAD_YAW_LOW, HEAD_YAW_HIGH = 0.30, 0.70
++YAW_TURN_DEG = _env_float("AI_YAW_TURN_DEG", 35.0)
++PITCH_DOWN_DEG = _env_float("AI_PITCH_DOWN_DEG", 25.0)      # head tipped down this far = looking at lap / desk / phone
++PITCH_DOWN_ASSISTED_DEG = 14.0      # ... or this far when the eyes are also looking down
++PITCH_UP_DEG = -25.0
++EYES_DOWN_SCORE = 0.60
+ DARK_FRAME_MEAN = 18.0
++FLAT_FRAME_STD = 7.0                # a hand / paper / lens cap over the camera leaves almost no detail
++
++_lock = threading.Lock()            # guards model loading and the (non thread-safe) MediaPipe task object
++_yolo_lock = threading.Lock()       # ultralytics predictors are not thread-safe either
++_state: Dict[str, Any] = {
++    "loaded": False, "error": None, "landmarker": None, "yolo": None, "cv2": None, "np": None, "mp": None,
++    "landmarker_error": None, "yolo_error": None, "yolo_classes": None, "attempted_at": None,
++}
+ 
+-_lock = threading.Lock()
+-_state: Dict[str, Any] = {"loaded": False, "error": None, "landmarker": None, "yolo": None, "cv2": None, "np": None, "mp": None}
++Box = Tuple[float, float, float, float]   # x1, y1, x2, y2 as fractions of the frame (0..1)
+ 
+ 
++# ---------------------------------------------------------------------------
++# geometry helpers (pure)
++# ---------------------------------------------------------------------------
+ def _mean(values) -> float:
+     values = list(values)
+     return sum(values) / len(values) if values else 0.0
+ 
+ 
+-def interpret_landmarks(landmarks) -> List[Dict[str, Any]]:
+-    """Turn one face's 478 landmarks (objects with .x/.y in 0..1) into proctoring findings."""
++def _area(b: Box) -> float:
++    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
++
++
++def _intersection(a: Box, b: Box) -> float:
++    return max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
++
++
++def iou(a: Box, b: Box) -> float:
++    inter = _intersection(a, b)
++    union = _area(a) + _area(b) - inter
++    return inter / union if union > 0 else 0.0
++
++
++def covered_share(inner: Box, outer: Box) -> float:
++    """How much of `inner` lies inside `outer` (0..1). Unlike IoU this ignores how big `outer` is."""
++    a = _area(inner)
++    return _intersection(inner, outer) / a if a > 0 else 0.0
++
++
++def _center_inside(point_box: Box, outer: Box) -> bool:
++    cx, cy = (point_box[0] + point_box[2]) / 2, (point_box[1] + point_box[3]) / 2
++    return outer[0] <= cx <= outer[2] and outer[1] <= cy <= outer[3]
++
++
++def tile_windows(width: int, height: int, grid: Tuple[int, int] = TILE_GRID, overlap: float = TILE_OVERLAP) -> List[Tuple[int, int, int, int]]:
++    """Overlapping tiles (x1, y1, x2, y2 in pixels) that together cover the ENTIRE frame, edge to edge."""
++    cols, rows = grid
++    tile_w = min(width, int(round(width / cols * (1 + overlap))))
++    tile_h = min(height, int(round(height / rows * (1 + overlap))))
++    step_x = (width - tile_w) / (cols - 1) if cols > 1 else 0
++    step_y = (height - tile_h) / (rows - 1) if rows > 1 else 0
++    out = []
++    for r in range(rows):
++        for c in range(cols):
++            x1, y1 = int(round(c * step_x)), int(round(r * step_y))
++            out.append((x1, y1, min(width, x1 + tile_w), min(height, y1 + tile_h)))
++    return out
++
++
++def kind_of(name: str) -> str:
++    return "phone" if name == PHONE_LABEL else "person" if name == PERSON_LABEL else "object"
++
++
++# ---------------------------------------------------------------------------
++# detections (pure): filter, merge full-frame + tile passes, count people
++# ---------------------------------------------------------------------------
++def select_detections(raw: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    """Keep detections of the classes we care about that clear their own confidence and minimum-size bar."""
++    keep = []
++    for d in raw:
++        name = d["name"]
++        if name == PERSON_LABEL:
++            threshold, min_area = PERSON_CONFIDENCE, MIN_PERSON_AREA
++        elif name == PHONE_LABEL:
++            threshold, min_area = PHONE_CONFIDENCE, MIN_PHONE_AREA
++        elif name in PROHIBITED_OBJECTS:
++            threshold, min_area = OBJECT_CONFIDENCE, MIN_OBJECT_AREA
++        else:
++            continue
++        if d["conf"] >= threshold and _area(d["box"]) >= min_area:
++            keep.append(d)
++    return keep
++
++
++def dedupe_detections(dets: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    """Remove duplicates. People are de-duplicated among themselves; every other object competes class-agnostically
++    (a phone that the model also labelled 'remote' stays a phone)."""
++    people = sorted((d for d in dets if d["name"] == PERSON_LABEL), key=lambda d: -d["conf"])
++    others = sorted((d for d in dets if d["name"] != PERSON_LABEL), key=lambda d: (d["name"] != PHONE_LABEL, -d["conf"]))
++    out: List[Dict[str, Any]] = []
++    for group, limit in ((people, 0.65), (others, 0.5)):
++        kept: List[Dict[str, Any]] = []
++        for d in group:
++            if all(iou(d["box"], k["box"]) < limit for k in kept):
++                kept.append(d)
++        out.extend(kept)
++    return out
++
++
++def merge_passes(full: Sequence[Dict[str, Any]], tiled: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    """Combine the full-frame pass with the tile pass without double counting.
++
++    A tile only sees part of a large object, so a person box from a tile that sits inside (or heavily overlaps) a person
++    already found on the full frame is that same person cut in half - it must never become a second person."""
++    merged = list(full)
++    for d in sorted(tiled, key=lambda x: -x["conf"]):
++        if d["name"] == PERSON_LABEL:
++            if d["conf"] < TILE_PERSON_CONFIDENCE:
++                continue
++            known = [m["box"] for m in merged if m["name"] == PERSON_LABEL]
++            if any(covered_share(d["box"], k) >= 0.5 or iou(d["box"], k) >= 0.3 for k in known):
++                continue
++        merged.append(d)
++    return dedupe_detections(merged)
++
++
++def count_people(person_boxes: Sequence[Box], face_boxes: Sequence[Box]) -> int:
++    """Distinct people in view. A face that sits inside a person box belongs to that person; two faces inside one box
++    are two people (the model sometimes merges people who sit close together); a face with no body box counts too
++    (body cut off by the frame edge)."""
++    free = list(face_boxes)
++    total = 0
++    for person in person_boxes:
++        mine = [f for f in free if _center_inside(f, person)]
++        for f in mine:
++            free.remove(f)
++        total += max(1, len(mine))
++    return total + len(free)
++
++
++def object_findings(dets: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    out: List[Dict[str, Any]] = []
++    phones = [d for d in dets if d["name"] == PHONE_LABEL]
++    if phones:
++        best = int(round(max(p["conf"] for p in phones) * 100))
++        what = "Mobile phone" if len(phones) == 1 else f"{len(phones)} mobile phones"
++        out.append({"code": "PHONE_DETECTED", "detail": f"{what} detected (confidence {best}%)"})
++    names = sorted({d["name"] for d in dets if d["name"] in PROHIBITED_OBJECTS})
++    if names:
++        out.append({"code": "PROHIBITED_OBJECT", "detail": "; ".join(PROHIBITED_OBJECTS[n] for n in names)})
++    return out
++
++
++# ---------------------------------------------------------------------------
++# face landmarks (pure)
++# ---------------------------------------------------------------------------
++def face_box(landmarks) -> Box:
++    xs = [p.x for p in landmarks]
++    ys = [p.y for p in landmarks]
++    return (max(0.0, min(xs)), max(0.0, min(ys)), min(1.0, max(xs)), min(1.0, max(ys)))
++
++
++def head_pose_from_landmarks(landmarks, aspect: float = 1.0) -> Optional[Tuple[float, float]]:
++    """(yaw, pitch) in degrees from the 3-D landmarks. Pitch > 0 means the chin is down. None without usable depth.
++
++    The face plane is spanned by the cheek-to-cheek and forehead-to-chin vectors; its outward normal tells where the
++    head points. Image y grows downward and MediaPipe z grows away from the camera, so a face that looks straight at
++    the camera has its normal along -z. x and z are scaled by the frame aspect so the three axes share one unit."""
++    try:
++        def pt(i):
++            p = landmarks[i]
++            return (p.x * aspect, p.y, p.z * aspect)
++        left, right, top, chin = pt(CHEEK_LEFT), pt(CHEEK_RIGHT), pt(FACE_TOP), pt(FACE_CHIN)
++    except (IndexError, AttributeError, TypeError):
++        return None
++    u = (right[0] - left[0], right[1] - left[1], right[2] - left[2])    # across the face
++    v = (chin[0] - top[0], chin[1] - top[1], chin[2] - top[2])          # down the face
++    mx, my, mz = v[1] * u[2] - v[2] * u[1], v[2] * u[0] - v[0] * u[2], v[0] * u[1] - v[1] * u[0]
++    if not all(math.isfinite(c) for c in (mx, my, mz)) or mz >= 0:
++        return None
++    return math.degrees(math.atan2(mx, -mz)), math.degrees(math.atan2(my, -mz))
++
++
++def interpret_landmarks(landmarks, blendshapes: Optional[Dict[str, float]] = None, aspect: Optional[float] = None) -> List[Dict[str, Any]]:
++    """Turn one face's 478 landmarks (objects with .x/.y[/.z] in 0..1) into proctoring findings.
++
++    `blendshapes` (name -> score) and `aspect` (frame width / height) are optional; without them the function behaves
++    as a landmark-only check."""
+     findings: List[Dict[str, Any]] = []
+     try:
+         left_ratio = (_mean(landmarks[i].x for i in LEFT_IRIS) - landmarks[33].x) / ((landmarks[133].x - landmarks[33].x) or 1e-4)
+@@ -65,70 +327,224 @@ def interpret_landmarks(landmarks) -> List[Dict[str, Any]]:
+     except (IndexError, AttributeError, ZeroDivisionError):
+         pass
+ 
++    pose = head_pose_from_landmarks(landmarks, aspect or 1.0)
++    turned = False
+     try:  # head yaw: where the nose tip sits between the two cheeks
+-        span = (landmarks[454].x - landmarks[234].x) or 1e-4
+-        yaw = (landmarks[1].x - landmarks[234].x) / span
++        span = (landmarks[CHEEK_RIGHT].x - landmarks[CHEEK_LEFT].x) or 1e-4
++        yaw = (landmarks[1].x - landmarks[CHEEK_LEFT].x) / span
+         if yaw < HEAD_YAW_LOW or yaw > HEAD_YAW_HIGH:
++            turned = True
+             findings.append({"code": "HEAD_TURNED", "detail": "Head turned to the " + ("left" if yaw < HEAD_YAW_LOW else "right")})
+     except (IndexError, AttributeError, ZeroDivisionError):
+         pass
++    if pose is not None and not turned and abs(pose[0]) >= YAW_TURN_DEG:
++        findings.append({"code": "HEAD_TURNED", "detail": f"Head turned about {abs(pose[0]):.0f} degrees"})
++
++    # looking down / up: head pitch (and the eyes, when blendshapes are available)
++    blend = blendshapes or {}
++    eyes_down = _mean([blend.get("eyeLookDownLeft", 0.0), blend.get("eyeLookDownRight", 0.0)]) if blend else 0.0
++    pitch = pose[1] if pose is not None else None
++    if pitch is not None and (pitch >= PITCH_DOWN_DEG or (pitch >= PITCH_DOWN_ASSISTED_DEG and eyes_down >= EYES_DOWN_SCORE)):
++        findings.append({"code": "LOOKING_DOWN", "detail": f"Head tilted down about {pitch:.0f} degrees"})
++    elif pitch is None and eyes_down >= EYES_DOWN_SCORE + 0.1:
++        findings.append({"code": "LOOKING_DOWN", "detail": "Eyes looking down"})
++    elif pitch is not None and pitch <= PITCH_UP_DEG:
++        findings.append({"code": "LOOKING_AWAY", "detail": f"Head tilted up about {abs(pitch):.0f} degrees"})
+ 
+     try:
+-        gap = abs(_mean(landmarks[i].y for i in LOWER_LIP) - _mean(landmarks[i].y for i in UPPER_LIP))
+-        if gap > LIP_OPEN_THRESHOLD:
+-            findings.append({"code": "LIP_MOVEMENT", "detail": "Mouth open - possible speaking"})
++        if "jawOpen" in blend:
++            if blend["jawOpen"] >= JAW_OPEN_SCORE:
++                findings.append({"code": "LIP_MOVEMENT", "detail": "Mouth open - possible speaking"})
++        else:
++            gap = abs(_mean(landmarks[i].y for i in LOWER_LIP) - _mean(landmarks[i].y for i in UPPER_LIP))
++            face_height = abs(landmarks[FACE_CHIN].y - landmarks[FACE_TOP].y)
++            opened = gap / face_height > LIP_OPEN_FACE_RATIO if face_height > 0.05 else gap > LIP_OPEN_THRESHOLD
++            if opened:
++                findings.append({"code": "LIP_MOVEMENT", "detail": "Mouth open - possible speaking"})
+     except (IndexError, AttributeError):
+         pass
+     return findings
+ 
+ 
++def covered_reason(mean: float, std: float) -> Optional[str]:
++    """Why a frame looks like a blocked camera (black, or flat with no detail), or None if it looks like a real scene."""
++    if mean < DARK_FRAME_MEAN:
++        return "Camera view is black or covered"
++    if std < FLAT_FRAME_STD:
++        return "Camera view is blocked (no detail visible)"
++    return None
++
++
++def build_findings(faces: Optional[Sequence[Dict[str, Any]]], dets: Optional[Sequence[Dict[str, Any]]], aspect: float = 1.0) -> Dict[str, Any]:
++    """Fuse the face and object/person results of ONE frame into findings.
++
++    `faces`: [{"landmarks", "box", "blend"?}] or None when face analysis did not run.
++    `dets`:  filtered detections or None when object detection did not run."""
++    findings: List[Dict[str, Any]] = []
++    person_boxes = [d["box"] for d in dets if d["name"] == PERSON_LABEL] if dets is not None else None
++    face_count = len(faces) if faces is not None else None
++    if faces is not None and person_boxes is not None:
++        people: Optional[int] = count_people(person_boxes, [f["box"] for f in faces])
++    elif person_boxes is not None:
++        people = len(person_boxes)
++    else:
++        people = face_count
++
++    if faces is not None:
++        if not faces:
++            body = bool(person_boxes)
++            findings.append({"code": "NO_FACE", "detail": "A person is in view but their face is not visible (looking away, head down or face covered)" if body else "No face visible"})
++    elif people == 0:
++        findings.append({"code": "NO_FACE", "detail": "No person visible"})
++
++    if face_count is not None and face_count >= 2:
++        findings.append({"code": "MULTIPLE_FACES", "detail": f"{face_count} faces visible"})
++    elif people is not None and people >= 2:
++        findings.append({"code": "MULTIPLE_PERSONS", "detail": f"{people} people visible in the camera view"})
++
++    if faces:
++        main = max(faces, key=lambda f: _area(f["box"]))   # the candidate is the biggest face, not whichever came first
++        findings.extend(interpret_landmarks(main["landmarks"], main.get("blend"), aspect))
++    if dets:
++        findings.extend(object_findings(dets))
++    return {"findings": findings, "face_count": face_count or 0, "person_count": people or 0,
++            "phone_count": sum(1 for d in (dets or []) if d["name"] == PHONE_LABEL)}
++
++
++# ---------------------------------------------------------------------------
++# model files + loading
++# ---------------------------------------------------------------------------
++def _download(url: str, dest: str, timeout: int = 180) -> None:
++    folder = os.path.dirname(dest) or "."
++    os.makedirs(folder, exist_ok=True)
++    fd, tmp = tempfile.mkstemp(dir=folder, suffix=".part")
++    try:
++        with urllib.request.urlopen(url, timeout=timeout) as resp, os.fdopen(fd, "wb") as out:  # honours HTTPS_PROXY
++            shutil.copyfileobj(resp, out)
++        if os.path.getsize(tmp) < 100_000:
++            raise RuntimeError(f"download from {url} looks truncated")
++        os.chmod(tmp, 0o644)               # mkstemp makes it 0600; the server may run as a different user than the build
++        os.replace(tmp, dest)
++    finally:
++        if os.path.exists(tmp):
++            os.remove(tmp)
++
++
++def _ensure_file(path: str, url: Optional[str]) -> None:
++    if os.path.exists(path):
++        return
++    if not (AUTODOWNLOAD and url) or settings.env == "test":   # tests / CI must never reach for the network
++        raise FileNotFoundError(f"model missing: {path}")
++    log.info("downloading %s", url)
++    _download(url, path)
++
++
++def _yolo_url(path: str) -> Optional[str]:
++    name = os.path.basename(path)
++    return YOLO_ASSET_URL + name if _YOLO_STOCK_NAME.match(name) else None
++
++
++def ensure_models() -> Dict[str, str]:
++    """Download any missing model file. Used at image-build time; raises nothing, reports per model."""
++    report = {}
++    for label, path, url in (("face", FACE_MODEL_PATH, FACE_MODEL_URL), ("yolo", YOLO_MODEL_PATH, _yolo_url(YOLO_MODEL_PATH))):
++        try:
++            _ensure_file(path, url)
++            report[label] = "ok"
++        except Exception as exc:  # noqa: BLE001
++            report[label] = f"failed: {exc}"
++    return report
++
++
++def _load_landmarker() -> None:
++    import mediapipe as mp
++    from mediapipe.tasks import python as mp_python
++    from mediapipe.tasks.python import vision
++
++    _ensure_file(FACE_MODEL_PATH, FACE_MODEL_URL)
++    options = vision.FaceLandmarkerOptions(
++        base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL_PATH),
++        output_face_blendshapes=True,                 # jawOpen / eyeLookDown scores: far steadier than raw landmark gaps
++        output_facial_transformation_matrixes=False,
++        num_faces=6,                                  # was 3: a crowded room must still be counted
++        min_face_detection_confidence=0.3,            # was the 0.5 default: small / turned / partly hidden faces count
++        min_face_presence_confidence=0.3,
++    )
++    _state.update(landmarker=vision.FaceLandmarker.create_from_options(options), mp=mp)
++
++
++def _load_yolo() -> None:
++    from ultralytics import YOLO
++
++    _ensure_file(YOLO_MODEL_PATH, _yolo_url(YOLO_MODEL_PATH))
++    model = YOLO(YOLO_MODEL_PATH)
++    names = getattr(model, "names", {}) or {}
++    classes = [int(i) for i, n in names.items() if n in WANTED_CLASSES]
++    if PHONE_LABEL not in names.values() or PERSON_LABEL not in names.values():
++        raise RuntimeError(f"{os.path.basename(YOLO_MODEL_PATH)} is not a COCO model (no 'cell phone' / 'person' class)")
++    _state.update(yolo=model, yolo_classes=classes)
++
++
+ def _load() -> None:
+-    """Import and build the models once. Failure is remembered so we do not retry on every frame."""
++    """Import and build the models once. A failure is remembered (and retried later), never repeated on every frame."""
+     with _lock:
+         if _state["loaded"]:
+             return
+-        _state["loaded"] = True
++        _state.update(loaded=True, attempted_at=time.time(), error=None, landmarker_error=None, yolo_error=None)
+         try:
+             import cv2
+-            import mediapipe as mp
+             import numpy as np
+-            from mediapipe.tasks import python as mp_python
+-            from mediapipe.tasks.python import vision
+-
+-            if not os.path.exists(FACE_MODEL_PATH):
+-                raise FileNotFoundError(f"face model missing: {FACE_MODEL_PATH}")
+-            options = vision.FaceLandmarkerOptions(
+-                base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL_PATH),
+-                output_face_blendshapes=False,
+-                output_facial_transformation_matrixes=False,
+-                num_faces=3,
+-            )
+-            _state.update(landmarker=vision.FaceLandmarker.create_from_options(options), cv2=cv2, np=np, mp=mp)
+-            try:
+-                from ultralytics import YOLO
+-                if os.path.exists(YOLO_MODEL_PATH):
+-                    _state["yolo"] = YOLO(YOLO_MODEL_PATH)
+-                else:
+-                    log.warning("YOLO model not found at %s - object detection disabled", YOLO_MODEL_PATH)
+-            except Exception as exc:  # noqa: BLE001
+-                log.warning("Object detection disabled: %s", exc)
+-        except Exception as exc:  # noqa: BLE001 - missing libs, missing model, bad install
++            _state.update(cv2=cv2, np=np)
++        except Exception as exc:  # noqa: BLE001 - OpenCV / numpy not installed
+             _state["error"] = str(exc)
+             log.warning("AI proctoring unavailable: %s", exc)
++            return
++        for key, loader in (("landmarker_error", _load_landmarker), ("yolo_error", _load_yolo)):
++            try:
++                loader()
++            except Exception as exc:  # noqa: BLE001 - missing lib, missing model, blocked download
++                _state[key] = str(exc)
++                log.warning("AI component unavailable (%s): %s", key.replace("_error", ""), exc)
++        if _state["landmarker"] is None and _state["yolo"] is None:
++            _state["error"] = "; ".join(e for e in (_state["landmarker_error"], _state["yolo_error"]) if e) or "no AI model could be loaded"
++
++
++def _ensure_loaded() -> None:
++    with _lock:
++        due = (_state["loaded"] and _state["error"] is not None and _state.get("attempted_at")
++               and time.time() - _state["attempted_at"] > RETRY_AFTER_SECONDS)
++        if due:
++            _state["loaded"] = False
++    if not _state["loaded"]:
++        _load()
++
++
++def warm_up_async() -> None:
++    """Load (and if needed download) the models in the background at start-up so the first candidate is not the one waiting."""
++    if settings.ai_proctoring_enabled:
++        threading.Thread(target=_ensure_loaded, name="ai-warmup", daemon=True).start()
+ 
+ 
+ def status() -> Dict[str, Any]:
+     if not settings.ai_proctoring_enabled:
+         return {"available": False, "reason": "disabled by configuration"}
+-    if not _state["loaded"]:
+-        _load()
++    _ensure_loaded()
+     return {
+         "available": _state["error"] is None,
+         "reason": _state["error"],
+         "object_detection": _state["yolo"] is not None,
++        "phone_detection": _state["yolo"] is not None,
++        "person_detection": _state["yolo"] is not None,
++        "face_analysis": _state["landmarker"] is not None,
++        "face_error": _state["landmarker_error"],
++        "object_error": _state["yolo_error"],
++        "tiled_detection": TILED_DETECTION,
+     }
+ 
+ 
++# ---------------------------------------------------------------------------
++# model plumbing (thin; replaced by fakes in tests)
++# ---------------------------------------------------------------------------
+ def _decode(data_url: str):
+     cv2, np = _state["cv2"], _state["np"]
+     if "," in data_url:
+@@ -137,13 +553,123 @@ def _decode(data_url: str):
+     return cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+ 
+ 
++def _faces_in(rgb, offset: Tuple[int, int] = (0, 0), full_size: Optional[Tuple[int, int]] = None) -> List[Dict[str, Any]]:
++    """Run the face model on an RGB array. With `offset`/`full_size` the boxes are mapped back to full-frame fractions."""
++    np, mp = _state["np"], _state["mp"]
++    height, width = rgb.shape[:2]
++    full_w, full_h = full_size or (width, height)
++    with _lock:
++        detection = _state["landmarker"].detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb)))
++    blends = detection.face_blendshapes or []
++    faces = []
++    for i, landmarks in enumerate(detection.face_landmarks or []):
++        box = face_box(landmarks)
++        faces.append({
++            "landmarks": landmarks,
++            "box": ((box[0] * width + offset[0]) / full_w, (box[1] * height + offset[1]) / full_h,
++                    (box[2] * width + offset[0]) / full_w, (box[3] * height + offset[1]) / full_h),
++            "blend": {c.category_name: float(c.score) for c in blends[i]} if i < len(blends) else {},
++        })
++    return faces
++
++
++def _detect_faces(rgb) -> List[Dict[str, Any]]:
++    """Faces anywhere in the frame: the full frame first, then tiles to catch small / far-away faces."""
++    height, width = rgb.shape[:2]
++    faces = _faces_in(rgb)
++    if TILED_DETECTION and width >= MIN_TILED_WIDTH:
++        for x1, y1, x2, y2 in tile_windows(width, height):
++            for f in _faces_in(rgb[y1:y2, x1:x2], (x1, y1), (width, height)):
++                w, h = f["box"][2] - f["box"][0], f["box"][3] - f["box"][1]
++                # face-shaped is judged in PIXELS: on a 16:9 frame an ordinary 70x90 px face is only 0.44 wide-to-tall in fractions
++                plausible = h > 0 and 0.5 <= (w * width) / (h * height) <= 1.6 and w * h >= 0.0015
++                if plausible and all(covered_share(f["box"], k["box"]) < 0.4 for k in faces):   # not a cut-off copy of a known face
++                    faces.append(f)
++    return faces
++
++
++def _predict(images, imgsz: int) -> List[List[Dict[str, Any]]]:
++    model = _state["yolo"]
++    with _yolo_lock:
++        results = model.predict(images, imgsz=imgsz, conf=YOLO_FLOOR_CONF, iou=0.6, classes=_state["yolo_classes"], verbose=False)
++    names = model.names
++    out = []
++    for r in results:
++        boxes = r.boxes
++        coords, confs, classes = boxes.xyxyn.tolist(), boxes.conf.tolist(), boxes.cls.tolist()
++        out.append([{"name": names[int(c)], "conf": float(p), "box": tuple(float(v) for v in b)} for b, p, c in zip(coords, confs, classes)])
++    return out
++
++
++def _detect_objects(img) -> List[Dict[str, Any]]:
++    """Phones, people and other prohibited objects anywhere in the frame (full-frame pass + tile pass)."""
++    height, width = img.shape[:2]
++    full = select_detections(_predict([img], DETECT_IMGSZ)[0])
++    if not (TILED_DETECTION and width >= MIN_TILED_WIDTH):
++        return dedupe_detections(full)
++    windows = tile_windows(width, height)
++    tiled: List[Dict[str, Any]] = []
++    for (x1, y1, x2, y2), found in zip(windows, _predict([img[y1:y2, x1:x2] for x1, y1, x2, y2 in windows], TILE_IMGSZ)):
++        for d in select_detections(found):
++            bx1, by1, bx2, by2 = d["box"]
++            d = dict(d, box=((x1 + bx1 * (x2 - x1)) / width, (y1 + by1 * (y2 - y1)) / height, (x1 + bx2 * (x2 - x1)) / width, (y1 + by2 * (y2 - y1)) / height))
++            tiled.append(d)
++    return merge_passes(full, tiled)
++
++
++# ---------------------------------------------------------------------------
++# evidence image + HUD boxes
++# ---------------------------------------------------------------------------
++_COLORS = {"phone": (0, 0, 255), "person": (0, 140, 255), "object": (0, 215, 255), "face": (255, 200, 0)}   # BGR
++
++
++def hud_boxes(dets: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
++    out = []
++    for d in dets:
++        x1, y1, x2, y2 = d["box"]
++        kind = kind_of(d["name"])
++        out.append({"kind": kind, "label": "Phone" if kind == "phone" else "Person" if kind == "person" else d["name"].title(),
++                    "conf": round(d["conf"], 2), "x": round(x1, 4), "y": round(y1, 4), "w": round(x2 - x1, 4), "h": round(y2 - y1, 4)})
++    return out
++
++
++def _annotate(img, dets: Sequence[Dict[str, Any]], faces: Optional[Sequence[Dict[str, Any]]]) -> Optional[str]:
++    """JPEG data URL of the frame with every detection boxed, so a reviewer sees exactly what the AI saw."""
++    try:
++        cv2 = _state["cv2"]
++        out = img.copy()
++        height, width = out.shape[:2]
++        items = [("face", "", f["box"]) for f in faces or []] + [(kind_of(d["name"]), f"{d['name']} {int(d['conf'] * 100)}%", d["box"]) for d in dets]
++        for kind, text, (x1, y1, x2, y2) in items:
++            p1, p2 = (int(x1 * width), int(y1 * height)), (int(x2 * width), int(y2 * height))
++            cv2.rectangle(out, p1, p2, _COLORS[kind], 2 if kind != "face" else 1)
++            if text:
++                cv2.putText(out, text, (p1[0], max(14, p1[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, _COLORS[kind], 2, cv2.LINE_AA)
++        budget = int(settings.max_image_bytes * 0.9)
++        for scale in (1.0, 0.75, 0.5):
++            frame = out if scale == 1.0 else cv2.resize(out, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
++            for quality in (80, 65, 50):
++                ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
++                if ok and len(buf) <= budget:
++                    return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
++    except Exception as exc:  # noqa: BLE001 - evidence is a nice-to-have; the finding itself must still be recorded
++        log.warning("could not annotate evidence frame: %s", exc)
++    return None
++
++
++# ---------------------------------------------------------------------------
++# public entry point
++# ---------------------------------------------------------------------------
+ def analyze_frame(data_url: str, *, detect_objects: bool = True) -> Dict[str, Any]:
+-    """Analyse one webcam frame. Never raises: problems come back as available=False / empty findings."""
+-    result: Dict[str, Any] = {"available": False, "face_count": 0, "findings": []}
++    """Analyse one webcam frame. Never raises: problems come back as available=False / empty findings.
++
++    Result: available, face_count, person_count, phone_count, findings [{code, detail}], boxes (HUD overlay, fractions of
++    the frame) and evidence_image (annotated JPEG data URL, only when an object/person finding exists)."""
++    result: Dict[str, Any] = {"available": False, "face_count": 0, "person_count": 0, "phone_count": 0,
++                              "boxes": [], "findings": [], "evidence_image": None}
+     if not settings.ai_proctoring_enabled:
+         return result
+-    if not _state["loaded"]:
+-        _load()
++    _ensure_loaded()
+     if _state["error"] is not None:
+         return result
+     result["available"] = True
+@@ -152,32 +678,45 @@ def analyze_frame(data_url: str, *, detect_objects: bool = True) -> Dict[str, An
+         if img is None:
+             result["findings"].append({"code": "CAMERA_COVERED", "detail": "Frame could not be decoded"})
+             return result
+-        cv2, np, mp = _state["cv2"], _state["np"], _state["mp"]
+-        if float(np.mean(img)) < DARK_FRAME_MEAN:
+-            result["findings"].append({"code": "CAMERA_COVERED", "detail": "Camera view is black or covered"})
++        cv2 = _state["cv2"]
++        if max(img.shape[:2]) > MAX_ANALYSIS_SIDE:
++            scale = MAX_ANALYSIS_SIDE / max(img.shape[:2])
++            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
++        height, width = img.shape[:2]
++        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
++        reason = covered_reason(float(gray.mean()), float(gray.std()))
++        if reason:
++            result["findings"].append({"code": "CAMERA_COVERED", "detail": reason})
+             return result
+ 
+-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+-        with _lock:  # the MediaPipe task object is not thread-safe
+-            detection = _state["landmarker"].detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
+-        faces = detection.face_landmarks or []
+-        result["face_count"] = len(faces)
+-        if not faces:
+-            result["findings"].append({"code": "NO_FACE", "detail": "No face visible"})
+-        else:
+-            if len(faces) > 1:
+-                result["findings"].append({"code": "MULTIPLE_FACES", "detail": f"{len(faces)} faces visible"})
+-            result["findings"].extend(interpret_landmarks(faces[0]))
+-
++        faces: Optional[List[Dict[str, Any]]] = None
++        if _state["landmarker"] is not None:
++            try:
++                faces = _detect_faces(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
++            except Exception as exc:  # noqa: BLE001 - one failing model must not blank the other
++                log.warning("face analysis failed: %s", exc)
++        dets: Optional[List[Dict[str, Any]]] = None
+         if detect_objects and _state["yolo"] is not None:
+-            seen = set()
+-            for r in _state["yolo"](img, verbose=False):
+-                for box in r.boxes:
+-                    name = _state["yolo"].names[int(box.cls[0])]
+-                    if name in PROHIBITED_OBJECTS and float(box.conf[0]) >= OBJECT_CONFIDENCE and name not in seen:
+-                        seen.add(name)
+-                        result["findings"].append({"code": "PROHIBITED_OBJECT", "detail": PROHIBITED_OBJECTS[name]})
++            try:
++                dets = _detect_objects(img)
++            except Exception as exc:  # noqa: BLE001
++                log.warning("object detection failed: %s", exc)
++
++        fused = build_findings(faces, dets, aspect=width / height)
++        result.update(face_count=fused["face_count"], person_count=fused["person_count"], phone_count=fused["phone_count"], findings=fused["findings"])
++        result["boxes"] = hud_boxes(dets or [])
++        if any(f["code"] in ("PHONE_DETECTED", "PROHIBITED_OBJECT", "MULTIPLE_PERSONS", "MULTIPLE_FACES") for f in fused["findings"]):
++            result["evidence_image"] = _annotate(img, dets or [], faces)
+     except Exception as exc:  # noqa: BLE001 - one bad frame must never break an exam
+         log.warning("frame analysis failed: %s", exc)
+         result["findings"] = []
+     return result
++
++
++if __name__ == "__main__":  # python -m app.proctoring download-models
++    if len(sys.argv) > 1 and sys.argv[1] == "download-models":
++        logging.basicConfig(level=logging.INFO)
++        report = ensure_models()
++        print(report)
++        sys.exit(0 if all(v == "ok" for v in report.values()) else 1)
++    print("usage: python -m app.proctoring download-models")
+diff --git a/backend/app/routers/candidate.py b/backend/app/routers/candidate.py
+index 0511298..a4baf66 100644
+--- a/backend/app/routers/candidate.py
++++ b/backend/app/routers/candidate.py
+@@ -30,8 +30,40 @@ MAX_ANSWER_CHARS = 4000
+ MAX_PERIODIC_SNAPSHOTS = 300
+ MIN_ANALYZE_GAP_SECONDS = 1.0
+ # consecutive suspicious frames required before the server records an AI violation (kills one-frame flukes)
+-STREAK_REQUIRED = {"NO_FACE": 2, "MULTIPLE_FACES": 2, "LOOKING_AWAY": 3, "HEAD_TURNED": 3, "LIP_MOVEMENT": 3,
+-                   "PROHIBITED_OBJECT": 2, "CAMERA_COVERED": 2}
++STREAK_REQUIRED = {"NO_FACE": 2, "MULTIPLE_FACES": 2, "LOOKING_AWAY": 3, "HEAD_TURNED": 3, "LOOKING_DOWN": 3, "LIP_MOVEMENT": 3,
++                   "PROHIBITED_OBJECT": 2, "PHONE_DETECTED": 2, "MULTIPLE_PERSONS": 2, "CAMERA_COVERED": 2}
++# Object and person sightings FLICKER: a phone half hidden by a hand drops out of every other frame, a second person leans
++# in and out of view. Requiring them in consecutive frames lets exactly that behaviour slip through, so these codes are
++# confirmed by "N sightings within the last M frames" instead.
++WINDOW_RULES = {"PHONE_DETECTED": (2, 4), "PROHIBITED_OBJECT": (2, 4), "MULTIPLE_PERSONS": (2, 4), "MULTIPLE_FACES": (2, 4)}
++
++
++def debounce(state: Dict[str, Any], present) -> Dict[str, bool]:
++    """Advance the per-code frame history kept on the attempt by one frame.
++
++    `present` is the set of finding codes in this frame. Returns {code: confirmed} for the codes seen in this frame and
++    updates `state["streaks"]` (consecutive rule) and `state["hist"]` (sliding-window rule) in place. A confirmed code
++    starts counting from zero again, so one ongoing event is recorded once per confirmation, not once per frame."""
++    streaks = dict(state.get("streaks") or {})
++    hist = {code: list(h) for code, h in (state.get("hist") or {}).items()}
++    confirmed: Dict[str, bool] = {}
++    for code in set(streaks) | set(hist) | set(present):
++        seen = code in present
++        if code in WINDOW_RULES:
++            need, window = WINDOW_RULES[code]
++            frames = (hist.get(code, []) + [1 if seen else 0])[-window:]
++            hit = seen and sum(frames) >= need
++            hist[code] = [] if hit else frames
++        else:
++            streaks[code] = streaks.get(code, 0) + 1 if seen else 0
++            hit = seen and streaks[code] >= STREAK_REQUIRED.get(code, 2)
++            if hit:
++                streaks[code] = 0
++        if seen:
++            confirmed[code] = hit
++    state["streaks"] = {c: n for c, n in streaks.items() if n}
++    state["hist"] = {c: h for c, h in hist.items() if any(h)}
++    return confirmed
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -430,27 +462,27 @@ def analyze(body: ImageIn, ctx: AttemptCtx = Depends(attempt_ctx), db: Session =
+         db.commit()
+         return empty
+ 
+-    streaks: Dict[str, int] = dict(state.get("streaks", {}))
+     present = {f["code"]: f for f in result["findings"]}
+-    for code in list(streaks):
+-        if code not in present:
+-            streaks[code] = 0
++    confirmed = debounce(state, set(present))
++    # evidence: the frame with every detection boxed when the AI produced one, otherwise the raw frame
++    evidence = result.get("evidence_image") or body.image
+     reported = []
+-    outcome = None
++    outcomes = []
+     for code, finding in present.items():
+-        streaks[code] = streaks.get(code, 0) + 1
+         sev, _, label, _ = VIOLATION_CATALOG[code]
+-        reported.append({"code": code, "label": label, "severity": sev, "detail": finding.get("detail"), "confirmed": streaks[code] >= STREAK_REQUIRED.get(code, 2)})
+-        if streaks[code] >= STREAK_REQUIRED.get(code, 2):
+-            outcome = proctor_rules.record_violation(db, attempt, exam, code, details=finding.get("detail"), image=body.image, source="ai")
+-            streaks[code] = 0
++        reported.append({"code": code, "label": label, "severity": sev, "detail": finding.get("detail"), "confirmed": confirmed[code]})
++        if confirmed[code]:
++            outcomes.append(proctor_rules.record_violation(db, attempt, exam, code, details=finding.get("detail"), image=evidence, source="ai"))
+             db.refresh(attempt)
+-    state["streaks"] = streaks
++    reported.sort(key=lambda r: -r["severity"])          # the candidate's hint shows the most serious finding first
++    recorded = [o for o in outcomes if o.get("recorded")]
++    outcome = max(recorded, key=lambda o: o["severity"]) if recorded else (outcomes[-1] if outcomes else None)
+     attempt.last_state = state
+     db.commit()
+-    return {"available": True, "face_count": result["face_count"], "findings": reported,
++    return {"available": True, "face_count": result.get("face_count", 0), "person_count": result.get("person_count", 0),
++            "phone_count": result.get("phone_count", 0), "boxes": result.get("boxes", []), "findings": reported,
+             "level2_count": attempt.level2_count, "terminated": attempt.status == ATT_TERMINATED,
+-            "outcome": outcome}
++            "outcome": outcome, "outcomes": recorded}
+ 
+ 
+ # ---------------------------------------------------------------------------
+diff --git a/backend/requirements-ai.txt b/backend/requirements-ai.txt
+index 6284874..b53662c 100644
+--- a/backend/requirements-ai.txt
++++ b/backend/requirements-ai.txt
+@@ -1,5 +1,11 @@
+-# Optional: server-side AI proctoring (face / gaze / lips / object detection).
++# Optional: server-side AI proctoring (face / gaze / head pose / object + person detection).
+ # The platform runs without these; AI analysis is simply reported as "unavailable".
++#
++# Two models are used and are downloaded automatically (at image build with WITH_AI=true, or on first use):
++#   face_landmarker.task  MediaPipe face landmarks + blendshapes   (~4 MB)
++#   yolov8s.pt            YOLOv8 COCO weights: phones, people, books, laptops, screens (~22 MB; yolov8n.pt = ~6 MB, faster, weaker)
++# See docs/AI_PROCTORING.md. Tip for small images: install CPU-only PyTorch first, e.g.
++#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+ numpy>=1.26
+ opencv-python-headless>=4.9
+ mediapipe>=0.10
+diff --git a/backend/tests/test_proctoring_ai.py b/backend/tests/test_proctoring_ai.py
+index 7062429..ffb5d64 100644
+--- a/backend/tests/test_proctoring_ai.py
++++ b/backend/tests/test_proctoring_ai.py
+@@ -184,3 +184,116 @@ def test_a_camera_that_went_dark_is_recorded_with_evidence(ai_env):
+     report = ai_env.client.get(f"/attempts/{c['attempt_id']}", headers=org["headers"]).json()
+     v = report["violations"][0]
+     assert v["code"] == "CAMERA_COVERED" and v["snapshot_id"] and v["details"].startswith("[ai]")
++
++
++# ---------------------------------------------------------------- phones, extra people and the whole-frame results
++def png(r, g, b):
++    """A valid 1x1 PNG of the given colour (so two evidence images can be told apart)."""
++    import base64
++    import struct
++    import zlib
++
++    def chunk(kind, data):
++        body = kind + data
++        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
++
++    raw = b"\x00" + bytes((r, g, b))
++    blob = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
++    return "data:image/png;base64," + base64.b64encode(blob).decode()
++
++
++def analyze(env, c, **result):
++    """One /attempt/analyze call against a fake AI result. Anything not given defaults to a quiet single-person frame."""
++    findings = [{"code": code, "detail": "d"} for code in result.pop("codes", [])]
++    env.frames["next"] = {"available": True, "face_count": 1, "person_count": 1, "phone_count": 0, "boxes": [], "findings": findings, **result}
++    return env.client.post("/attempt/analyze", headers=c["headers"], json={"image": TINY}).json()
++
++
++def test_a_phone_that_keeps_dropping_out_of_view_is_still_recorded(ai_env):
++    """A phone half hidden by a hand is seen in every other frame; 'two in a row' would let exactly that through."""
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org)["code"])
++    assert analyze(ai_env, c, codes=["PHONE_DETECTED"])["findings"][0]["confirmed"] is False
++    analyze(ai_env, c)                                                   # the hand moved: no phone this frame
++    assert recorded(ai_env, org, c) == []
++    out = analyze(ai_env, c, codes=["PHONE_DETECTED"])
++    assert out["findings"][0]["confirmed"] is True and recorded(ai_env, org, c) == ["PHONE_DETECTED"]
++
++
++def test_a_single_stray_phone_sighting_is_not_a_violation(ai_env):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org)["code"])
++    analyze(ai_env, c, codes=["PHONE_DETECTED"])
++    for _ in range(4):
++        analyze(ai_env, c)
++    assert recorded(ai_env, org, c) == []
++
++
++def test_the_boxed_frame_is_stored_as_evidence_instead_of_the_raw_frame(ai_env, monkeypatch):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org)["code"])
++    seen = []
++    original = candidate_router.proctor_rules.record_violation
++    monkeypatch.setattr(candidate_router.proctor_rules, "record_violation", lambda *a, **kw: seen.append(kw.get("image")) or original(*a, **kw))
++    boxed = png(255, 0, 0)
++    for _ in range(2):
++        analyze(ai_env, c, codes=["PHONE_DETECTED"], evidence_image=boxed)
++    assert seen == [boxed] and seen[0] != TINY
++    analyze(ai_env, c, codes=["LOOKING_AWAY"])                           # no annotated frame for gaze: the raw frame is used
++    analyze(ai_env, c, codes=["LOOKING_AWAY"])
++    analyze(ai_env, c, codes=["LOOKING_AWAY"])
++    assert seen[-1] == TINY
++
++
++def test_the_response_reports_what_the_ai_sees_and_every_alert_that_was_recorded(ai_env):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org)["code"])
++    boxes = [{"kind": "phone", "label": "Phone", "conf": 0.4, "x": 0.8, "y": 0.7, "w": 0.1, "h": 0.2}]
++    both = dict(codes=["PHONE_DETECTED", "MULTIPLE_PERSONS"], person_count=2, phone_count=1, boxes=boxes)
++    analyze(ai_env, c, **both)
++    out = analyze(ai_env, c, **both)
++    assert out["person_count"] == 2 and out["phone_count"] == 1 and out["boxes"] == boxes
++    assert {o["code"] for o in out["outcomes"]} == {"PHONE_DETECTED", "MULTIPLE_PERSONS"}     # neither alert is lost
++    assert set(recorded(ai_env, org, c)) == {"PHONE_DETECTED", "MULTIPLE_PERSONS"}
++
++
++def test_the_most_serious_finding_comes_first_so_it_is_the_one_shown_to_the_candidate(ai_env):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org)["code"])
++    out = analyze(ai_env, c, codes=["LOOKING_AWAY", "PHONE_DETECTED"])
++    assert [f["code"] for f in out["findings"]] == ["PHONE_DETECTED", "LOOKING_AWAY"]
++
++
++def test_a_phone_and_a_second_person_are_serious_but_do_not_terminate_unless_the_org_opts_in(ai_env):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org, max_level2_violations=1)["code"])
++    for _ in range(3):
++        out = analyze(ai_env, c, codes=["PHONE_DETECTED", "MULTIPLE_PERSONS"])
++    assert out["terminated"] is False and out["level2_count"] == 0
++    assert set(recorded(ai_env, org, c)) >= {"PHONE_DETECTED", "MULTIPLE_PERSONS"}
++
++
++@pytest.mark.parametrize("code", ["PHONE_DETECTED", "MULTIPLE_PERSONS"])
++def test_a_phone_or_a_second_person_ends_the_test_when_the_org_opts_in(ai_env, code):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org, max_level2_violations=1, ai_can_terminate=True)["code"])
++    analyze(ai_env, c, codes=[code])
++    out = analyze(ai_env, c, codes=[code])
++    assert out["terminated"] is True
++
++
++def test_looking_down_is_a_minor_flag_that_needs_a_sustained_look(ai_env):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org)["code"])
++    analyze(ai_env, c, codes=["LOOKING_DOWN"])
++    analyze(ai_env, c, codes=["LOOKING_DOWN"])
++    assert recorded(ai_env, org, c) == []
++    out = analyze(ai_env, c, codes=["LOOKING_DOWN"])
++    assert recorded(ai_env, org, c) == ["LOOKING_DOWN"] and out["findings"][0]["severity"] == 1
++
++
++def test_the_browser_cannot_report_the_ai_codes_itself(ai_env):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org)["code"])
++    for code in ("PHONE_DETECTED", "MULTIPLE_PERSONS", "LOOKING_DOWN"):
++        assert ai_env.client.post("/attempt/violations", headers=c["headers"], json={"code": code}).status_code == 400
+diff --git a/backend/tests/test_proctoring_detection.py b/backend/tests/test_proctoring_detection.py
+new file mode 100644
+index 0000000..6ee4959
+--- /dev/null
++++ b/backend/tests/test_proctoring_detection.py
+@@ -0,0 +1,658 @@
++"""AI proctoring over the whole camera frame: phones, extra people, head pose, frame fusion, model loading.
++
++The real MediaPipe / YOLO models are NOT needed here: the decision logic is pure, and the model plumbing is replaced by
++fakes. (A smoke test against real weights is at the bottom; it only runs when the weight files are present.)
++"""
++import base64
++import math
++import os
++
++import pytest
++
++from app import proctoring as P
++from app.routers import candidate as cand
++
++
++class Pt:
++    def __init__(self, x=0.5, y=0.5, z=0.0):
++        self.x, self.y, self.z = x, y, z
++
++
++def neutral():
++    """478 landmarks of a face looking straight at the camera with a closed mouth: eyes centred, nose between the cheeks."""
++    pts = [Pt() for _ in range(478)]
++    pts[33].x, pts[133].x, pts[362].x, pts[263].x = 0.30, 0.40, 0.60, 0.70
++    pts[234].x, pts[454].x, pts[1].x = 0.20, 0.80, 0.50
++    for i in P.LEFT_IRIS:
++        pts[i].x = 0.35
++    for i in P.RIGHT_IRIS:
++        pts[i].x = 0.65
++    return pts
++
++
++def det(name, conf, box):
++    return {"name": name, "conf": conf, "box": box}
++
++
++def codes(findings):
++    return [f["code"] for f in findings]
++
++
++# ------------------------------------------------------------------ tiles cover the ENTIRE frame
++@pytest.mark.parametrize("w, h", [(960, 540), (1280, 720), (960, 934), (640, 480)])
++def test_tiles_cover_the_whole_frame_edge_to_edge(w, h):
++    tiles = P.tile_windows(w, h)
++    assert len(tiles) == 4
++    covered = [[False] * 20 for _ in range(20)]       # a 20x20 grid of probe points across the frame
++    for gy in range(20):
++        for gx in range(20):
++            px, py = (gx + 0.5) * w / 20, (gy + 0.5) * h / 20
++            covered[gy][gx] = any(x1 <= px < x2 and y1 <= py < y2 for x1, y1, x2, y2 in tiles)
++    assert all(all(row) for row in covered)
++    assert min(t[0] for t in tiles) == 0 and min(t[1] for t in tiles) == 0
++    assert max(t[2] for t in tiles) == w and max(t[3] for t in tiles) == h
++    left, right = tiles[0], tiles[1]
++    assert right[0] < left[2]                          # neighbouring tiles overlap, so a phone on a seam is whole in one of them
++
++
++# ------------------------------------------------------------------ filtering: phones get a deliberately LOW bar
++def test_phone_is_accepted_at_a_low_confidence_but_other_things_are_not():
++    big = (0.2, 0.2, 0.3, 0.4)
++    kept = P.select_detections([
++        det("cell phone", 0.31, big),       # phones are small and half hidden by a hand: low bar
++        det("cell phone", 0.25, big),       # still too weak
++        det("person", 0.40, (0.1, 0.1, 0.6, 0.9)),   # a person needs more than that
++        det("person", 0.46, (0.1, 0.1, 0.6, 0.9)),
++        det("book", 0.45, big),
++        det("book", 0.55, big),
++    ])
++    assert [(d["name"], d["conf"]) for d in kept] == [("cell phone", 0.31), ("person", 0.46), ("book", 0.55)]
++
++
++def test_tiny_specks_and_irrelevant_classes_are_ignored():
++    assert P.select_detections([det("cell phone", 0.9, (0.5, 0.5, 0.505, 0.505))]) == []       # a few pixels
++    assert P.select_detections([det("keyboard", 0.95, (0.1, 0.5, 0.9, 0.9)), det("mouse", 0.95, (0.5, 0.5, 0.6, 0.6)),
++                                det("tie", 0.95, (0.4, 0.4, 0.5, 0.7))]) == []                   # own keyboard/mouse are not alarms
++
++
++def test_a_phone_that_the_model_also_calls_a_remote_stays_a_phone():
++    box = (0.40, 0.50, 0.50, 0.70)
++    out = P.dedupe_detections([det("remote", 0.60, box), det("cell phone", 0.35, (0.41, 0.51, 0.51, 0.71))])
++    assert [d["name"] for d in out] == ["cell phone"]
++
++
++def test_overlapping_duplicate_person_boxes_collapse_to_one():
++    out = P.dedupe_detections([det("person", 0.9, (0.1, 0.1, 0.6, 0.95)), det("person", 0.6, (0.12, 0.12, 0.6, 0.95))])
++    assert len(out) == 1 and out[0]["conf"] == 0.9
++
++
++# ------------------------------------------------------------------ merging the full-frame pass with the tile pass
++def test_a_cut_off_piece_of_the_candidate_found_on_a_tile_is_not_a_second_person():
++    full = [det("person", 0.90, (0.20, 0.25, 1.00, 1.00))]
++    tiled = [det("person", 0.85, (0.38, 0.28, 0.93, 0.62)), det("person", 0.85, (0.23, 0.44, 0.62, 0.99))]
++    assert len(P.merge_passes(full, tiled)) == 1
++
++
++def test_a_small_far_person_that_only_a_tile_can_see_is_found():
++    full = [det("person", 0.90, (0.20, 0.25, 0.70, 1.00))]
++    tiled = [det("person", 0.72, (0.80, 0.40, 0.88, 0.70))]
++    merged = P.merge_passes(full, tiled)
++    assert len(merged) == 2
++
++
++def test_weak_tile_only_people_are_rejected_because_zoom_makes_blurry_backgrounds_look_like_people():
++    assert len(P.merge_passes([det("person", 0.9, (0.2, 0.3, 0.7, 1.0))], [det("person", 0.56, (0.80, 0.40, 0.95, 0.80))])) == 1
++
++
++def test_a_phone_seen_by_the_full_frame_and_a_tile_is_one_phone():
++    full = [det("cell phone", 0.40, (0.40, 0.50, 0.46, 0.62))]
++    tiled = [det("cell phone", 0.55, (0.405, 0.505, 0.462, 0.625))]
++    assert len(P.merge_passes(full, tiled)) == 1
++
++
++# ------------------------------------------------------------------ counting people
++def test_people_counting():
++    me = (0.25, 0.20, 0.75, 1.00)
++    my_face = (0.42, 0.25, 0.58, 0.50)
++    other = (0.78, 0.30, 0.98, 1.00)
++    other_face = (0.82, 0.32, 0.94, 0.50)
++    assert P.count_people([me], [my_face]) == 1                            # one person, one face
++    assert P.count_people([me], []) == 1                                   # face turned away: still a person
++    assert P.count_people([], [my_face]) == 1                              # body cut off by the frame, face seen
++    assert P.count_people([me, other], [my_face]) == 2                     # someone without a visible face
++    assert P.count_people([me, other], [my_face, other_face]) == 2         # faces are not counted twice
++    assert P.count_people([me], [my_face, (0.60, 0.30, 0.70, 0.45)]) == 2  # two heads inside one merged box
++    assert P.count_people([me], [my_face, (0.01, 0.30, 0.10, 0.45)]) == 2  # a face with no body box at the edge
++    assert P.count_people([], []) == 0
++
++
++# ------------------------------------------------------------------ fusing one frame into findings
++def face(box, landmarks=None, blend=None):
++    return {"box": box, "landmarks": landmarks if landmarks is not None else neutral(), "blend": blend or {}}
++
++
++ME = (0.25, 0.20, 0.75, 1.00)
++MY_FACE = (0.42, 0.25, 0.58, 0.50)
++
++
++def test_a_lone_candidate_raises_nothing():
++    out = P.build_findings([face(MY_FACE)], [det("person", 0.9, ME)])
++    assert out["findings"] == [] and out["face_count"] == 1 and out["person_count"] == 1
++
++
++def test_someone_behind_the_candidate_with_no_visible_face_is_a_second_person():
++    out = P.build_findings([face(MY_FACE)], [det("person", 0.9, ME), det("person", 0.7, (0.78, 0.30, 0.98, 1.0))])
++    assert codes(out["findings"]) == ["MULTIPLE_PERSONS"] and out["person_count"] == 2
++
++
++def test_two_visible_faces_are_reported_as_multiple_faces_not_double_reported():
++    out = P.build_findings([face(MY_FACE), face((0.80, 0.30, 0.95, 0.5))], [det("person", 0.9, ME), det("person", 0.8, (0.76, 0.28, 0.99, 1.0))])
++    assert codes(out["findings"]) == ["MULTIPLE_FACES"]
++
++
++def test_body_in_view_but_no_face_is_no_face_with_an_explanation():
++    out = P.build_findings([], [det("person", 0.9, ME)])
++    assert codes(out["findings"]) == ["NO_FACE"] and "face is not visible" in out["findings"][0]["detail"]
++
++
++def test_empty_room_is_no_face():
++    out = P.build_findings([], [])
++    assert codes(out["findings"]) == ["NO_FACE"] and out["findings"][0]["detail"] == "No face visible"
++
++
++def test_phone_is_its_own_finding_with_the_confidence():
++    out = P.build_findings([face(MY_FACE)], [det("person", 0.9, ME), det("cell phone", 0.42, (0.60, 0.60, 0.66, 0.74))])
++    assert codes(out["findings"]) == ["PHONE_DETECTED"] and "42%" in out["findings"][0]["detail"] and out["phone_count"] == 1
++
++
++def test_two_phones_are_counted_and_a_book_is_a_separate_prohibited_object():
++    out = P.build_findings([face(MY_FACE)], [det("cell phone", 0.5, (0.1, 0.5, 0.15, 0.62)), det("cell phone", 0.4, (0.8, 0.5, 0.85, 0.62)),
++                                              det("book", 0.7, (0.4, 0.8, 0.6, 0.95))])
++    assert sorted(codes(out["findings"])) == ["PHONE_DETECTED", "PROHIBITED_OBJECT"]
++    assert "2 mobile phones" in out["findings"][0]["detail"] or "2 mobile phones" in out["findings"][1]["detail"]
++    assert out["phone_count"] == 2
++
++
++def test_the_largest_face_is_the_candidate_not_whichever_came_first():
++    looking_away = neutral()
++    for i in P.LEFT_IRIS:
++        looking_away[i].x = 0.30
++    for i in P.RIGHT_IRIS:
++        looking_away[i].x = 0.60
++    big_ok = face(MY_FACE)
++    small_background = face((0.85, 0.3, 0.90, 0.38), landmarks=looking_away)
++    assert "LOOKING_AWAY" not in codes(P.build_findings([small_background, big_ok], None)["findings"])
++
++
++def test_when_the_object_model_is_unavailable_people_are_still_counted_from_faces():
++    out = P.build_findings([face(MY_FACE), face((0.8, 0.3, 0.95, 0.5))], None)
++    assert codes(out["findings"]) == ["MULTIPLE_FACES"] and out["person_count"] == 2
++
++
++def test_when_the_face_model_is_unavailable_people_come_from_the_object_model():
++    assert codes(P.build_findings(None, [det("person", 0.9, ME), det("person", 0.8, (0.78, 0.3, 0.98, 1.0))])["findings"]) == ["MULTIPLE_PERSONS"]
++    assert codes(P.build_findings(None, [])["findings"]) == ["NO_FACE"]            # nobody there at all
++    assert P.build_findings(None, [det("person", 0.9, ME)])["findings"] == []      # one person, nothing to say
++
++
++# ------------------------------------------------------------------ head pose from 3-D landmarks
++def posed(yaw=0.0, pitch=0.0, aspect=1.0):
++    """A synthetic face turned by `yaw` and tipped by `pitch` (chin down = positive), as MediaPipe would report it:
++    x / z normalised by frame width, y by height, z growing away from the camera."""
++    pts = neutral()
++    cy, cp, sy, sp = math.cos(math.radians(yaw)), math.cos(math.radians(pitch)), math.sin(math.radians(yaw)), math.sin(math.radians(pitch))
++
++    def place(i, x, y, z):
++        x, z = x * cy + z * sy, -x * sy + z * cy          # yaw about the vertical axis
++        y, z = y * cp - z * sp, y * sp + z * cp           # pitch about the horizontal axis
++        pts[i].x, pts[i].y, pts[i].z = 0.5 + x / aspect, 0.5 + y, z / aspect
++
++    place(P.CHEEK_LEFT, -0.25, 0, 0); place(P.CHEEK_RIGHT, 0.25, 0, 0); place(P.FACE_TOP, 0, -0.30, 0); place(P.FACE_CHIN, 0, 0.30, 0)
++    return pts
++
++
++def test_a_neutral_posed_face_raises_no_findings_at_all():
++    assert P.interpret_landmarks(posed()) == []
++
++
++def test_a_face_looking_straight_at_the_camera_has_no_pose_angle():
++    yaw, pitch = P.head_pose_from_landmarks(posed(), 1.0)
++    assert abs(yaw) < 0.5 and abs(pitch) < 0.5
++
++
++@pytest.mark.parametrize("deg", [15, 30, 45])
++def test_pitch_down_is_positive_and_accurate(deg):
++    assert P.head_pose_from_landmarks(posed(pitch=deg))[1] == pytest.approx(deg, abs=0.5)
++    assert P.head_pose_from_landmarks(posed(pitch=-deg))[1] == pytest.approx(-deg, abs=0.5)
++
++
++@pytest.mark.parametrize("deg", [20, 40])
++def test_yaw_is_measured_either_way(deg):
++    assert abs(P.head_pose_from_landmarks(posed(yaw=deg))[0]) == pytest.approx(deg, abs=0.5)
++    assert abs(P.head_pose_from_landmarks(posed(yaw=-deg))[0]) == pytest.approx(deg, abs=0.5)
++
++
++def test_pose_does_not_depend_on_the_frame_shape():
++    assert P.head_pose_from_landmarks(posed(pitch=35, aspect=16 / 9), 16 / 9)[1] == pytest.approx(35, abs=0.5)
++    assert P.head_pose_from_landmarks(posed(yaw=30, aspect=16 / 9), 16 / 9)[0] == pytest.approx(-30, abs=0.5) or \
++        P.head_pose_from_landmarks(posed(yaw=30, aspect=16 / 9), 16 / 9)[0] == pytest.approx(30, abs=0.5)
++
++
++def test_pose_is_unavailable_without_depth_or_for_a_face_facing_away():
++    class NoZ:
++        def __init__(self):
++            self.x = self.y = 0.5
++    assert P.head_pose_from_landmarks([NoZ() for _ in range(478)]) is None
++    assert P.head_pose_from_landmarks([]) is None
++    assert P.head_pose_from_landmarks(posed(yaw=180)) is None
++
++
++def test_looking_down_at_a_phone_or_the_desk_is_caught():
++    assert codes(P.interpret_landmarks(posed(pitch=35))) == ["LOOKING_DOWN"]
++    assert P.interpret_landmarks(posed(pitch=10)) == []                              # reading the lower part of the screen is fine
++    assert "LOOKING_DOWN" in codes(P.interpret_landmarks(posed(pitch=16), {"eyeLookDownLeft": 0.8, "eyeLookDownRight": 0.7}))   # head AND eyes down
++    assert "LOOKING_DOWN" not in codes(P.interpret_landmarks(posed(pitch=16), {"eyeLookDownLeft": 0.2, "eyeLookDownRight": 0.2}))
++    flat = neutral()                                                      # no depth information at all: the eyes alone decide, more strictly
++    assert "LOOKING_DOWN" in codes(P.interpret_landmarks(flat, {"eyeLookDownLeft": 0.9, "eyeLookDownRight": 0.9}))
++    assert "LOOKING_DOWN" not in codes(P.interpret_landmarks(flat, {"eyeLookDownLeft": 0.62, "eyeLookDownRight": 0.62}))
++
++
++def test_a_strongly_turned_head_is_caught_even_when_the_nose_does_not_move():
++    assert codes(P.interpret_landmarks(posed(yaw=45))) == ["HEAD_TURNED"]
++    assert P.interpret_landmarks(posed(yaw=15)) == []
++
++
++def test_looking_up_is_looking_away():
++    out = P.interpret_landmarks(posed(pitch=-35))
++    assert codes(out) == ["LOOKING_AWAY"] and "up" in out[0]["detail"]
++
++
++# ------------------------------------------------------------------ speaking: normalised by face size, steadier with blendshapes
++def mouth(open_amount, face_height):
++    pts = neutral()
++    pts[P.FACE_TOP].y, pts[P.FACE_CHIN].y = 0.5 - face_height / 2, 0.5 + face_height / 2
++    for i in P.UPPER_LIP:
++        pts[i].y = 0.5
++    for i in P.LOWER_LIP:
++        pts[i].y = 0.5 + open_amount
++    pts[291].y = 0.5
++    return pts
++
++
++def test_a_relaxed_mouth_on_a_big_close_face_is_not_speaking():
++    # absolute gap 0.06 would have tripped the old fixed 0.05 threshold; relative to a 0.6-tall face it is only 10 %
++    assert P.interpret_landmarks(mouth(0.06, 0.6)) == []
++    assert codes(P.interpret_landmarks(mouth(0.12, 0.6))) == ["LIP_MOVEMENT"]
++
++
++def test_a_small_far_face_with_an_open_mouth_is_still_caught():
++    assert codes(P.interpret_landmarks(mouth(0.03, 0.15))) == ["LIP_MOVEMENT"]    # the old absolute threshold would have missed this
++
++
++def test_jaw_open_blendshape_decides_when_available():
++    assert codes(P.interpret_landmarks(mouth(0.0, 0.5), {"jawOpen": 0.6})) == ["LIP_MOVEMENT"]
++    assert P.interpret_landmarks(mouth(0.3, 0.5), {"jawOpen": 0.05}) == []
++
++
++# ------------------------------------------------------------------ blocked camera
++def test_blocked_camera_detection():
++    assert P.covered_reason(5, 3) and "black" in P.covered_reason(5, 3)
++    assert P.covered_reason(120, 2) and "blocked" in P.covered_reason(120, 2)       # a hand / paper over the lens: bright but flat
++    assert P.covered_reason(110, 45) is None                                        # a real scene
++
++
++# ------------------------------------------------------------------ debouncing in the API layer
++def run(code_frames, code="PHONE_DETECTED"):
++    state, out = {}, []
++    for seen in code_frames:
++        out.append(cand.debounce(state, {code} if seen else set()).get(code))
++    return out
++
++
++def test_a_flickering_phone_is_confirmed_even_though_it_never_shows_twice_in_a_row():
++    assert run([1, 0, 1]) == [False, None, True]
++
++
++def test_consecutive_rules_are_unchanged_for_gaze():
++    assert run([1, 0, 1, 1, 1], "LOOKING_AWAY") == [False, None, False, False, True]
++
++
++def test_one_stray_sighting_never_confirms_and_old_sightings_age_out_of_the_window():
++    assert run([1, 0, 0, 0, 1]) == [False, None, None, None, False]
++
++
++def test_a_confirmed_event_starts_counting_again_instead_of_firing_every_frame():
++    assert run([1, 1, 1, 1, 1, 1]) == [False, True, False, True, False, True]
++
++
++def test_state_stays_small():
++    state = {}
++    for seen in [1, 1, 0, 0, 0, 0, 0]:
++        cand.debounce(state, {"PHONE_DETECTED"} if seen else set())
++    assert state["hist"] == {} and state["streaks"] == {}
++
++
++# ------------------------------------------------------------------ analyze_frame end to end with fake models
++cv2 = pytest.importorskip("cv2")
++np = pytest.importorskip("numpy")
++
++
++def data_url(img, quality=80):
++    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
++    assert ok
++    return "data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()
++
++
++@pytest.fixture()
++def scene():
++    rng = np.random.default_rng(1)
++    return (rng.normal(110, 30, (540, 960, 3))).clip(0, 255).astype("uint8")
++
++
++@pytest.fixture()
++def live(monkeypatch):
++    """A 'loaded' AI stack whose two models are fakes."""
++    monkeypatch.setitem(P._state, "loaded", True)
++    monkeypatch.setitem(P._state, "error", None)
++    monkeypatch.setitem(P._state, "cv2", cv2)
++    monkeypatch.setitem(P._state, "np", np)
++    monkeypatch.setitem(P._state, "landmarker", object())
++    monkeypatch.setitem(P._state, "yolo", object())
++    box = {"faces": [face(MY_FACE)], "dets": [det("person", 0.9, ME)]}
++    monkeypatch.setattr(P, "_detect_faces", lambda rgb: box["faces"])
++    monkeypatch.setattr(P, "_detect_objects", lambda img: box["dets"])
++    return box
++
++
++def test_a_phone_anywhere_in_the_frame_is_reported_with_boxed_evidence(live, scene):
++    live["dets"] = [det("person", 0.9, ME), det("cell phone", 0.41, (0.88, 0.80, 0.93, 0.92))]     # bottom-right corner, far from the face
++    out = P.analyze_frame(data_url(scene))
++    assert out["available"] and codes(out["findings"]) == ["PHONE_DETECTED"] and out["phone_count"] == 1
++    assert any(b["kind"] == "phone" and b["x"] > 0.8 for b in out["boxes"])
++    evidence = out["evidence_image"]
++    assert evidence and evidence.startswith("data:image/jpeg;base64,")
++    raw = base64.b64decode(evidence.split(",", 1)[1])
++    assert len(raw) <= 400_000
++    drawn = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
++    assert drawn.shape[:2] == scene.shape[:2]
++    corner = drawn[int(0.80 * 540) - 3:int(0.80 * 540) + 3, int(0.88 * 960):int(0.93 * 960)]
++    assert (corner[..., 2].astype(int) - corner[..., 1].astype(int)).max() > 80       # the red phone box was drawn on the frame
++
++
++def test_a_second_person_at_the_edge_of_the_frame_is_reported(live, scene):
++    live["dets"] = [det("person", 0.9, ME), det("person", 0.7, (0.92, 0.25, 1.0, 1.0))]            # half out of frame, far right
++    out = P.analyze_frame(data_url(scene))
++    assert codes(out["findings"]) == ["MULTIPLE_PERSONS"] and out["person_count"] == 2 and out["evidence_image"]
++    assert sum(1 for b in out["boxes"] if b["kind"] == "person") == 2
++
++
++def test_a_quiet_frame_has_no_findings_and_no_evidence(live, scene):
++    out = P.analyze_frame(data_url(scene))
++    assert out["findings"] == [] and out["evidence_image"] is None and out["person_count"] == 1
++
++
++def test_a_blocked_camera_is_reported_without_running_the_models(live, monkeypatch):
++    def boom(*a, **k):
++        raise AssertionError("models must not run on a blocked camera")
++    monkeypatch.setattr(P, "_detect_faces", boom)
++    monkeypatch.setattr(P, "_detect_objects", boom)
++    black = np.zeros((540, 960, 3), dtype="uint8")
++    assert codes(P.analyze_frame(data_url(black))["findings"]) == ["CAMERA_COVERED"]
++    flat = np.full((540, 960, 3), 140, dtype="uint8")
++    assert codes(P.analyze_frame(data_url(flat))["findings"]) == ["CAMERA_COVERED"]
++
++
++def test_a_failing_face_model_does_not_hide_a_phone(live, scene, monkeypatch):
++    def broken(rgb):
++        raise RuntimeError("landmarker crashed")
++    monkeypatch.setattr(P, "_detect_faces", broken)
++    live["dets"] = [det("person", 0.9, ME), det("cell phone", 0.6, (0.6, 0.6, 0.7, 0.8))]
++    out = P.analyze_frame(data_url(scene))
++    assert "PHONE_DETECTED" in codes(out["findings"])
++
++
++def test_without_the_face_model_phones_and_people_are_still_detected(live, scene, monkeypatch):
++    monkeypatch.setitem(P._state, "landmarker", None)
++    live["dets"] = [det("person", 0.9, ME), det("person", 0.8, (0.76, 0.28, 0.99, 1.0)), det("cell phone", 0.5, (0.1, 0.5, 0.16, 0.65))]
++    out = P.analyze_frame(data_url(scene))
++    assert sorted(codes(out["findings"])) == ["MULTIPLE_PERSONS", "PHONE_DETECTED"]
++
++
++def test_very_large_frames_are_scaled_down_but_never_cropped(live, scene, monkeypatch):
++    seen = {}
++    monkeypatch.setattr(P, "_detect_objects", lambda img: seen.setdefault("shape", img.shape) and [])
++    big = cv2.resize(scene, (2560, 1440), interpolation=cv2.INTER_LINEAR)
++    P.analyze_frame(data_url(big))
++    h, w = seen["shape"][:2]
++    assert max(h, w) == P.MAX_ANALYSIS_SIDE and w / h == pytest.approx(16 / 9, abs=0.01)
++
++
++# ------------------------------------------------------------------ model plumbing with fake models: coordinate mapping
++class FakeTensor(list):
++    """Quacks like the tensors ultralytics returns: .tolist()."""
++
++    def tolist(self):
++        return list(self)
++
++
++def yolo_result(items):
++    boxes = type("Boxes", (), {})()
++    boxes.xyxyn = FakeTensor([i[2] for i in items])
++    boxes.conf = FakeTensor([i[1] for i in items])
++    boxes.cls = FakeTensor([i[0] for i in items])
++    return type("Result", (), {"boxes": boxes})()
++
++
++class FakeYolo:
++    """names like COCO; call 1 = the full frame, call 2 = the batch of tiles."""
++    names = {0: "person", 67: "cell phone", 73: "book"}
++
++    def __init__(self, full, per_tile):
++        self.full, self.per_tile, self.calls = full, per_tile, []
++
++    def predict(self, images, imgsz, **kw):
++        self.calls.append((len(images), imgsz))
++        if len(self.calls) == 1:
++            return [yolo_result(self.full)]
++        return [yolo_result(self.per_tile.get(i, [])) for i in range(len(images))]
++
++
++def test_a_phone_found_on_a_tile_is_mapped_back_to_the_right_place_in_the_full_frame(monkeypatch, scene):
++    monkeypatch.setitem(P._state, "yolo", FakeYolo(full=[(0, 0.9, (0.2, 0.2, 0.7, 1.0))], per_tile={1: [(67, 0.5, (0.5, 0.5, 0.6, 0.7))]}))
++    monkeypatch.setitem(P._state, "yolo_classes", [0, 67])
++    monkeypatch.setattr(P, "TILED_DETECTION", True)
++    h, w = scene.shape[:2]
++    x1, y1, x2, y2 = P.tile_windows(w, h)[1]                                  # the top-right tile
++    out = {d["name"]: d for d in P._detect_objects(scene)}
++    px1, py1, px2, py2 = out["cell phone"]["box"]
++    assert (px1, py1, px2, py2) == pytest.approx(((x1 + 0.5 * (x2 - x1)) / w, (y1 + 0.5 * (y2 - y1)) / h, (x1 + 0.6 * (x2 - x1)) / w, (y1 + 0.7 * (y2 - y1)) / h))
++    assert px1 == pytest.approx(0.6875, abs=0.001)                                    # right-hand side of the frame ...
++    assert py1 == pytest.approx(0.3130, abs=0.001) and py2 < 0.5                      # ... in the upper half
++    model = P._state["yolo"]
++    assert model.calls == [(1, P.DETECT_IMGSZ), (4, P.TILE_IMGSZ)]            # one full-frame pass + one batched pass over four tiles
++
++
++def test_tiling_can_be_switched_off_for_small_hosts(monkeypatch, scene):
++    monkeypatch.setitem(P._state, "yolo", FakeYolo(full=[(67, 0.5, (0.1, 0.5, 0.2, 0.7))], per_tile={}))
++    monkeypatch.setitem(P._state, "yolo_classes", [0, 67])
++    monkeypatch.setattr(P, "TILED_DETECTION", False)
++    assert [d["name"] for d in P._detect_objects(scene)] == ["cell phone"] and len(P._state["yolo"].calls) == 1
++
++
++def test_small_frames_are_not_tiled(monkeypatch):
++    monkeypatch.setitem(P._state, "yolo", FakeYolo(full=[], per_tile={}))
++    monkeypatch.setitem(P._state, "yolo_classes", [0, 67])
++    monkeypatch.setattr(P, "TILED_DETECTION", True)
++    P._detect_objects(np.zeros((240, 320, 3), dtype="uint8"))
++    assert len(P._state["yolo"].calls) == 1
++
++
++def landmarks_in(box):
++    """478 points whose bounding box is `box` (all that face_box() looks at)."""
++    x1, y1, x2, y2 = box
++    pts = [Pt((x1 + x2) / 2, (y1 + y2) / 2) for _ in range(478)]
++    pts[0].x, pts[0].y, pts[1].x, pts[1].y = x1, y1, x2, y2
++    return pts
++
++
++class FakeLandmarker:
++    """detect() call 1 = the full frame, then one call per tile, answered from `script`."""
++
++    def __init__(self, script):
++        self.script, self.calls = script, []
++
++    def detect(self, image):
++        self.calls.append(image.data.shape)
++        faces = self.script.get(len(self.calls) - 1, [])
++        blend = [[type("C", (), {"category_name": "jawOpen", "score": 0.1})()] for _ in faces]
++        return type("D", (), {"face_landmarks": [landmarks_in(b) for b in faces], "face_blendshapes": blend})()
++
++
++def fake_mp():
++    return type("MP", (), {"Image": lambda image_format, data: type("I", (), {"data": data})(), "ImageFormat": type("F", (), {"SRGB": 1})})
++
++
++def test_faces_are_searched_on_tiles_and_mapped_back_without_double_counting(monkeypatch, scene):
++    h, w = scene.shape[:2]
++    tiles = P.tile_windows(w, h)
++    tx1, ty1, tx2, ty2 = tiles[1]
++    candidate_full = (0.40, 0.20, 0.60, 0.55)                                   # the candidate, seen on the full frame
++    far_in_tile = (0.62, 0.30, 0.74, 0.62)                                      # a small face (72x108 px) at the right, in tile-local coordinates
++    # the top-left tile sees only a cut-off half of the candidate's own face (a would-be false 'second face')
++    script = {0: [candidate_full], 1: [(0.60, 0.30, 1.0, 0.95)], 2: [far_in_tile]}
++    monkeypatch.setitem(P._state, "landmarker", FakeLandmarker(script))
++    monkeypatch.setitem(P._state, "np", np)
++    monkeypatch.setitem(P._state, "mp", fake_mp())
++    monkeypatch.setattr(P, "TILED_DETECTION", True)
++    faces = P._detect_faces(scene)
++    assert len(P._state["landmarker"].calls) == 5                               # full frame + 4 tiles
++    assert len(faces) == 2
++    far = max(faces, key=lambda f: f["box"][0])["box"]
++    assert far == pytest.approx(((tx1 + 0.62 * (tx2 - tx1)) / w, (ty1 + 0.30 * (ty2 - ty1)) / h, (tx1 + 0.74 * (tx2 - tx1)) / w, (ty1 + 0.62 * (ty2 - ty1)) / h))
++    assert all(f["blend"] == {"jawOpen": pytest.approx(0.1)} for f in faces)
++
++
++def test_an_ordinary_small_face_is_not_rejected_for_the_frames_aspect_ratio(monkeypatch, scene):
++    h, w = scene.shape[:2]                       # 960x540: a 70x90 px face is only 0.44 wide-to-tall in fractions of the frame
++    tx1, ty1, tx2, ty2 = P.tile_windows(w, h)[2]
++    tw, th = tx2 - tx1, ty2 - ty1
++    local = (100 / tw, 100 / th, 170 / tw, 190 / th)                                  # 70 x 90 px inside the bottom-left tile
++    monkeypatch.setitem(P._state, "landmarker", FakeLandmarker({0: [(0.40, 0.10, 0.60, 0.45)], 3: [local]}))
++    monkeypatch.setitem(P._state, "np", np)
++    monkeypatch.setitem(P._state, "mp", fake_mp())
++    monkeypatch.setattr(P, "TILED_DETECTION", True)
++    assert len(P._detect_faces(scene)) == 2
++
++
++def test_face_search_ignores_tiny_or_oddly_shaped_boxes_found_on_tiles(monkeypatch, scene):
++    script = {0: [(0.40, 0.20, 0.60, 0.55)], 1: [(0.10, 0.10, 0.11, 0.11)], 2: [(0.1, 0.1, 0.9, 0.2)]}   # a speck, then a wide strip
++    monkeypatch.setitem(P._state, "landmarker", FakeLandmarker(script))
++    monkeypatch.setitem(P._state, "np", np)
++    monkeypatch.setitem(P._state, "mp", fake_mp())
++    monkeypatch.setattr(P, "TILED_DETECTION", True)
++    assert len(P._detect_faces(scene)) == 1
++
++
++# ------------------------------------------------------------------ model files + loading
++def test_nothing_is_downloaded_under_test(tmp_path, monkeypatch):
++    monkeypatch.setattr(P, "_download", lambda *a, **k: pytest.fail("tests must never reach for the network"))
++    with pytest.raises(FileNotFoundError):
++        P._ensure_file(str(tmp_path / "model.task"), "https://example.invalid/model.task")
++
++
++def test_a_missing_model_is_downloaded_once_outside_tests(tmp_path, monkeypatch):
++    monkeypatch.setattr(P.settings, "env", "development")
++    got = []
++    monkeypatch.setattr(P, "_download", lambda url, dest, **k: got.append((url, dest)) or open(dest, "wb").write(b"x"))
++    target = str(tmp_path / "m.task")
++    P._ensure_file(target, "https://example.invalid/m.task")
++    P._ensure_file(target, "https://example.invalid/m.task")          # already there now
++    assert got == [("https://example.invalid/m.task", target)]
++
++
++def test_download_is_atomic_and_rejects_truncated_files(tmp_path):
++    src = tmp_path / "src.bin"
++    src.write_bytes(b"\0" * 200_000)
++    dest = tmp_path / "out" / "model.bin"
++    P._download(src.as_uri(), str(dest))
++    assert dest.stat().st_size == 200_000
++    tiny = tmp_path / "tiny.bin"
++    tiny.write_bytes(b"oops")
++    with pytest.raises(RuntimeError):
++        P._download(tiny.as_uri(), str(tmp_path / "out" / "never.bin"))
++    assert not (tmp_path / "out" / "never.bin").exists() and not list((tmp_path / "out").glob("*.part"))
++
++
++def test_only_stock_yolo_weights_are_auto_downloaded():
++    assert P._yolo_url("/x/yolov8s.pt").endswith("/yolov8s.pt")
++    assert P._yolo_url("/x/yolo11n.pt").endswith("/yolo11n.pt")
++    assert P._yolo_url("/x/my-custom-model.pt") is None
++
++
++def fresh_state():
++    return {"loaded": False, "error": None, "landmarker": None, "yolo": None, "cv2": None, "np": None, "mp": None,
++            "landmarker_error": None, "yolo_error": None, "yolo_classes": None, "attempted_at": None}
++
++
++def test_one_model_failing_to_load_leaves_the_other_working(monkeypatch):
++    monkeypatch.setattr(P, "_state", fresh_state())
++    monkeypatch.setattr(P, "_load_landmarker", lambda: (_ for _ in ()).throw(RuntimeError("face model blocked")))
++    monkeypatch.setattr(P, "_load_yolo", lambda: P._state.update(yolo=object()))
++    P._load()
++    st = P.status()
++    assert st["available"] is True and st["face_analysis"] is False and st["person_detection"] is True and "blocked" in st["face_error"]
++
++
++def test_both_models_failing_reports_why(monkeypatch):
++    monkeypatch.setattr(P, "_state", fresh_state())
++    monkeypatch.setattr(P, "_load_landmarker", lambda: (_ for _ in ()).throw(RuntimeError("no face model")))
++    monkeypatch.setattr(P, "_load_yolo", lambda: (_ for _ in ()).throw(RuntimeError("no yolo")))
++    P._load()
++    assert P._state["error"] == "no face model; no yolo" and P.status()["available"] is False
++
++
++def test_a_failed_load_is_retried_later_instead_of_staying_dead_until_restart(monkeypatch):
++    monkeypatch.setattr(P, "_state", fresh_state())
++    attempts = []
++    monkeypatch.setattr(P, "_load_landmarker", lambda: attempts.append("face") or (_ for _ in ()).throw(RuntimeError("offline")))
++    monkeypatch.setattr(P, "_load_yolo", lambda: attempts.append("yolo") or (_ for _ in ()).throw(RuntimeError("offline")))
++    P._ensure_loaded()
++    P._ensure_loaded()                                                # too soon: no second attempt
++    assert attempts == ["face", "yolo"]
++    P._state["attempted_at"] -= P.RETRY_AFTER_SECONDS + 1
++    P._ensure_loaded()
++    assert attempts == ["face", "yolo", "face", "yolo"]
++
++
++def test_a_non_coco_model_is_refused_with_a_clear_reason(monkeypatch):
++    class Fake:
++        names = {0: "cat", 1: "dog"}
++    ultralytics = pytest.importorskip("ultralytics")
++    monkeypatch.setattr(ultralytics, "YOLO", lambda path: Fake())
++    monkeypatch.setattr(P, "_ensure_file", lambda *a, **k: None)
++    monkeypatch.setattr(P, "_state", fresh_state())
++    with pytest.raises(RuntimeError, match="not a COCO model"):
++        P._load_yolo()
++
++
++# ------------------------------------------------------------------ smoke test against REAL weights (skipped when absent)
++@pytest.mark.skipif(not os.path.exists(P.YOLO_MODEL_PATH), reason="YOLO weights not installed")
++def test_real_yolo_runs_over_the_whole_frame(scene, monkeypatch):
++    pytest.importorskip("ultralytics")
++    monkeypatch.setattr(P, "_state", fresh_state())
++    P._load()
++    if P._state["yolo"] is None:
++        pytest.skip(f"YOLO could not load: {P._state['yolo_error']}")
++    out = P._detect_objects(cv2.resize(scene, (960, 540)))
++    assert isinstance(out, list) and all(d["name"] in P.WANTED_CLASSES and all(0 <= v <= 1 for v in d["box"]) for d in out)
++
++
++def test_health_reports_each_model_and_never_triggers_a_load(env, monkeypatch):
++    monkeypatch.setattr(P, "_state", fresh_state())
++    body = env.client.get("/health/ready").json()["ai_proctoring"]
++    assert body["loaded"] is False and body["face_model"] is False and body["object_model"] is False
++    assert P._state["loaded"] is False                                   # a health check must never block on loading models
++    monkeypatch.setitem(P._state, "landmarker", object())
++    monkeypatch.setitem(P._state, "yolo_error", "weights missing")
++    body = env.client.get("/health/ready").json()["ai_proctoring"]
++    assert body["face_model"] is True and body["object_model"] is False and body["object_error"] == "weights missing"
+diff --git a/docs/AI_PROCTORING.md b/docs/AI_PROCTORING.md
+new file mode 100644
+index 0000000..3cc7d72
+--- /dev/null
++++ b/docs/AI_PROCTORING.md
+@@ -0,0 +1,61 @@
++# AI proctoring
++
++Optional (needs the `WITH_AI=true` image, or `pip install -r backend/requirements-ai.txt`). Without it the platform runs normally and AI analysis is reported as "unavailable". Findings are **evidence for a human reviewer**: by default AI findings never end a test (`ai_can_terminate` is off).
++
++## What it watches
++
++The browser sends one frame every `analysis_interval_seconds` (default 3 s, minimum 2 s). The server analyses it, and only records a violation after the finding repeats, so a single odd frame is never a violation.
++
++| Code | Raised when | Severity | Confirmed after |
++|---|---|---|---|
++| `PHONE_DETECTED` | a mobile phone anywhere in the frame (confidence ≥ 0.30) | serious | 2 sightings within 4 frames |
++| `MULTIPLE_PERSONS` | two or more people, including someone turned away, at the edge of the frame, partly out of it, or too small/far for a face to be found | serious | 2 within 4 frames |
++| `MULTIPLE_FACES` | two or more faces | serious | 2 within 4 frames |
++| `PROHIBITED_OBJECT` | a book, second laptop, extra screen or remote | serious | 2 within 4 frames |
++| `NO_FACE` | no face found (the detail says whether a body is still in view) | serious | 2 in a row |
++| `CAMERA_COVERED` | black frame, or a flat featureless one (hand / paper over the lens) | serious | 2 in a row |
++| `LOOKING_DOWN` | head tipped down ≥ 25° (≥ 14° if the eyes also look down): phone in the lap, notes on the desk | minor | 3 in a row |
++| `LOOKING_AWAY` | eyes far left/right, or head tipped up ≥ 25° | minor | 3 in a row |
++| `HEAD_TURNED` | head turned (nose position, or ≥ 35° from the 3-D pose) | minor | 3 in a row |
++| `LIP_MOVEMENT` | mouth clearly open (jaw blendshape; falls back to lip gap relative to face height) | minor | 3 in a row |
++
++Phones and people use a *sliding window* ("2 of the last 4 frames") rather than "2 in a row", because a phone half-hidden by a hand drops out of every other frame. Voice is detected in the browser from the microphone (adaptive to the room's noise level) when the test requires a microphone.
++
++## The whole camera is analysed, never a region
++
++- The browser asks the camera for its **wide 16:9 view** (1280×720 ideal) and sends the **entire frame** at 960 px wide. The preview shows the same uncropped frame (`object-fit: contain`), with corner marks on the true edges.
++- On the server nothing is masked or cropped. Objects and people are searched on the full frame **and** on four overlapping tiles that together cover the frame edge to edge (a ~1.6× zoom, to find a small phone on the desk or a person far in the background). Faces are searched the same way.
++- People are counted by fusing YOLO `person` boxes with face detections, so a person with no visible face still counts, and a face is never counted twice.
++- When a phone or extra person is found, the stored evidence image is the frame **with every detection boxed**. The candidate's preview shows the same boxes live, so they can see and fix what was flagged.
++
++## Setup
++
++| Setting | Default | Meaning |
++|---|---|---|
++| `AI_PROCTORING_ENABLED` | `true` | master switch |
++| `AI_MODEL_AUTODOWNLOAD` | `true` | download missing model files on first use (never done under `APP_ENV=test`) |
++| `FACE_MODEL_PATH` / `FACE_MODEL_URL` | `backend/face_landmarker.task` / Google's MediaPipe URL | face model |
++| `YOLO_MODEL_PATH` | `backend/yolov8s.pt` (an existing `yolov8n.pt` is also accepted) | any COCO YOLOv8 / YOLO11 weights |
++| `AI_TILED_DETECTION` | `true` | the tile pass; turn **off** on small hosts (see cost) |
++| `AI_PHONE_CONFIDENCE` | `0.30` | lower = more phones found, more false alarms |
++| `AI_PERSON_CONFIDENCE` / `AI_OBJECT_CONFIDENCE` | `0.45` / `0.50` | |
++| `AI_DETECT_IMGSZ` / `AI_TILE_IMGSZ` | `640` | keep at 640 (see below) |
++| `AI_PITCH_DOWN_DEG` / `AI_YAW_TURN_DEG` | `25` / `35` | head-pose limits |
++
++With `WITH_AI=true` the Dockerfile downloads both models at build time and the app also loads them in the background at start-up. `GET /health/ready` reports whether AI loaded. The two models load independently: if one cannot be fetched, the other still works (and `status()` says which is missing). A failed load is retried every 5 minutes.
++
++`python -m app.proctoring download-models` fetches the models by hand.
++
++## Cost (measured)
++
++On a 2-vCPU CPU-only machine, one 960×540 frame with `yolov8s`: **~150 ms** without the tile pass, **~700 ms** with it (decode + detection + boxing; the face model was not part of this measurement). At the default 3 s interval that is roughly 5 % / 25 % of that machine's time per concurrently-testing candidate. Size the host for your concurrency, or set `AI_TILED_DETECTION=false` / use `yolov8n.pt` to cut it. Only the tile pass can find small, far-away phones, so turning it off trades recall for CPU.
++
++`AI_DETECT_IMGSZ` stays at 640 on purpose: YOLOv8 was trained at that scale, and running the whole frame larger made a close-up person *less* recognisable (measured 0.91 → 0.39 confidence at 960). Small objects are handled by the tiles instead.
++
++## What it does not do (yet)
++
++- **No calibration on real exam footage.** Thresholds are sensible starting points, not tuned values. Record a few real sessions and adjust the table above.
++- **COCO has no class for earbuds, headphones, smartwatches, notes held in a hand or a phone with the screen off.** Those need a custom-trained model (point `YOLO_MODEL_PATH` at it; the class names must still include `person` and `cell phone`).
++- **No identity verification** (matching the candidate to an ID photo). It needs a face-recognition model and a privacy/consent decision, so it was left out.
++- **No liveness check:** a photo or video held up to the camera is not detected.
++- **A second screen or device outside the camera's view is invisible to any camera-based check.**
+diff --git a/docs/KNOWN_GAPS.md b/docs/KNOWN_GAPS.md
+index 1a96bae..40ef522 100644
+--- a/docs/KNOWN_GAPS.md
++++ b/docs/KNOWN_GAPS.md
+@@ -11,7 +11,7 @@
+ - Live human proctoring video streaming; recordings are periodic snapshots only.
+ 
+ **Implemented but not verified in this build environment**
+-- AI proctoring with real MediaPipe/YOLO models and real webcams. Only landmark math and debouncing are unit-tested; head-turn and gaze thresholds are untuned and need calibration on real footage.
++- AI proctoring (see `docs/AI_PROCTORING.md`). Phone / person detection was run against real YOLOv8 weights on sample photos (people, including overlapping and small ones) but **not on photos of phones or real exam-room footage**; the MediaPipe face path (face counting, gaze, head pose, blendshapes) is unit-tested with synthetic landmarks and fake models only, never against the real face model or a real webcam. All thresholds (phone 0.30, head-down 25°, ...) are starting points that need calibration on real footage. The Dockerfile model-download step was not built (no Docker daemon).
+ - Real e-mail delivery (Brevo, Resend and SMTP are tested against fakes only; send yourself a test invitation after deploy)
+ - The built-in code runner: verified here for Python, JavaScript, TypeScript, C, C++, Java, Go, Ruby, PHP, Perl and Bash. The other languages are wired but untested without their compilers.
+ - Real SMTP delivery (messages are verified to reach the outbox/SMTP client in tests).
+diff --git a/frontend/src/pages/candidate/ExamRoom.jsx b/frontend/src/pages/candidate/ExamRoom.jsx
+index 3a58403..1a30b33 100644
+--- a/frontend/src/pages/candidate/ExamRoom.jsx
++++ b/frontend/src/pages/candidate/ExamRoom.jsx
+@@ -76,6 +76,7 @@ function Exam({ state, media, onDone }) {
+   const [fsLost, setFsLost] = useState(false)
+   const [ready, setReady] = useState(false)              // user gesture gate (camera / fullscreen) after a refresh
+   const [hint, setHint] = useState('')
++  const [boxes, setBoxes] = useState([])                 // what the AI currently sees (phones, extra people), as fractions of the frame
+   const [gateErr, setGateErr] = useState('')
+ 
+   const clockRef = useRef({ remaining: state.attempt.remaining_seconds, at: performance.now() })
+@@ -205,14 +206,17 @@ function Exam({ state, media, onDone }) {
+     let busy = false
+     const id = setInterval(async () => {
+       if (busy || finishing.current) return
+-      const img = media.capture(video.current, 320, 0.5); if (!img) return
++      // The WHOLE camera frame at 960 px wide. (It used to be 320 px: a phone shrank to a few pixels before the AI saw it.)
++      const img = media.capture(video.current, 960, 0.72); if (!img) return
+       busy = true
+       try {
+         const r = await cand.post('/attempt/analyze', { image: img })
+         if (r.terminated) { finishing.current = true; onDone(); return }
+         const live = r.findings || []
+         setHint(r.available && live.length ? live[0].label : '')
+-        if (r.outcome?.recorded) pushAlert(r.outcome, cfg.auto_terminate && cfg.ai_can_terminate)
++        setBoxes(r.available ? (r.boxes || []) : [])
++        const recorded = r.outcomes?.length ? r.outcomes : r.outcome?.recorded ? [r.outcome] : []
++        recorded.forEach((o) => pushAlert(o, cfg.auto_terminate && cfg.ai_can_terminate))
+       } catch { /* skip this frame */ } finally { busy = false }
+     }, cfg.analysis_interval_seconds * 1000)
+     return () => clearInterval(id)
+@@ -284,7 +288,7 @@ function Exam({ state, media, onDone }) {
+         </main>
+ 
+         <aside className="room-side">
+-          {needCam && <CamTile video={video} camOn={media.cam} issue={hint} monitoring={!!cfg.ai_monitoring} />}
++          {needCam && <CamTile video={video} camOn={media.cam} issue={hint} monitoring={!!cfg.ai_monitoring} boxes={boxes} />}
+           {view === 'questions' && <nav aria-label="Question navigator">{sections.map((g, gi) => (
+             <div key={gi}>{g.s && <div className="nav-sec">{g.s}</div>}<div className="qgrid">{g.items.map((i) => { const id = questions[i].id; return <button key={id} className={`qn ${i === idx ? 'cur' : ''} ${answers[id] != null ? 'ans' : ''} ${flagged.includes(id) ? 'flag' : ''}`} aria-label={`Question ${i + 1}${answers[id] != null ? ', answered' : ''}${flagged.includes(id) ? ', flagged' : ''}`} onClick={() => { setIdx(i); setView('questions') }}>{i + 1}</button> })}</div></div>))}
+             <div className="legend mt"><span><i style={{ background: 'var(--accent)' }} />Answered</span><span><i style={{ background: 'var(--warn)' }} />Flagged</span><span><i style={{ background: 'var(--neutral-soft)' }} />Not answered</span></div></nav>}
+diff --git a/frontend/src/pages/candidate/Lobby.jsx b/frontend/src/pages/candidate/Lobby.jsx
+index 00c8010..fbe8ae4 100644
+--- a/frontend/src/pages/candidate/Lobby.jsx
++++ b/frontend/src/pages/candidate/Lobby.jsx
+@@ -60,7 +60,7 @@ export default function Lobby({ state, media, onStarted }) {
+             <div>
+               {!media.cam || (cfg.microphone_required && !media.mic)
+                 ? <><p className="mb">Allow camera{cfg.microphone_required ? ' and microphone' : ''} access so we can check your setup.</p><Button icon={Camera} variant="primary" onClick={() => media.request({ video: true, audio: cfg.microphone_required })}>Turn on camera</Button></>
+-                : <Alert tone="ok">Camera{cfg.microphone_required ? ' and microphone are' : ' is'} working. Make sure your face is clearly visible and well lit.</Alert>}
++                : <Alert tone="ok">Camera{cfg.microphone_required ? ' and microphone are' : ' is'} working. Make sure your face is clearly visible and well lit. The whole camera view is monitored during the test, so keep phones, notes and other people out of the picture.</Alert>}
+               {media.error && <Alert tone="bad" className="mt">{media.error}</Alert>}
+               {cfg.id_verification && media.cam && (
+                 <div className="mt"><h3 className="mb">Verify your identity</h3>
+diff --git a/frontend/src/pages/candidate/ProctorHud.jsx b/frontend/src/pages/candidate/ProctorHud.jsx
+index c70e867..6066954 100644
+--- a/frontend/src/pages/candidate/ProctorHud.jsx
++++ b/frontend/src/pages/candidate/ProctorHud.jsx
+@@ -1,5 +1,5 @@
+-import { useEffect, useRef } from 'react'
+-import { AlertTriangle, AppWindow, Camera, CameraOff, ClipboardX, Expand, Keyboard, MousePointerClick, ScanFace, ShieldAlert, ShieldCheck, Users, Volume2, X } from 'lucide-react'
++import { useEffect, useRef, useState } from 'react'
++import { AlertTriangle, AppWindow, Camera, CameraOff, ClipboardX, Expand, Keyboard, MousePointerClick, ScanFace, ShieldAlert, ShieldCheck, Smartphone, Users, Volume2, X } from 'lucide-react'
+ 
+ // What the candidate is told for each recorded event. The server decides severity; this is wording only.
+ const INFO = {
+@@ -16,7 +16,10 @@ const INFO = {
+   AUDIO_VOICE: { icon: Volume2, title: 'Talking detected', advice: 'Please stay quiet during the test.' },
+   NO_FACE: { icon: ScanFace, title: 'We cannot see your face', advice: 'Sit in front of the camera with your face fully visible.' },
+   MULTIPLE_FACES: { icon: Users, title: 'More than one person in view', advice: 'You must be alone during the test.' },
++  MULTIPLE_PERSONS: { icon: Users, title: 'Another person is in the camera view', advice: 'You must be alone. Nobody else may be visible anywhere in the camera, even at the edge.' },
++  PHONE_DETECTED: { icon: Smartphone, title: 'Mobile phone in the camera view', advice: 'Put your phone away, out of the room or out of sight, for the rest of the test.' },
+   LOOKING_AWAY: { icon: ScanFace, title: 'Looking away from the screen', advice: 'Keep your eyes on the screen.' },
++  LOOKING_DOWN: { icon: ScanFace, title: 'Looking down', advice: 'Keep your head and eyes facing the screen, not your lap or desk.' },
+   HEAD_TURNED: { icon: ScanFace, title: 'Head turned away', advice: 'Face the screen.' },
+   LIP_MOVEMENT: { icon: Volume2, title: 'Possible speaking detected', advice: 'Please do not speak during the test.' },
+   PROHIBITED_OBJECT: { icon: ShieldAlert, title: 'Prohibited object in view', advice: 'Remove phones, books and other devices from view.' },
+@@ -66,21 +69,34 @@ function AlertCard({ a, onDismiss }) {
+   )
+ }
+ 
+-/** Live camera tile with a status chip and a face guide. `issue`: current live finding label, if any. */
+-export function CamTile({ video, camOn, issue, monitoring }) {
++/** Live camera tile with a status chip. It shows the camera's ENTIRE view, uncropped, because the whole view is monitored.
++ *  `issue`: current live finding label, if any. `boxes`: what the AI currently sees, as fractions of the frame. */
++export function CamTile({ video, camOn, issue, monitoring, boxes = [] }) {
++  const [ratio, setRatio] = useState(16 / 9)   // follows the real camera, so the preview is never cropped or stretched
+   const state = !camOn ? 'off' : issue ? 'check' : monitoring ? 'ok' : 'idle'
+   const text = { off: 'Camera off', check: issue, ok: 'Monitoring', idle: 'Camera on' }[state]
++  const people = boxes.filter((b) => b.kind === 'person').length
++  // the candidate's own outline is noise; show people only when there is more than one
++  const shown = camOn ? boxes.filter((b) => b.kind !== 'person' || people > 1) : []
++  const sync = (e) => { const v = e.currentTarget; if (v.videoWidth && v.videoHeight) setRatio(v.videoWidth / v.videoHeight) }
+   return (
+     <div className={`cam-tile ${state}`}>
+-      <div className="cam"><video ref={video} muted playsInline autoPlay aria-label="Your camera" />
++      <div className="cam" style={{ aspectRatio: ratio }}>
++        <video ref={video} muted playsInline autoPlay aria-label="Your camera" onLoadedMetadata={sync} onResize={sync} />
+         {!camOn && <div className="ph"><Camera size={20} />Camera off</div>}
+         {camOn && <span className="cam-guide" aria-hidden><i /><i /><i /><i /></span>}
++        {shown.map((b, i) => (
++          // the preview is mirrored, so mirror the box too
++          <span key={i} className={`cam-box ${b.kind}${b.y < 0.07 ? ' edge' : ''}`} style={{ left: `${(1 - b.x - b.w) * 100}%`, top: `${b.y * 100}%`, width: `${b.w * 100}%`, height: `${b.h * 100}%` }}><em>{b.label}</em></span>
++        ))}
+       </div>
+       <div className="cam-chip" role="status">
+         {state === 'ok' ? <ShieldCheck size={14} /> : state === 'off' ? <CameraOff size={14} /> : state === 'check' ? <AlertTriangle size={14} /> : <Camera size={14} />}
+         <span>{text}</span>{state === 'ok' && <i className="live-dot" aria-hidden />}
+       </div>
+-      {state === 'check' && <p className="cam-tip">Look at the screen and keep only your face in view.</p>}
++      {state === 'check'
++        ? <p className="cam-tip">The whole camera view is monitored. Look at the screen, and keep phones, notes and other people out of view.</p>
++        : camOn && <p className="cam-tip">Everything this camera can see is monitored, including the edges.</p>}
+     </div>
+   )
+ }
+diff --git a/frontend/src/pages/candidate/useMedia.js b/frontend/src/pages/candidate/useMedia.js
+index 7834f2e..ce10814 100644
+--- a/frontend/src/pages/candidate/useMedia.js
++++ b/frontend/src/pages/candidate/useMedia.js
+@@ -9,7 +9,9 @@ export function useMedia() {
+     if (!video && !audio) return true
+     if (!navigator.mediaDevices?.getUserMedia) { setState((s) => ({ ...s, error: 'This browser cannot access a camera. Use a recent Chrome, Edge or Firefox.' })); return false }
+     try {
+-      const stream = await navigator.mediaDevices.getUserMedia({ video: video ? { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' } : false, audio: !!audio })
++      // 16:9 at 720p: the camera's WIDE view, so nothing at the edges of the room is cut off. The old 640x480 request made
++      // many browsers crop the sides of a wide sensor, hiding exactly the area (a second person, a phone) we need to see.
++      const stream = await navigator.mediaDevices.getUserMedia({ video: video ? { width: { ideal: 1280 }, height: { ideal: 720 }, aspectRatio: { ideal: 16 / 9 }, frameRate: { ideal: 15, max: 30 }, facingMode: 'user' } : false, audio: !!audio })
+       streamRef.current?.getTracks().forEach((t) => t.stop())
+       streamRef.current = stream
+       stream.getTracks().forEach((t) => { t.onended = () => setState((s) => ({ ...s, cam: t.kind === 'video' ? false : s.cam, mic: t.kind === 'audio' ? false : s.mic })) })
+@@ -27,27 +29,34 @@ export function useMedia() {
+ 
+   // attach the stream to any <video> element
+   const attach = useCallback((el) => { if (el && streamRef.current && el.srcObject !== streamRef.current) { el.srcObject = streamRef.current; el.play?.().catch(() => {}) } }, [])
++  // Always the WHOLE frame (never a crop), scaled down to `width` at the same aspect ratio and never scaled UP.
+   const capture = useCallback((videoEl, width = 320, quality = 0.6) => {
+     const v = videoEl; if (!v || !v.videoWidth) return null
+-    const c = document.createElement('canvas'); c.width = width; c.height = Math.round((v.videoHeight / v.videoWidth) * width)
++    const w = Math.min(width, v.videoWidth)
++    const c = document.createElement('canvas'); c.width = w; c.height = Math.round((v.videoHeight / v.videoWidth) * w)
+     c.getContext('2d').drawImage(v, 0, 0, c.width, c.height)
+     return c.toDataURL('image/jpeg', quality)
+   }, [])
+   return { ...state, request, stop, attach, capture, streamRef }
+ }
+ 
+-// Rough "someone is talking" detector: sustained level above a threshold. Conservative on purpose.
++// Rough "someone is talking" detector: sustained level clearly above THIS room's ambient noise. Conservative on purpose.
++// A fixed threshold either fires all the time in a noisy room or never in a very quiet one, so the ambient level is
++// learned continuously (it falls quickly, rises slowly, so speech itself does not raise the bar).
+ export function watchVoice(stream, onVoice) {
+   try {
+     const Ctx = window.AudioContext || window.webkitAudioContext
+     if (!Ctx || !stream.getAudioTracks().length) return () => {}
+     const ctx = new Ctx(); const src = ctx.createMediaStreamSource(stream); const an = ctx.createAnalyser(); an.fftSize = 1024; src.connect(an)
+-    const buf = new Uint8Array(an.fftSize); let loud = 0
++    const buf = new Uint8Array(an.fftSize); let loud = 0, floor = null, ticks = 0
+     const id = setInterval(() => {
+       an.getByteTimeDomainData(buf)
+       let sum = 0; for (let i = 0; i < buf.length; i++) { const v = (buf[i] - 128) / 128; sum += v * v }
+       const rms = Math.sqrt(sum / buf.length)
+-      loud = rms > 0.07 ? loud + 1 : Math.max(0, loud - 1)
++      floor = floor == null ? rms : rms < floor ? floor * 0.5 + rms * 0.5 : floor + (rms - floor) * 0.01
++      if (++ticks < 8) return                                    // first ~2 s: just learn the room
++      const threshold = Math.max(0.05, Math.min(floor, 0.04) * 3 + 0.02)
++      loud = rms > threshold ? loud + 1 : Math.max(0, loud - 1)
+       if (loud >= 12) { loud = 0; onVoice() }   // ~3 s of sustained sound (250 ms ticks)
+     }, 250)
+     return () => { clearInterval(id); ctx.close().catch(() => {}) }
+diff --git a/frontend/src/styles/pages.css b/frontend/src/styles/pages.css
+index 729b97f..019de3b 100644
+--- a/frontend/src/styles/pages.css
++++ b/frontend/src/styles/pages.css
+@@ -50,8 +50,10 @@
+ .syscheck li { display: flex; gap: 10px; align-items: center; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); }
+ .syscheck li.ok { border-color: var(--ok); background: var(--ok-soft); }
+ .syscheck li.bad { border-color: var(--bad); background: var(--bad-soft); }
+-.preview { position: relative; aspect-ratio: 4 / 3; background: var(--ink); border-radius: var(--radius); overflow: hidden; }
+-.preview video, .cam video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); display: block; }
++/* The preview shows the camera's WHOLE view (16:9 by default, matching what the AI analyses). `contain`, never `cover`:
++   a cropped preview would hide the very edges the proctoring looks at. */
++.preview { position: relative; aspect-ratio: 16 / 9; background: var(--ink); border-radius: var(--radius); overflow: hidden; }
++.preview video, .cam video { width: 100%; height: 100%; object-fit: contain; transform: scaleX(-1); display: block; }
+ .preview .ph, .cam .ph { position: absolute; inset: 0; display: grid; place-content: center; justify-items: center; gap: 6px; color: var(--ink-mute); font-size: 13px; }
+ .scorebox { text-align: center; padding: 24px; border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--surface-2); margin: 16px 0; }
+ .scorebox .big { font: 600 48px var(--font-display); }
+@@ -99,7 +101,7 @@ pre.bad { background: var(--bad-soft); color: var(--bad); padding: 10px; border-
+ .option input { position: absolute; opacity: 0; pointer-events: none; }
+ .option .key { width: 26px; height: 26px; flex: none; display: grid; place-items: center; border-radius: 50%; border: 1px solid var(--line-strong); font: 600 12px var(--font-mono); }
+ .option.on .key { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+-.cam { position: relative; aspect-ratio: 4 / 3; background: var(--ink); border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); }
++.cam { position: relative; aspect-ratio: 16 / 9; background: var(--ink); border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); }
+ .nav-sec { font-size: 12px; color: var(--text-3); margin: 10px 0 6px; font-weight: 600; }
+ .qgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(38px, 1fr)); gap: 6px; }
+ .qn { height: 38px; border-radius: var(--radius); border: 1px solid var(--line-strong); background: var(--neutral-soft); color: var(--text); font: 600 13px var(--font-mono); cursor: pointer; }
+@@ -166,13 +168,20 @@ body.in-exam .theme-float { display: none; }
+ .cam-tile.ok .cam { border-color: var(--ok); }
+ .cam-tile.check .cam { border-color: var(--warn); box-shadow: 0 0 0 3px var(--warn-soft); }
+ .cam-tile.off .cam { border-color: var(--bad); }
+-.cam-guide { position: absolute; inset: 14%; pointer-events: none; opacity: 0.7; }
++/* corner marks sit on the very edge of the picture: the entire frame is monitored, not a centre region */
++.cam-guide { position: absolute; inset: 4px; pointer-events: none; opacity: 0.7; }
+ .cam-guide i { position: absolute; width: 16px; height: 16px; border: 2px solid rgba(255, 255, 255, 0.85); }
+ .cam-guide i:nth-child(1) { top: 0; left: 0; border-right: 0; border-bottom: 0; border-top-left-radius: 6px; }
+ .cam-guide i:nth-child(2) { top: 0; right: 0; border-left: 0; border-bottom: 0; border-top-right-radius: 6px; }
+ .cam-guide i:nth-child(3) { bottom: 0; left: 0; border-right: 0; border-top: 0; border-bottom-left-radius: 6px; }
+ .cam-guide i:nth-child(4) { bottom: 0; right: 0; border-left: 0; border-top: 0; border-bottom-right-radius: 6px; }
+ .cam-tile.check .cam-guide i { border-color: var(--warn); }
++/* what the AI currently sees (phones, extra people), drawn over the preview */
++.cam-box { position: absolute; border: 2px solid var(--bad); border-radius: 4px; pointer-events: none; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35); }
++.cam-box.person { border-color: var(--warn); }
++.cam-box em { position: absolute; left: -2px; top: -20px; padding: 1px 6px; border-radius: 4px 4px 4px 0; background: var(--bad); color: #fff; font-size: 11px; font-weight: 600; font-style: normal; white-space: nowrap; }
++.cam-box.person em { background: var(--warn); }
++.cam-box.edge em { top: 2px; }   /* a box touching the top edge keeps its label inside the picture */
+ .cam-chip { margin-top: 8px; display: flex; align-items: center; gap: 7px; padding: 6px 10px; border-radius: var(--radius); font-size: 12.5px; font-weight: 600; background: var(--neutral-soft); color: var(--text-2); }
+ .cam-tile.ok .cam-chip { background: var(--ok-soft); color: var(--ok); }
+ .cam-tile.check .cam-chip { background: var(--warn-soft); color: var(--warn); }

@@ -4,12 +4,13 @@ from datetime import timedelta
 from typing import Any, Dict, List, NamedTuple, Optional
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import Response
 from app.mongo import func
 from app.mongo import Session
 
 from app import (
-    attempt_service, audit, auth, coding, email_verification, exam_service, models, proctor_rules, proctoring, scoring, serializers, staff_service,
-    storage, tenancy, webhooks,
+    attempt_service, audit, auth, coding, email_verification, exam_service, models, omr_pdf, omr_service, proctor_rules, proctoring, scoring, serializers,
+    staff_service, storage, tenancy, webhooks,
 )
 from app.constants import (
     ACCESS_INVITE, ATT_IN_PROGRESS, ATT_REGISTERED, ATT_SUBMITTED, ATT_TERMINATED, ATT_VOIDED, CLIENT_REPORTABLE,
@@ -30,8 +31,59 @@ MAX_ANSWER_CHARS = 4000
 MAX_PERIODIC_SNAPSHOTS = 300
 MIN_ANALYZE_GAP_SECONDS = 1.0
 # consecutive suspicious frames required before the server records an AI violation (kills one-frame flukes)
-STREAK_REQUIRED = {"NO_FACE": 2, "MULTIPLE_FACES": 2, "LOOKING_AWAY": 3, "HEAD_TURNED": 3, "LIP_MOVEMENT": 3,
-                   "PROHIBITED_OBJECT": 2, "CAMERA_COVERED": 2}
+STREAK_REQUIRED = {"NO_FACE": 2, "MULTIPLE_FACES": 2, "LOOKING_AWAY": 3, "HEAD_TURNED": 3, "LOOKING_DOWN": 3, "LIP_MOVEMENT": 3,
+                   "PROHIBITED_OBJECT": 2, "PHONE_DETECTED": 2, "MULTIPLE_PERSONS": 2, "CAMERA_COVERED": 2,
+                   "NO_FACE_BODY": 6}          # competitive exams: face hidden but the person is still in view (head down over rough work)
+# Object and person sightings FLICKER: a phone half hidden by a hand drops out of every other frame, a second person leans
+# in and out of view. Requiring them in consecutive frames lets exactly that behaviour slip through, so these codes are
+# confirmed by "N sightings within the last M frames" instead.
+WINDOW_RULES = {"PHONE_DETECTED": (2, 4), "PROHIBITED_OBJECT": (2, 4), "MULTIPLE_PERSONS": (2, 4), "MULTIPLE_FACES": (2, 4)}
+
+
+def apply_exam_policy(findings, cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Frame findings -> {debounce key: finding}, after the test's own rules.
+
+    Competitive-exam tests expect rough work on paper, so looking down is not a finding at all, and a face that
+    disappears while the person is still in view (head bent over the desk) must last ~6 frames instead of 2 before it
+    counts. Phones, other people, a covered camera, turning away or nobody being there are judged exactly as before."""
+    present: Dict[str, Dict[str, Any]] = {}
+    competitive = bool(cfg.get("competitive_exam"))
+    for f in findings:
+        key = f["code"]
+        if competitive and key == "LOOKING_DOWN":
+            continue
+        if competitive and key == "NO_FACE" and f.get("body_visible"):
+            key = "NO_FACE_BODY"
+        present[key] = f
+    return present
+
+
+def debounce(state: Dict[str, Any], present) -> Dict[str, bool]:
+    """Advance the per-code frame history kept on the attempt by one frame.
+
+    `present` is the set of finding codes in this frame. Returns {code: confirmed} for the codes seen in this frame and
+    updates `state["streaks"]` (consecutive rule) and `state["hist"]` (sliding-window rule) in place. A confirmed code
+    starts counting from zero again, so one ongoing event is recorded once per confirmation, not once per frame."""
+    streaks = dict(state.get("streaks") or {})
+    hist = {code: list(h) for code, h in (state.get("hist") or {}).items()}
+    confirmed: Dict[str, bool] = {}
+    for code in set(streaks) | set(hist) | set(present):
+        seen = code in present
+        if code in WINDOW_RULES:
+            need, window = WINDOW_RULES[code]
+            frames = (hist.get(code, []) + [1 if seen else 0])[-window:]
+            hit = seen and sum(frames) >= need
+            hist[code] = [] if hit else frames
+        else:
+            streaks[code] = streaks.get(code, 0) + 1 if seen else 0
+            hit = seen and streaks[code] >= STREAK_REQUIRED.get(code, 2)
+            if hit:
+                streaks[code] = 0
+        if seen:
+            confirmed[code] = hit
+    state["streaks"] = {c: n for c, n in streaks.items() if n}
+    state["hist"] = {c: h for c, h in hist.items() if any(h)}
+    return confirmed
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +128,10 @@ def _public_test(db: Session, exam: models.Exam, org: models.Organization) -> Di
         "unavailable_reason": None if (state == "open" and not blocked) else (
             "This test is not available right now. Please contact the organizer." if blocked else
             {"closed": "This test is closed.", "not_started": "This test has not opened yet.", "ended": "The window for this test has ended."}[state]),
-        "proctoring": {k: cfg[k] for k in ("webcam_required", "microphone_required", "fullscreen_required", "ai_monitoring", "id_verification")},
+        "proctoring": {k: cfg[k] for k in ("webcam_required", "microphone_required", "fullscreen_required", "ai_monitoring", "id_verification", "competitive_exam")},
         "instructions": exam.instructions,
         "is_sample": bool(exam.is_sample),
+        "omr_enabled": bool(exam.omr_enabled), "question_sets": exam.question_sets or 1, "calculator": exam.calculator or "off",
         "requires_email_verification": settings.candidate_email_verification,
         "email_domains": list(org.allowed_domains or []) if org.candidate_domain_lock and org.allowed_domains else [],
     }
@@ -132,7 +185,10 @@ def _state_payload(db: Session, ctx: AttemptCtx) -> Dict[str, Any]:
         "test": {**_public_test(db, exam, org), "id": exam.id, "result_visibility": exam.result_visibility,
                  "proctoring_config": _candidate_cfg(exam)},
         "candidate": {"name": ctx.user.full_name, "email": ctx.user.email},
+        "paper_set": attempt.paper_set,
     }
+    if exam.omr_enabled:
+        payload["omr"] = omr_service.live_header(attempt, exam, org, ctx.user)
     if attempt.status == ATT_IN_PROGRESS:
         payload.update(
             questions=attempt.question_data or [], answers=attempt.answers or {}, flagged=attempt.flagged or [],
@@ -291,6 +347,21 @@ def get_state(ctx: AttemptCtx = Depends(attempt_ctx), db: Session = Depends(get_
     return _state_payload(db, ctx)
 
 
+@router.get("/omr.pdf")
+@limiter.limit("20/minute")
+def my_omr(request: Request, tz: Optional[str] = Query(default=None, max_length=64), ctx: AttemptCtx = Depends(attempt_ctx), db: Session = Depends(get_db)):
+    """The candidate's own OMR sheet (only when the organizer switched OMR on for the test). Never carries the answer key."""
+    attempt, exam = ctx.attempt, ctx.exam
+    if not exam.omr_enabled:
+        raise ApiError(403, "The organizer has not enabled the OMR sheet for this test.", "omr_disabled")
+    if not attempt.question_data:
+        raise conflict("Start the test first", "not_started")
+    org = db.get(models.Organization, exam.org_id)
+    sheet = omr_service.sheet_for_attempt(attempt, exam, org, ctx.user, evaluated=False, tz=tz)
+    return Response(omr_pdf.render([sheet]), media_type="application/pdf", headers={
+        "Cache-Control": "private, no-store", "Content-Disposition": f'attachment; filename="OMR-{omr_service.safe_filename(ctx.user.full_name)}.pdf"'})
+
+
 @router.post("/start")
 def start_attempt(request: Request, body: StartRequest, ctx: AttemptCtx = Depends(attempt_ctx), db: Session = Depends(get_db)):
     attempt, exam = ctx.attempt, ctx.exam
@@ -314,8 +385,20 @@ def start_attempt(request: Request, body: StartRequest, ctx: AttemptCtx = Depend
     questions = db.query(models.Question).filter(models.Question.exam_id == exam.id).order_by(models.Question.position, models.Question.id).all()
     if not questions and not exam.coding_problems:
         raise bad_request("This test has no questions yet", "empty_test")
-    question_data, answer_key = scoring.build_attempt_questions(
-        questions, per_attempt=exam.questions_per_attempt, shuffle_questions=exam.shuffle_questions, shuffle_options=exam.shuffle_options)
+    n_sets = int(exam.question_sets or 1)
+    if n_sets > 1:
+        # Fixed papers: Set A, Set B ... Every candidate of a set gets the identical paper; sets are handed out evenly.
+        used: Dict[str, int] = {}
+        for other in db.query(models.Attempt).filter(models.Attempt.exam_id == exam.id, models.Attempt.status != ATT_VOIDED).all():
+            if other.paper_set and other.id != attempt.id:
+                used[other.paper_set] = used.get(other.paper_set, 0) + 1
+        index = scoring.pick_set(used, n_sets)
+        question_data, answer_key = scoring.build_set_paper(
+            questions, exam_id=exam.id, index=index, per_attempt=exam.questions_per_attempt, shuffle_options=bool(exam.shuffle_options))
+        attempt.paper_set = scoring.set_letter(index)
+    else:
+        question_data, answer_key = scoring.build_attempt_questions(
+            questions, per_attempt=exam.questions_per_attempt, shuffle_questions=exam.shuffle_questions, shuffle_options=exam.shuffle_options)
 
     for kind, image in (("id", body.id_image), ("face", body.face_image)):
         if image:
@@ -327,7 +410,8 @@ def start_attempt(request: Request, body: StartRequest, ctx: AttemptCtx = Depend
     attempt.status, attempt.started_at, attempt.consent_at = ATT_IN_PROGRESS, now, now
     attempt.system_info = {k: str(v)[:200] for k, v in list((body.system_info or {}).items())[:20]}
     attempt.last_heartbeat_at = now
-    audit.log_event(db, "ATTEMPT_STARTED", user=ctx.user, entity_type="attempt", entity_id=attempt.id, details=f"exam={exam.id}", ip=auth.client_ip(request))
+    audit.log_event(db, "ATTEMPT_STARTED", user=ctx.user, entity_type="attempt", entity_id=attempt.id,
+                    details=f"exam={exam.id}" + (f" set={attempt.paper_set}" if attempt.paper_set else ""), ip=auth.client_ip(request))
     webhooks.emit(db, attempt.org_id, "attempt.started", {"attempt_id": attempt.id, "test_id": exam.id, "test_title": exam.title,
                                                           "candidate": {"name": ctx.user.full_name, "email": ctx.user.email}})
     db.commit()
@@ -430,27 +514,28 @@ def analyze(body: ImageIn, ctx: AttemptCtx = Depends(attempt_ctx), db: Session =
         db.commit()
         return empty
 
-    streaks: Dict[str, int] = dict(state.get("streaks", {}))
-    present = {f["code"]: f for f in result["findings"]}
-    for code in list(streaks):
-        if code not in present:
-            streaks[code] = 0
+    present = apply_exam_policy(result["findings"], cfg)
+    confirmed = debounce(state, set(present))
+    # evidence: the frame with every detection boxed when the AI produced one, otherwise the raw frame
+    evidence = result.get("evidence_image") or body.image
     reported = []
-    outcome = None
-    for code, finding in present.items():
-        streaks[code] = streaks.get(code, 0) + 1
+    outcomes = []
+    for key, finding in present.items():
+        code = finding["code"]
         sev, _, label, _ = VIOLATION_CATALOG[code]
-        reported.append({"code": code, "label": label, "severity": sev, "detail": finding.get("detail"), "confirmed": streaks[code] >= STREAK_REQUIRED.get(code, 2)})
-        if streaks[code] >= STREAK_REQUIRED.get(code, 2):
-            outcome = proctor_rules.record_violation(db, attempt, exam, code, details=finding.get("detail"), image=body.image, source="ai")
-            streaks[code] = 0
+        reported.append({"code": code, "label": label, "severity": sev, "detail": finding.get("detail"), "confirmed": confirmed[key]})
+        if confirmed[key]:
+            outcomes.append(proctor_rules.record_violation(db, attempt, exam, code, details=finding.get("detail"), image=evidence, source="ai"))
             db.refresh(attempt)
-    state["streaks"] = streaks
+    reported.sort(key=lambda r: -r["severity"])          # the candidate's hint shows the most serious finding first
+    recorded = [o for o in outcomes if o.get("recorded")]
+    outcome = max(recorded, key=lambda o: o["severity"]) if recorded else (outcomes[-1] if outcomes else None)
     attempt.last_state = state
     db.commit()
-    return {"available": True, "face_count": result["face_count"], "findings": reported,
+    return {"available": True, "face_count": result.get("face_count", 0), "person_count": result.get("person_count", 0),
+            "phone_count": result.get("phone_count", 0), "boxes": result.get("boxes", []), "findings": reported,
             "level2_count": attempt.level2_count, "terminated": attempt.status == ATT_TERMINATED,
-            "outcome": outcome}
+            "outcome": outcome, "outcomes": recorded}
 
 
 # ---------------------------------------------------------------------------

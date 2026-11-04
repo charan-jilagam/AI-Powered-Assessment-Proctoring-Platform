@@ -77,14 +77,14 @@ def test_candidate_domain_lock_restricts_who_can_join(env):
 
 
 # ---------------------------------------------------------------- sample tests
-def test_new_organizations_get_two_published_trial_tests(env):
+def test_new_organizations_get_three_published_trial_tests(env):
     env.make_super()
     r = _create(env, install_samples=True, admin_email="sai@sconexsoft.com", allowed_domains=[])
     assert r.status_code == 201
     admin = {"Authorization": "Bearer " + env.login("sai@sconexsoft.com")}
     rows = env.client.get("/tests", headers=admin).json()["items"]
-    assert len(rows) == 2 and all(t["is_sample"] and t["status"] == "published" and t["title"].startswith("[Trial]") for t in rows)
-    assert sorted(t["coding_problem_count"] for t in rows) == [0, 2]
+    assert len(rows) == 3 and all(t["is_sample"] and t["status"] == "published" and t["title"].startswith("[Trial]") for t in rows)
+    assert sorted(t["coding_problem_count"] for t in rows) == [0, 0, 2]
     # they are real: a candidate can join one
     code = rows[0]["code"]
     assert env.client.get(f"/public/tests/{code}").json()["is_sample"] is True
@@ -99,7 +99,7 @@ def test_trial_tests_do_not_use_up_the_active_test_allowance(env):
     db.commit()
     db.close()
     usage = env.client.get("/org", headers=org["headers"]).json()["usage"]
-    assert usage["active_tests"] == 0 and usage["total_tests"] == 2
+    assert usage["active_tests"] == 0 and usage["total_tests"] == 3
     t1, t2 = env.make_test(org, publish=False), env.make_test(org, publish=False)
     assert env.client.post(f"/tests/{t1['id']}/publish", headers=org["headers"]).status_code == 200
     assert env.client.post(f"/tests/{t2['id']}/publish", headers=org["headers"]).status_code == 200
@@ -108,17 +108,17 @@ def test_trial_tests_do_not_use_up_the_active_test_allowance(env):
 def test_installing_samples_is_idempotent_and_available_on_demand(env):
     org = env.make_org()
     first = env.client.post("/tests/samples", headers=org["headers"])
-    assert first.status_code == 201 and len(first.json()["created"]) == 2
+    assert first.status_code == 201 and len(first.json()["created"]) == 3
     again = env.client.post("/tests/samples", headers=org["headers"])
     assert again.json()["created"] == []
-    assert env.client.get("/tests", headers=org["headers"]).json()["total"] == 2
+    assert env.client.get("/tests", headers=org["headers"]).json()["total"] == 3
 
 
 def test_sample_test_content_is_valid_and_scores_correctly(env):
     org = env.make_org()
     env.client.post("/tests/samples", headers=org["headers"])
     rows = env.client.get("/tests", headers=org["headers"]).json()["items"]
-    quiz = next(t for t in rows if t["coding_problem_count"] == 0)
+    quiz = next(t for t in rows if t["coding_problem_count"] == 0 and "OMR" not in t["title"])
     detail = env.client.get(f"/tests/{quiz['id']}", headers=org["headers"]).json()
     assert len(detail["questions"]) == 10 and {q["question_type"] for q in detail["questions"]} == {"single", "multiple", "true_false", "short_text"}
     cand = env.candidate(quiz["code"])

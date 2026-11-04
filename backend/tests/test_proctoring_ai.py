@@ -184,3 +184,116 @@ def test_a_camera_that_went_dark_is_recorded_with_evidence(ai_env):
     report = ai_env.client.get(f"/attempts/{c['attempt_id']}", headers=org["headers"]).json()
     v = report["violations"][0]
     assert v["code"] == "CAMERA_COVERED" and v["snapshot_id"] and v["details"].startswith("[ai]")
+
+
+# ---------------------------------------------------------------- phones, extra people and the whole-frame results
+def png(r, g, b):
+    """A valid 1x1 PNG of the given colour (so two evidence images can be told apart)."""
+    import base64
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+
+    raw = b"\x00" + bytes((r, g, b))
+    blob = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+    return "data:image/png;base64," + base64.b64encode(blob).decode()
+
+
+def analyze(env, c, **result):
+    """One /attempt/analyze call against a fake AI result. Anything not given defaults to a quiet single-person frame."""
+    findings = [{"code": code, "detail": "d"} for code in result.pop("codes", [])]
+    env.frames["next"] = {"available": True, "face_count": 1, "person_count": 1, "phone_count": 0, "boxes": [], "findings": findings, **result}
+    return env.client.post("/attempt/analyze", headers=c["headers"], json={"image": TINY}).json()
+
+
+def test_a_phone_that_keeps_dropping_out_of_view_is_still_recorded(ai_env):
+    """A phone half hidden by a hand is seen in every other frame; 'two in a row' would let exactly that through."""
+    org = ai_env.make_org()
+    c = ai_env.candidate(ai_test(ai_env, org)["code"])
+    assert analyze(ai_env, c, codes=["PHONE_DETECTED"])["findings"][0]["confirmed"] is False
+    analyze(ai_env, c)                                                   # the hand moved: no phone this frame
+    assert recorded(ai_env, org, c) == []
+    out = analyze(ai_env, c, codes=["PHONE_DETECTED"])
+    assert out["findings"][0]["confirmed"] is True and recorded(ai_env, org, c) == ["PHONE_DETECTED"]
+
+
+def test_a_single_stray_phone_sighting_is_not_a_violation(ai_env):
+    org = ai_env.make_org()
+    c = ai_env.candidate(ai_test(ai_env, org)["code"])
+    analyze(ai_env, c, codes=["PHONE_DETECTED"])
+    for _ in range(4):
+        analyze(ai_env, c)
+    assert recorded(ai_env, org, c) == []
+
+
+def test_the_boxed_frame_is_stored_as_evidence_instead_of_the_raw_frame(ai_env, monkeypatch):
+    org = ai_env.make_org()
+    c = ai_env.candidate(ai_test(ai_env, org)["code"])
+    seen = []
+    original = candidate_router.proctor_rules.record_violation
+    monkeypatch.setattr(candidate_router.proctor_rules, "record_violation", lambda *a, **kw: seen.append(kw.get("image")) or original(*a, **kw))
+    boxed = png(255, 0, 0)
+    for _ in range(2):
+        analyze(ai_env, c, codes=["PHONE_DETECTED"], evidence_image=boxed)
+    assert seen == [boxed] and seen[0] != TINY
+    analyze(ai_env, c, codes=["LOOKING_AWAY"])                           # no annotated frame for gaze: the raw frame is used
+    analyze(ai_env, c, codes=["LOOKING_AWAY"])
+    analyze(ai_env, c, codes=["LOOKING_AWAY"])
+    assert seen[-1] == TINY
+
+
+def test_the_response_reports_what_the_ai_sees_and_every_alert_that_was_recorded(ai_env):
+    org = ai_env.make_org()
+    c = ai_env.candidate(ai_test(ai_env, org)["code"])
+    boxes = [{"kind": "phone", "label": "Phone", "conf": 0.4, "x": 0.8, "y": 0.7, "w": 0.1, "h": 0.2}]
+    both = dict(codes=["PHONE_DETECTED", "MULTIPLE_PERSONS"], person_count=2, phone_count=1, boxes=boxes)
+    analyze(ai_env, c, **both)
+    out = analyze(ai_env, c, **both)
+    assert out["person_count"] == 2 and out["phone_count"] == 1 and out["boxes"] == boxes
+    assert {o["code"] for o in out["outcomes"]} == {"PHONE_DETECTED", "MULTIPLE_PERSONS"}     # neither alert is lost
+    assert set(recorded(ai_env, org, c)) == {"PHONE_DETECTED", "MULTIPLE_PERSONS"}
+
+
+def test_the_most_serious_finding_comes_first_so_it_is_the_one_shown_to_the_candidate(ai_env):
+    org = ai_env.make_org()
+    c = ai_env.candidate(ai_test(ai_env, org)["code"])
+    out = analyze(ai_env, c, codes=["LOOKING_AWAY", "PHONE_DETECTED"])
+    assert [f["code"] for f in out["findings"]] == ["PHONE_DETECTED", "LOOKING_AWAY"]
+
+
+def test_a_phone_and_a_second_person_are_serious_but_do_not_terminate_unless_the_org_opts_in(ai_env):
+    org = ai_env.make_org()
+    c = ai_env.candidate(ai_test(ai_env, org, max_level2_violations=1)["code"])
+    for _ in range(3):
+        out = analyze(ai_env, c, codes=["PHONE_DETECTED", "MULTIPLE_PERSONS"])
+    assert out["terminated"] is False and out["level2_count"] == 0
+    assert set(recorded(ai_env, org, c)) >= {"PHONE_DETECTED", "MULTIPLE_PERSONS"}
+
+
+@pytest.mark.parametrize("code", ["PHONE_DETECTED", "MULTIPLE_PERSONS"])
+def test_a_phone_or_a_second_person_ends_the_test_when_the_org_opts_in(ai_env, code):
+    org = ai_env.make_org()
+    c = ai_env.candidate(ai_test(ai_env, org, max_level2_violations=1, ai_can_terminate=True)["code"])
+    analyze(ai_env, c, codes=[code])
+    out = analyze(ai_env, c, codes=[code])
+    assert out["terminated"] is True
+
+
+def test_looking_down_is_a_minor_flag_that_needs_a_sustained_look(ai_env):
+    org = ai_env.make_org()
+    c = ai_env.candidate(ai_test(ai_env, org)["code"])
+    analyze(ai_env, c, codes=["LOOKING_DOWN"])
+    analyze(ai_env, c, codes=["LOOKING_DOWN"])
+    assert recorded(ai_env, org, c) == []
+    out = analyze(ai_env, c, codes=["LOOKING_DOWN"])
+    assert recorded(ai_env, org, c) == ["LOOKING_DOWN"] and out["findings"][0]["severity"] == 1
+
+
+def test_the_browser_cannot_report_the_ai_codes_itself(ai_env):
+    org = ai_env.make_org()
+    c = ai_env.candidate(ai_test(ai_env, org)["code"])
+    for code in ("PHONE_DETECTED", "MULTIPLE_PERSONS", "LOOKING_DOWN"):
+        assert ai_env.client.post("/attempt/violations", headers=c["headers"], json={"code": code}).status_code == 400

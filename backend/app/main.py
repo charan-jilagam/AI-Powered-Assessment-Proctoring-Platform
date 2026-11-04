@@ -21,7 +21,7 @@ from app import database
 from app.mongo import IntegrityError
 from app.database import SessionLocal
 from app.limiter import limiter
-from app.routers import auth_routes, bank, billing, candidate, invites, org, public, results, superadmin, tests
+from app.routers import auth_routes, bank, billing, candidate, invites, omr, org, public, results, superadmin, tests
 from app.seed import bootstrap_super_admin, seed_plans
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
@@ -64,6 +64,8 @@ async def lifespan(_: FastAPI):
         log.exception("startup seeding failed (is MongoDB reachable?)")
     finally:
         db.close()
+    if settings.env != "test":
+        proctoring.warm_up_async()   # load / download the AI models now, not while the first candidate waits
     task = asyncio.create_task(_sweeper()) if settings.run_sweeper else None
     yield
     if task:
@@ -174,7 +176,10 @@ def ready():
         db_ok = False
     ai = proctoring._state
     body = {"status": "healthy" if db_ok else "degraded", "database": "connected" if db_ok else "unreachable", "version": VERSION,
-            "ai_proctoring": {"enabled": settings.ai_proctoring_enabled, "loaded": ai["loaded"] and ai["error"] is None, "error": ai["error"]},
+            "ai_proctoring": {"enabled": settings.ai_proctoring_enabled, "loaded": ai["loaded"] and ai["error"] is None, "error": ai["error"],
+                              # per model, read from state only: a health check must never trigger (or wait for) a model load
+                              "face_model": ai["landmarker"] is not None, "object_model": ai["yolo"] is not None,
+                              "face_error": ai["landmarker_error"], "object_error": ai["yolo_error"]},
             "mail": {"provider": settings.mail_provider or None, "configured": settings.mail_enabled},
             "code_runner": {"engine": judge0.CODE_RUNNER, "languages": len(judge0.get_languages()) if judge0.CODE_RUNNER == "local" else None,
                             "isolated": local_runner.isolation_active() if judge0.CODE_RUNNER == "local" else None}}
@@ -182,7 +187,7 @@ def ready():
 
 
 for r in (auth_routes.router, public.router, billing.router, superadmin.router, org.router, tests.router, bank.router, invites.router,
-          candidate.public_router, candidate.router, results.router, coding.router):
+          candidate.public_router, candidate.router, results.router, omr.router, coding.router):
     app.include_router(r)
 
 

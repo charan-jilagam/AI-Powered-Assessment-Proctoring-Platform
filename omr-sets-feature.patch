@@ -1,0 +1,2824 @@
+diff --git a/README.md b/README.md
+index 2015f9d..57276dc 100644
+--- a/README.md
++++ b/README.md
+@@ -19,7 +19,7 @@ Data is isolated per organization on every query; see `backend/tests/test_tenanc
+ 
+ **Platform (super admin):** organizations with trial/active/suspended/cancelled status · plans (seats, active tests, candidates/month, AI proctoring, coding, API, webhooks, evidence retention) with per-org overrides · platform admins · demo-request leads · e-mail outbox · audit log · platform usage dashboard.
+ 
+-**Test authoring (admin):** single / multiple / true-false / short-text questions · sections · negative marking · per-question marks and difficulty · shuffle questions and options · reusable question bank with tags · CSV import · built-in 36-question starter library (Python, JavaScript, SQL, DSA, CS fundamentals, aptitude) · coding problems with hidden test cases, added by hand **or imported from JSON** (format shown in the app) · 30+ languages (Judge0 or the built-in runner) · two ready-made trial tests per organization · e-mail verification for admins and candidates · per-organization allowed e-mail domains · in-app user guides at `/guide` · duplicate test · publish/close/archive · regenerate code.
++**Test authoring (admin):** single / multiple / true-false / short-text questions · sections · negative marking · per-question marks and difficulty · shuffle questions and options · reusable question bank with tags · CSV import · built-in 36-question starter library (Python, JavaScript, SQL, DSA, CS fundamentals, aptitude) · fixed question sets A/B/C… · live OMR answer sheet with PDF / ZIP / blank-template downloads · coding problems with hidden test cases, added by hand **or imported from JSON** (format shown in the app) · 30+ languages (Judge0 or the built-in runner) · three ready-made trial tests per organization (incl. a 40-question aptitude paper with OMR and sets) · e-mail verification for admins and candidates · per-organization allowed e-mail domains · in-app user guides at `/guide` · duplicate test · publish/close/archive · regenerate code.
+ 
+ **Access control:** 8-character code and share link `/t/{code}` · optional access password · invite-only mode with per-candidate links · start/end window · max attempts · custom candidate fields · one live session per attempt (a second join ends the first).
+ 
+diff --git a/backend/app/constants.py b/backend/app/constants.py
+index 606d487..0b0b1f6 100644
+--- a/backend/app/constants.py
++++ b/backend/app/constants.py
+@@ -112,6 +112,7 @@ DEFAULT_PROCTORING = {
+     "block_right_click": True,
+     "auto_terminate": True,
+     "ai_can_terminate": False,   # AI findings are for human review unless the org opts in
++    "competitive_exam": False,   # rough work on paper is expected: looking down is not flagged
+     "max_level2_violations": 3,
+     "snapshot_interval_seconds": 60,
+     "analysis_interval_seconds": 3,
+diff --git a/backend/app/exam_service.py b/backend/app/exam_service.py
+index 8a5247f..e311efa 100644
+--- a/backend/app/exam_service.py
++++ b/backend/app/exam_service.py
+@@ -65,6 +65,7 @@ def exam_summary(db: Session, exam: models.Exam) -> Dict[str, Any]:
+         "attempts": counts, "attempts_total": sum(counts.values()),
+         "created_at": exam.created_at, "published_at": exam.published_at,
+         "is_sample": bool(exam.is_sample),
++        "question_sets": exam.question_sets or 1, "omr_enabled": bool(exam.omr_enabled), "calculator": exam.calculator or "off",
+     }
+ 
+ 
+@@ -77,6 +78,7 @@ def exam_detail(db: Session, exam: models.Exam) -> Dict[str, Any]:
+         questions_per_attempt=exam.questions_per_attempt,
+         shuffle_questions=exam.shuffle_questions,
+         shuffle_options=exam.shuffle_options,
++        omr_institute=exam.omr_institute, omr_note=exam.omr_note,
+         pass_percentage=exam.pass_percentage,
+         result_visibility=exam.result_visibility,
+         proctoring={**DEFAULT_PROCTORING, **(exam.proctoring or {})},
+@@ -146,6 +148,7 @@ def duplicate_exam(db: Session, src: models.Exam, user: models.User) -> models.E
+         instructions=src.instructions, code=new_code(db), status=EXAM_DRAFT, duration_minutes=src.duration_minutes,
+         access_mode=src.access_mode, access_password_hash=src.access_password_hash, questions_per_attempt=src.questions_per_attempt,
+         shuffle_questions=src.shuffle_questions, shuffle_options=src.shuffle_options, pass_percentage=src.pass_percentage,
++        question_sets=src.question_sets or 1, omr_enabled=bool(src.omr_enabled), calculator=src.calculator or "off", omr_institute=src.omr_institute, omr_note=src.omr_note,
+         result_visibility=src.result_visibility, proctoring=dict(src.proctoring or {}), candidate_fields=list(src.candidate_fields or []),
+     )
+     db.add(copy)
+diff --git a/backend/app/main.py b/backend/app/main.py
+index b6bace0..caadf50 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -21,7 +21,7 @@ from app import database
+ from app.mongo import IntegrityError
+ from app.database import SessionLocal
+ from app.limiter import limiter
+-from app.routers import auth_routes, bank, billing, candidate, invites, org, public, results, superadmin, tests
++from app.routers import auth_routes, bank, billing, candidate, invites, omr, org, public, results, superadmin, tests
+ from app.seed import bootstrap_super_admin, seed_plans
+ 
+ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
+@@ -187,7 +187,7 @@ def ready():
+ 
+ 
+ for r in (auth_routes.router, public.router, billing.router, superadmin.router, org.router, tests.router, bank.router, invites.router,
+-          candidate.public_router, candidate.router, results.router, coding.router):
++          candidate.public_router, candidate.router, results.router, omr.router, coding.router):
+     app.include_router(r)
+ 
+ 
+diff --git a/backend/app/models.py b/backend/app/models.py
+index 72c2e3e..000aed7 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -232,6 +232,11 @@ class Exam(Model):
+     questions_per_attempt = Field()              # None = every question
+     shuffle_questions = Field(default=True)
+     shuffle_options = Field(default=True)
++    question_sets = Field(default=1)             # 1 = no sets; 2..6 = fixed papers Set A, B, C ... (same paper for everyone in a set)
++    calculator = Field(default="off")             # on-screen calculator for candidates: off | basic | scientific
++    omr_enabled = Field(default=False)           # candidates get a live OMR answer sheet next to the questions
++    omr_institute = Field()                      # name printed at the top of the OMR sheet (defaults to the organization)
++    omr_note = Field()                           # extra line under the institute name (address, exam centre ...)
+     pass_percentage = Field(default=40.0)
+     result_visibility = Field(default="score")
+     proctoring = Field(factory=dict)
+@@ -308,6 +313,7 @@ class Attempt(Model):
+     answer_key = Field(factory=dict)             # NEVER sent to clients
+     answers = Field(factory=dict)
+     flagged = Field(factory=list)
++    paper_set = Field()                          # "A", "B" ... when the test uses fixed question sets
+ 
+     score = Field()
+     max_score = Field()
+diff --git a/backend/app/omr_pdf.py b/backend/app/omr_pdf.py
+new file mode 100644
+index 0000000..5cac758
+--- /dev/null
++++ b/backend/app/omr_pdf.py
+@@ -0,0 +1,444 @@
++"""OMR answer sheets as PDF (A4, vector, prints cleanly on any printer).
++
++One :class:`OmrSheet` is one candidate's sheet (or one blank template). ``render`` draws any number of them into a
++single PDF, starting each on a fresh page. The layout is deterministic and has no database access, so it is tested
++by rendering and reading the PDF back.
++
++Sheet anatomy: alignment marks in the four corners, institute header, candidate / test details, the set bubbles,
++instructions, the bubble grid (questions numbered down each column, in blocks of five rows) and signature boxes. An
++*evaluated* copy additionally colours each mark (green right, red wrong), rings the right answer and prints the score.
++"""
++from __future__ import annotations
++
++import io
++from dataclasses import dataclass, field
++from typing import Dict, List, Optional, Sequence, Tuple
++
++from reportlab.lib.colors import Color, black, white
++from reportlab.lib.pagesizes import A4
++from reportlab.pdfbase.pdfmetrics import stringWidth
++from reportlab.pdfgen import canvas
++
++PAGE_W, PAGE_H = A4
++MARGIN = 34.0                       # content margin; the alignment marks sit just outside it
++CONTENT_W = PAGE_W - 2 * MARGIN
++GROUP = 5                           # rows per block
++GROUP_GAP = 5.0
++
++INK = Color(0.10, 0.12, 0.16)
++MUTED = Color(0.40, 0.43, 0.48)
++LINE = Color(0.62, 0.65, 0.70)
++FAINT = Color(0.93, 0.94, 0.96)
++GREEN = Color(0.10, 0.55, 0.28)
++RED = Color(0.80, 0.15, 0.15)
++BAND = Color(0.12, 0.16, 0.24)
++
++FONT, BOLD = "Helvetica", "Helvetica-Bold"
++
++
++@dataclass
++class OmrQuestion:
++    number: int
++    kind: str                                   # single | multiple | true_false | short_text
++    labels: List[str] = field(default_factory=list)          # bubble letters, e.g. A B C D  (T F for true/false)
++    marked: List[int] = field(default_factory=list)          # indexes the candidate filled
++    correct: Optional[List[int]] = None                      # evaluated copies only
++    text: Optional[str] = None                               # short-text answer typed by the candidate
++    correct_text: Optional[str] = None                       # evaluated copies only
++    verdict: Optional[str] = None                            # correct | wrong | blank (evaluated copies only)
++
++
++@dataclass
++class OmrSheet:
++    institute: str
++    test_title: str
++    questions: List[OmrQuestion]
++    note: str = ""
++    test_code: str = ""
++    candidate_name: str = ""
++    email: str = ""
++    phone: str = ""
++    extras: List[Tuple[str, str]] = field(default_factory=list)   # (label, value) from the test's custom fields
++    date_text: str = ""
++    time_text: str = ""
++    duration_text: str = ""
++    attempt_ref: str = ""
++    set_letter: str = ""                                     # "" when the test has no sets
++    set_letters: str = ""                                    # every set of the test, e.g. "ABC"
++    evaluated: bool = False
++    blank: bool = False                                      # an empty template to print and hand out
++    summary: Optional[Dict[str, object]] = None              # evaluated copies: score, max, percentage, correct, wrong, blank, result
++    generated_text: str = ""
++
++
++# ---------------------------------------------------------------------------
++# small helpers
++# ---------------------------------------------------------------------------
++def _t(text: object) -> str:
++    """Helvetica can only draw Latin-1; anything else becomes '?' rather than garbage."""
++    return str(text or "").encode("latin-1", "replace").decode("latin-1")
++
++
++def _fit(text: str, font: str, size: float, width: float, min_size: float = 6.0) -> Tuple[str, float]:
++    text = _t(text)
++    while size > min_size and stringWidth(text, font, size) > width:
++        size -= 0.5
++    if stringWidth(text, font, size) > width:
++        while text and stringWidth(text + "...", font, size) > width:
++            text = text[:-1]
++        text += "..."
++    return text, size
++
++
++def _text(c, x, y, text, font=FONT, size=9, color=INK, width=None, align="left"):
++    if width is not None:
++        text, size = _fit(text, font, size, width)
++    else:
++        text = _t(text)
++    c.setFont(font, size)
++    c.setFillColor(color)
++    if align == "center":
++        c.drawCentredString(x, y, text)
++    elif align == "right":
++        c.drawRightString(x, y, text)
++    else:
++        c.drawString(x, y, text)
++
++
++def _bubble(c, cx, cy, r, label, state):
++    """state: empty | filled | right | wrong | key  (key = the right answer the candidate did not mark)."""
++    if state in ("filled", "right", "wrong"):
++        c.setFillColor({"filled": black, "right": GREEN, "wrong": RED}[state])
++        c.setStrokeColor({"filled": black, "right": GREEN, "wrong": RED}[state])
++        c.setLineWidth(0.8)
++        c.circle(cx, cy, r, stroke=1, fill=1)
++        label_color = white
++    else:
++        c.setFillColor(white)
++        c.setStrokeColor(GREEN if state == "key" else LINE)
++        c.setLineWidth(1.8 if state == "key" else 0.8)
++        c.circle(cx, cy, r, stroke=1, fill=1)
++        label_color = GREEN if state == "key" else MUTED
++    size = r * 1.05
++    c.setFillColor(label_color)
++    c.setFont(BOLD if state != "empty" else FONT, size)
++    c.drawCentredString(cx, cy - size * 0.34, label)
++
++
++def _box(c, x, y, w, h, label, value="", blank=False, value_size=9.5):
++    """A labelled field; ``y`` is the TOP edge."""
++    c.setStrokeColor(LINE)
++    c.setLineWidth(0.7)
++    c.setFillColor(white)
++    c.roundRect(x, y - h, w, h, 2.5, stroke=1, fill=1)
++    _text(c, x + 5, y - 8.5, label.upper(), BOLD, 5.8, MUTED, width=w - 10)
++    if value and not blank:
++        _text(c, x + 5, y - h + 6.5, value, BOLD, value_size, INK, width=w - 10)
++
++
++# ---------------------------------------------------------------------------
++# layout planning
++# ---------------------------------------------------------------------------
++@dataclass
++class _Plan:
++    cols: int
++    row_h: float
++    radius: float
++    spacing: float
++    pages: List[List[List[OmrQuestion]]]        # pages -> columns -> questions
++    shorts: List[OmrQuestion]
++    shorts_page: int                            # page index that carries the written answers (-1 if none)
++
++
++FIRST_TOP = 0.0       # filled in by _header (depends on how many info rows the sheet has)
++
++
++def _rows_that_fit(avail: float, row_h: float) -> int:
++    """How many rows fit in ``avail`` points, in whole blocks of GROUP rows (each block adds GROUP_GAP)."""
++    block = GROUP * row_h + GROUP_GAP
++    return max(0, int(avail // block)) * GROUP
++
++
++def _plan(sheet: OmrSheet, first_avail: float, next_avail: float, last_reserved: float) -> _Plan:
++    grid = [q for q in sheet.questions if q.kind != "short_text"]
++    shorts = [q for q in sheet.questions if q.kind == "short_text"]
++    most = max((len(q.labels) for q in grid), default=4)
++    cols = 4 if most <= 5 else 3
++    col_w = CONTENT_W / cols
++    spacing = min(22.0, (col_w - 30) / max(most, 1))
++
++    chosen = 17.0
++    for candidate in (26.0, 22.0, 19.0, 17.0):
++        rows = _rows_that_fit(first_avail - last_reserved, candidate)
++        if rows * cols >= len(grid):
++            chosen = candidate
++            break
++    row_h = chosen
++    radius = min(7.2, row_h * 0.33, spacing * 0.42)
++
++    pages: List[List[List[OmrQuestion]]] = []
++    remaining = list(grid)
++    page_no = 0
++    while remaining or not pages:
++        avail = first_avail if page_no == 0 else next_avail
++        cap_rows = _rows_that_fit(avail, row_h) or GROUP
++        # the last page also has to leave room for the signatures / summary
++        if len(remaining) <= cols * _rows_that_fit(avail - last_reserved, row_h):
++            cap_rows = _rows_that_fit(avail - last_reserved, row_h) or GROUP
++        take = remaining[: cols * cap_rows]
++        remaining = remaining[len(take):]
++        rows = -(-len(take) // cols) if take else 0
++        columns = [take[k * rows:(k + 1) * rows] for k in range(cols)] if rows else [[] for _ in range(cols)]
++        pages.append(columns)
++        page_no += 1
++        if page_no > 60:   # absolute safety net
++            break
++
++    shorts_page = -1
++    if shorts:
++        shorts_page = len(pages) - 1
++        used_rows = max((len(col) for col in pages[-1]), default=0)
++        used = used_rows * row_h + (used_rows // GROUP) * GROUP_GAP
++        avail = first_avail if len(pages) == 1 else next_avail
++        need = 22 + 15 * len(shorts)
++        if avail - last_reserved - used < need:
++            pages.append([[] for _ in range(cols)])
++            shorts_page = len(pages) - 1
++    return _Plan(cols, row_h, radius, spacing, pages, shorts, shorts_page)
++
++
++# ---------------------------------------------------------------------------
++# page furniture
++# ---------------------------------------------------------------------------
++def _corner_marks(c):
++    c.setFillColor(black)
++    for x, y in ((14, 14), (PAGE_W - 24, 14), (14, PAGE_H - 24), (PAGE_W - 24, PAGE_H - 24)):
++        c.rect(x, y, 10, 10, stroke=0, fill=1)
++
++
++def _footer(c, sheet: OmrSheet, page: int, pages: int):
++    c.setStrokeColor(LINE)
++    c.setLineWidth(0.5)
++    c.line(MARGIN, 30, PAGE_W - MARGIN, 30)
++    left = f"ORVEXA  |  {sheet.attempt_ref}" if sheet.attempt_ref else "ORVEXA"
++    if sheet.generated_text:
++        left += f"  |  {sheet.generated_text}"
++    _text(c, MARGIN, 20, left, FONT, 6.5, MUTED, width=CONTENT_W - 80)
++    _text(c, PAGE_W - MARGIN, 20, f"Page {page} of {pages}", FONT, 6.5, MUTED, align="right")
++
++
++def _first_header(c, sheet: OmrSheet) -> float:
++    """Draw the full header and return the y where the answer area may start."""
++    y = PAGE_H - 36
++    name, size = _fit(sheet.institute or "Institute", BOLD, 16, CONTENT_W)
++    _text(c, PAGE_W / 2, y - 12, name, BOLD, size, INK, align="center")
++    y -= 16
++    if sheet.note:
++        _text(c, PAGE_W / 2, y - 9, sheet.note, FONT, 8.5, MUTED, width=CONTENT_W, align="center")
++        y -= 13
++    y -= 10
++    # title band
++    c.setFillColor(BAND)
++    c.roundRect(MARGIN, y - 20, CONTENT_W, 20, 3, stroke=0, fill=1)
++    label = "OMR ANSWER SHEET" + ("  -  EVALUATED COPY" if sheet.evaluated else "  -  BLANK TEMPLATE" if sheet.blank else "")
++    _text(c, PAGE_W / 2, y - 13.5, label, BOLD, 10.5, white, align="center")
++    y -= 20 + 7
++    _text(c, MARGIN, y - 8, f"Test: {sheet.test_title}", BOLD, 10, INK, width=CONTENT_W - (150 if sheet.test_code else 0))
++    if sheet.test_code:
++        _text(c, PAGE_W - MARGIN, y - 8, f"Test code: {sheet.test_code}", BOLD, 9, MUTED, align="right")
++    y -= 17
++
++    unit = CONTENT_W / 4
++    gap = 4.0
++    h = 27.0
++    blank = sheet.blank
++    has_sets = bool(sheet.set_letters)
++
++    # row 1: candidate name | set
++    name_w = unit * 3 - gap if has_sets else CONTENT_W
++    _box(c, MARGIN, y, name_w, h, "Candidate name", sheet.candidate_name, blank)
++    if has_sets:
++        sx = MARGIN + unit * 3
++        sw = unit
++        _box(c, sx, y, sw, h, "Question set", "", blank)
++        letters = sheet.set_letters
++        step = min(18.0, (sw - 12) / max(len(letters), 1))
++        for i, ch in enumerate(letters):
++            cx = sx + 12 + step * i + step / 2 - 6
++            _bubble(c, cx, y - h + 9.5, 6.4, ch, "filled" if ch == sheet.set_letter else "empty")
++    y -= h + gap
++    # row 2: email | phone | code
++    _box(c, MARGIN, y, unit * 2 - gap, h, "E-mail", sheet.email, blank)
++    _box(c, MARGIN + unit * 2, y, unit - gap, h, "Phone", sheet.phone, blank)
++    _box(c, MARGIN + unit * 3, y, unit, h, "Attempt ID" if not blank else "Centre / hall", sheet.attempt_ref.replace("Attempt ", ""), blank)
++    y -= h + gap
++    # extra candidate fields (roll number ...), 4 per row
++    extras = list(sheet.extras) if not blank else [(lbl, "") for lbl, _ in sheet.extras]
++    for i in range(0, len(extras), 4):
++        row = extras[i:i + 4]
++        for k, (lbl, val) in enumerate(row):
++            w = unit - gap if k < len(row) - 1 or len(row) == 4 else unit
++            _box(c, MARGIN + unit * k, y, w, h, lbl, val, blank)
++        y -= h + gap
++    # row 3: date / time / duration / questions
++    _box(c, MARGIN, y, unit - gap, h, "Date", sheet.date_text, blank)
++    _box(c, MARGIN + unit, y, unit - gap, h, "Start time", sheet.time_text, blank)
++    _box(c, MARGIN + unit * 2, y, unit - gap, h, "Duration", sheet.duration_text, blank)
++    _box(c, MARGIN + unit * 3, y, unit, h, "Questions", str(len(sheet.questions)), False)
++    y -= h + 7
++
++    # instructions + legend
++    ih = 34.0
++    c.setFillColor(FAINT)
++    c.setStrokeColor(LINE)
++    c.setLineWidth(0.5)
++    c.roundRect(MARGIN, y - ih, CONTENT_W, ih, 3, stroke=1, fill=1)
++    if sheet.blank:
++        lines = ["Use a black or blue ball-point pen. Darken ONE circle completely for each question; * = more than one answer may be correct.",
++                 "Do not tick, cross or half-fill. Do not write inside the grid. Erased or double-marked answers are not counted."]
++    elif sheet.evaluated:
++        lines = ["Filled circles are the answers the candidate recorded. Green = right, red = wrong, a green ring marks the right answer.",
++                 "* = more than one answer may be correct (all must be marked for full marks)."]
++    else:
++        lines = ["Filled circles are the answers the candidate recorded in the online exam.",
++                 "* = more than one answer may be correct."]
++    for i, line in enumerate(lines):
++        _text(c, MARGIN + 7, y - 12 - i * 11, line, FONT, 7.2, INK, width=CONTENT_W - 150)
++    lx = PAGE_W - MARGIN - 122
++    if sheet.evaluated:
++        items = [("right", "right"), ("wrong", "wrong"), ("key", "answer key"), ("empty", "not marked")]
++    else:
++        items = [("filled", "marked"), ("empty", "not marked")]
++    for i, (state, text) in enumerate(items):
++        cx = lx + (i % 2) * 62
++        cy = y - 12 - (i // 2) * 14
++        _bubble(c, cx, cy, 5.2, "A", state)
++        _text(c, cx + 9, cy - 2.4, text, FONT, 6.6, MUTED)
++    y -= ih + 9
++    return y
++
++
++def _running_header(c, sheet: OmrSheet) -> float:
++    y = PAGE_H - 40
++    _text(c, MARGIN, y, sheet.institute, BOLD, 9, INK, width=CONTENT_W * 0.45)
++    mid = f"{sheet.test_title}" + (f"  |  Set {sheet.set_letter}" if sheet.set_letter else "")
++    _text(c, PAGE_W - MARGIN, y, f"{sheet.candidate_name or 'OMR answer sheet'}  -  {mid}", FONT, 8, MUTED, width=CONTENT_W * 0.55, align="right")
++    c.setStrokeColor(LINE)
++    c.setLineWidth(0.5)
++    c.line(MARGIN, y - 6, PAGE_W - MARGIN, y - 6)
++    return y - 16
++
++
++def _bottom_block(c, sheet: OmrSheet):
++    """Summary strip (evaluated copies) and the two signature boxes, anchored to the page bottom."""
++    y = 40.0 + 36.0
++    if sheet.evaluated and sheet.summary:
++        s = sheet.summary
++        cells = [("Score", f"{s.get('score', 0):g} / {s.get('max', 0):g}"), ("Percentage", f"{s.get('percentage', 0):g}%"),
++                 ("Correct", str(s.get("correct", 0))), ("Wrong", str(s.get("wrong", 0))), ("Not attempted", str(s.get("blank", 0))),
++                 ("Result", str(s.get("result", "-")))]
++        w = CONTENT_W / len(cells)
++        for i, (lbl, val) in enumerate(cells):
++            _box(c, MARGIN + w * i, y + 34, w - 3, 28, lbl, val, False, 10.5)
++    bw = (CONTENT_W - 12) / 2
++    for i, lbl in enumerate(("Candidate signature", "Invigilator signature")):
++        x = MARGIN + (bw + 12) * i
++        c.setStrokeColor(LINE)
++        c.setLineWidth(0.7)
++        c.setFillColor(white)
++        c.roundRect(x, 40, bw, 32, 2.5, stroke=1, fill=1)
++        _text(c, x + 5, 40 + 32 - 8.5, lbl.upper(), BOLD, 5.8, MUTED)
++
++
++def _draw_grid(c, sheet: OmrSheet, plan: _Plan, columns: List[List[OmrQuestion]], top: float):
++    col_w = CONTENT_W / plan.cols
++    r, sp = plan.radius, plan.spacing
++    for k, col in enumerate(columns):
++        x0 = MARGIN + k * col_w
++        if not col:
++            continue
++        rows = len(col)
++        height = rows * plan.row_h + ((rows - 1) // GROUP) * GROUP_GAP
++        # block frame + alternate group shading
++        c.setStrokeColor(LINE)
++        c.setLineWidth(0.6)
++        c.setFillColor(white)
++        c.roundRect(x0 + 1, top - height - 3, col_w - 4, height + 6, 3, stroke=1, fill=0)
++        for i, q in enumerate(col):
++            row_top = top - i * plan.row_h - (i // GROUP) * GROUP_GAP
++            if (i // GROUP) % 2 == 0:
++                c.setFillColor(FAINT)
++                c.rect(x0 + 2, row_top - plan.row_h, col_w - 6, plan.row_h, stroke=0, fill=1)
++            cy = row_top - plan.row_h / 2
++            num = f"{q.number}{'*' if q.kind == 'multiple' else ''}"
++            _text(c, x0 + 24, cy - 3, num, BOLD, 8.2, INK, align="right")
++            bx = x0 + 34 + r
++            for idx, label in enumerate(q.labels):
++                marked = idx in q.marked
++                is_key = bool(sheet.evaluated and q.correct is not None and idx in q.correct)
++                if sheet.evaluated:
++                    state = ("right" if is_key else "wrong") if marked else ("key" if is_key else "empty")
++                else:
++                    state = "filled" if marked else "empty"
++                _bubble(c, bx + idx * sp, cy, r, label, state)
++    return
++
++
++def _draw_shorts(c, sheet: OmrSheet, plan: _Plan, top: float):
++    _text(c, MARGIN, top - 9, "WRITTEN ANSWERS", BOLD, 7.5, MUTED)
++    y = top - 14
++    for q in plan.shorts:
++        y -= 15
++        given = q.text or ("(not answered)" if not sheet.blank else "")
++        _text(c, MARGIN, y, f"{q.number}.", BOLD, 8.5, INK)
++        color = INK
++        if sheet.evaluated:
++            color = GREEN if q.verdict == "correct" else RED if q.verdict == "wrong" else MUTED
++        _text(c, MARGIN + 22, y, given, FONT, 8.5, color, width=CONTENT_W * 0.5)
++        if sheet.evaluated and q.correct_text:
++            _text(c, MARGIN + CONTENT_W * 0.55, y, f"Accepted: {q.correct_text}", FONT, 7.5, MUTED, width=CONTENT_W * 0.45)
++        c.setStrokeColor(LINE)
++        c.setLineWidth(0.4)
++        c.line(MARGIN + 22, y - 2.5, MARGIN + CONTENT_W * 0.52, y - 2.5)
++
++
++# ---------------------------------------------------------------------------
++# public API
++# ---------------------------------------------------------------------------
++def _measure_first_header(sheet: OmrSheet) -> float:
++    """Height the first-page header takes, found by drawing it on a throw-away canvas."""
++    probe = canvas.Canvas(io.BytesIO(), pagesize=A4)
++    return PAGE_H - _first_header(probe, sheet)
++
++
++def render(sheets: Sequence[OmrSheet]) -> bytes:
++    if not sheets:
++        raise ValueError("No sheets to render")
++    buf = io.BytesIO()
++    c = canvas.Canvas(buf, pagesize=A4, pageCompression=1)
++    c.setTitle(f"OMR - {sheets[0].test_title}" if len(sheets) == 1 else f"OMR sheets - {sheets[0].test_title}")
++    c.setAuthor("ORVEXA")
++    c.setCreator("ORVEXA")
++    bottom_reserved = 40.0 + 36.0 + 8.0
++    for sheet in sheets:
++        summary_extra = 38.0 if (sheet.evaluated and sheet.summary) else 0.0
++        head = _measure_first_header(sheet)
++        first_avail = PAGE_H - head - 36.0 - 8.0          # to the footer rule, before the signature block
++        next_avail = PAGE_H - 56.0 - 36.0 - 8.0
++        reserved = bottom_reserved - 36.0 + summary_extra  # signature block (+ summary strip) height
++        plan = _plan(sheet, first_avail, next_avail, reserved)
++        total = len(plan.pages)
++        for p, columns in enumerate(plan.pages):
++            _corner_marks(c)
++            top = _first_header(c, sheet) if p == 0 else _running_header(c, sheet)
++            _draw_grid(c, sheet, plan, columns, top)
++            rows_used = max((len(col) for col in columns), default=0)
++            used = rows_used * plan.row_h + (max(rows_used - 1, 0) // GROUP) * GROUP_GAP + 8
++            if plan.shorts and p == plan.shorts_page:
++                _draw_shorts(c, sheet, plan, top - used)
++            if p == total - 1:
++                _bottom_block(c, sheet)
++            _footer(c, sheet, p + 1, total)
++            c.showPage()
++    c.save()
++    return buf.getvalue()
+diff --git a/backend/app/omr_service.py b/backend/app/omr_service.py
+new file mode 100644
+index 0000000..72d6165
+--- /dev/null
++++ b/backend/app/omr_service.py
+@@ -0,0 +1,174 @@
++"""Builds OMR sheets (see ``omr_pdf``) from attempts and tests, and the header the live sheet in the exam room shows.
++
++Everything here is read-only. Answers are stored as option TEXT (so shuffling can never corrupt scoring); an OMR
++bubble is simply the position of that text in the options *as this candidate saw them*, which is exactly what the
++exam room labels A, B, C ... on screen.
++"""
++import re
++from datetime import datetime, timezone
++from typing import Any, Dict, Iterable, List, Optional
++
++from app import models, omr_pdf, scoring
++from app.constants import Q_MULTIPLE, Q_SHORT, Q_SINGLE, Q_TRUE_FALSE
++from app.timeutil import as_utc, utcnow
++
++MAX_SHEETS_PER_EXPORT = 1000
++
++
++# ---------------------------------------------------------------------------
++# time zone: the browser sends its IANA name; unknown / missing names fall back to UTC
++# ---------------------------------------------------------------------------
++def _zone(name: Optional[str]):
++    if name:
++        try:
++            from zoneinfo import ZoneInfo
++
++            return ZoneInfo(name)
++        except Exception:  # noqa: BLE001 - bad name, or no tz database on this machine
++            pass
++    return timezone.utc
++
++
++def _stamp(dt: Optional[datetime], tz_name: Optional[str]) -> Dict[str, str]:
++    if dt is None:
++        return {"date": "", "time": ""}
++    local = as_utc(dt).astimezone(_zone(tz_name))
++    return {"date": local.strftime("%d %b %Y"), "time": f"{local.strftime('%H:%M')} {local.tzname() or 'UTC'}"}
++
++
++# ---------------------------------------------------------------------------
++# helpers
++# ---------------------------------------------------------------------------
++def labels_for(qtype: str, option_count: int) -> List[str]:
++    return ["T", "F"] if qtype == Q_TRUE_FALSE else [chr(65 + i) for i in range(option_count)]
++
++
++def _indexes(options: List[str], values: Iterable[Any]) -> List[int]:
++    wanted = {scoring.norm(v) for v in values}
++    return [i for i, o in enumerate(options) if scoring.norm(o) in wanted]
++
++
++def _given(answer: Any) -> List[Any]:
++    if answer is None:
++        return []
++    return list(answer) if isinstance(answer, (list, tuple, set)) else [answer]
++
++
++def candidate_extras(exam: models.Exam, attempt: models.Attempt) -> List[tuple]:
++    profile = attempt.profile or {}
++    return [(str(f.get("label") or f.get("key")), str(profile.get(f.get("key"), "") or "")) for f in (exam.candidate_fields or []) if f.get("key")]
++
++
++def _sets_text(exam: models.Exam) -> str:
++    n = int(exam.question_sets or 1)
++    return scoring.SET_LETTERS[:n] if n > 1 else ""
++
++
++def institute_name(exam: models.Exam, org: models.Organization) -> str:
++    return (exam.omr_institute or "").strip() or (org.name if org else "") or "Institute"
++
++
++# ---------------------------------------------------------------------------
++# sheets
++# ---------------------------------------------------------------------------
++def sheet_for_attempt(attempt: models.Attempt, exam: models.Exam, org: models.Organization, candidate: models.User,
++                      *, evaluated: bool, tz: Optional[str] = None) -> omr_pdf.OmrSheet:
++    answers = attempt.answers or {}
++    key = attempt.answer_key or {}
++    questions: List[omr_pdf.OmrQuestion] = []
++    right = wrong = blank = 0
++    for number, q in enumerate(attempt.question_data or [], start=1):
++        k = key.get(str(q["id"]), {})
++        given = answers.get(str(q["id"]))
++        answered = scoring.is_answered(given)
++        verdict = None
++        if evaluated:
++            verdict = "blank" if not answered else "correct" if scoring.is_correct(q["type"], k.get("correct", []), given) else "wrong"
++            right += verdict == "correct"
++            wrong += verdict == "wrong"
++            blank += verdict == "blank"
++        if q["type"] == Q_SHORT:
++            questions.append(omr_pdf.OmrQuestion(
++                number, "short_text", text=str(given or ""), verdict=verdict,
++                correct_text=" | ".join(str(a) for a in k.get("correct", [])) if evaluated else None))
++            continue
++        options = list(q.get("options") or [])
++        questions.append(omr_pdf.OmrQuestion(
++            number, q["type"], labels_for(q["type"], len(options)), _indexes(options, _given(given)),
++            _indexes(options, k.get("correct", [])) if evaluated else None, verdict=verdict))
++
++    summary = None
++    if evaluated:
++        score, max_score, _ = scoring.score_objective(key, answers)
++        if attempt.score is not None and attempt.max_score:        # final figures include any coding marks
++            score, max_score = attempt.score, attempt.max_score
++        pct = scoring.percentage(score, max_score)
++        passed = attempt.passed if attempt.passed is not None else pct >= float(exam.pass_percentage or 0)
++        summary = {"score": round(float(score), 2), "max": round(float(max_score), 2), "percentage": round(float(pct), 2),
++                   "correct": right, "wrong": wrong, "blank": blank, "result": "PASS" if passed else "FAIL"}
++
++    when = _stamp(attempt.started_at, tz)
++    return omr_pdf.OmrSheet(
++        institute=institute_name(exam, org), note=(exam.omr_note or "").strip(), test_title=exam.title, questions=questions,
++        test_code=_pretty_code(exam.code), candidate_name=candidate.full_name or "", email=candidate.email or "", phone=candidate.phone or "",
++        extras=candidate_extras(exam, attempt), date_text=when["date"], time_text=when["time"],
++        duration_text=f"{exam.duration_minutes} minutes", attempt_ref=f"Attempt {attempt.id}",
++        set_letter=attempt.paper_set or "", set_letters=_sets_text(exam), evaluated=evaluated, summary=summary,
++        generated_text=_generated(tz))
++
++
++def blank_sheets(exam: models.Exam, org: models.Organization, questions: List[models.Question], *,
++                 set_letter: Optional[str] = None, tz: Optional[str] = None) -> List[omr_pdf.OmrSheet]:
++    """Printable empty sheets: one per set when the test has sets (or just the one asked for), else a single sheet."""
++    n_sets = int(exam.question_sets or 1)
++    wanted = [scoring.set_index(set_letter)] if set_letter else (list(range(n_sets)) if n_sets > 1 else [None])
++    sheets = []
++    for index in wanted:
++        if index is None:
++            data, _ = scoring.build_attempt_questions(questions, per_attempt=exam.questions_per_attempt, shuffle_questions=False, shuffle_options=False)
++        else:
++            data, _ = scoring.build_set_paper(questions, exam_id=exam.id, index=index, per_attempt=exam.questions_per_attempt, shuffle_options=bool(exam.shuffle_options))
++        qs = []
++        for number, q in enumerate(data, start=1):
++            if q["type"] == Q_SHORT:
++                qs.append(omr_pdf.OmrQuestion(number, "short_text"))
++            else:
++                qs.append(omr_pdf.OmrQuestion(number, q["type"], labels_for(q["type"], len(q["options"]))))
++        sheets.append(omr_pdf.OmrSheet(
++            institute=institute_name(exam, org), note=(exam.omr_note or "").strip(), test_title=exam.title, questions=qs,
++            test_code=_pretty_code(exam.code), duration_text=f"{exam.duration_minutes} minutes",
++            extras=[(str(f.get("label") or f.get("key")), "") for f in (exam.candidate_fields or []) if f.get("key")],
++            set_letter=scoring.set_letter(index) if index is not None and n_sets > 1 else "", set_letters=_sets_text(exam),
++            blank=True, generated_text=_generated(tz)))
++    return sheets
++
++
++def _pretty_code(code: Optional[str]) -> str:
++    code = code or ""
++    return f"{code[:4]}-{code[4:]}" if len(code) == 8 else code
++
++
++def _generated(tz: Optional[str]) -> str:
++    s = _stamp(utcnow(), tz)
++    return f"Generated {s['date']} {s['time']}"
++
++
++def safe_filename(text: str, fallback: str = "omr") -> str:
++    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", str(text or "")).strip("-.")[:60]
++    return cleaned or fallback
++
++
++# ---------------------------------------------------------------------------
++# the live sheet in the exam room
++# ---------------------------------------------------------------------------
++def live_header(attempt: models.Attempt, exam: models.Exam, org: models.Organization, candidate: models.User) -> Dict[str, Any]:
++    """Everything the on-screen OMR header shows. (The date is formatted by the browser in the candidate's own time zone.)"""
++    return {
++        "enabled": bool(exam.omr_enabled),
++        "institute": institute_name(exam, org), "note": (exam.omr_note or "").strip(), "test_title": exam.title,
++        "test_code": _pretty_code(exam.code), "duration_minutes": exam.duration_minutes,
++        "started_at": attempt.started_at, "paper_set": attempt.paper_set, "sets": _sets_text(exam),
++        "candidate": {"name": candidate.full_name, "email": candidate.email, "phone": candidate.phone,
++                      "fields": [{"label": lbl, "value": val} for lbl, val in candidate_extras(exam, attempt)]},
++        "attempt_ref": f"Attempt {attempt.id}",
++    }
+diff --git a/backend/app/proctoring.py b/backend/app/proctoring.py
+index d48d446..9aedd28 100644
+--- a/backend/app/proctoring.py
++++ b/backend/app/proctoring.py
+@@ -393,7 +393,8 @@ def build_findings(faces: Optional[Sequence[Dict[str, Any]]], dets: Optional[Seq
+     if faces is not None:
+         if not faces:
+             body = bool(person_boxes)
+-            findings.append({"code": "NO_FACE", "detail": "A person is in view but their face is not visible (looking away, head down or face covered)" if body else "No face visible"})
++            findings.append({"code": "NO_FACE", "detail": "A person is in view but their face is not visible (looking away, head down or face covered)" if body else "No face visible",
++                             "body_visible": body})
+     elif people == 0:
+         findings.append({"code": "NO_FACE", "detail": "No person visible"})
+ 
+diff --git a/backend/app/routers/candidate.py b/backend/app/routers/candidate.py
+index a4baf66..8740b08 100644
+--- a/backend/app/routers/candidate.py
++++ b/backend/app/routers/candidate.py
+@@ -4,12 +4,13 @@ from datetime import timedelta
+ from typing import Any, Dict, List, NamedTuple, Optional
+ 
+ from fastapi import APIRouter, Depends, Query, Request
++from fastapi.responses import Response
+ from app.mongo import func
+ from app.mongo import Session
+ 
+ from app import (
+-    attempt_service, audit, auth, coding, email_verification, exam_service, models, proctor_rules, proctoring, scoring, serializers, staff_service,
+-    storage, tenancy, webhooks,
++    attempt_service, audit, auth, coding, email_verification, exam_service, models, omr_pdf, omr_service, proctor_rules, proctoring, scoring, serializers,
++    staff_service, storage, tenancy, webhooks,
+ )
+ from app.constants import (
+     ACCESS_INVITE, ATT_IN_PROGRESS, ATT_REGISTERED, ATT_SUBMITTED, ATT_TERMINATED, ATT_VOIDED, CLIENT_REPORTABLE,
+@@ -31,13 +32,32 @@ MAX_PERIODIC_SNAPSHOTS = 300
+ MIN_ANALYZE_GAP_SECONDS = 1.0
+ # consecutive suspicious frames required before the server records an AI violation (kills one-frame flukes)
+ STREAK_REQUIRED = {"NO_FACE": 2, "MULTIPLE_FACES": 2, "LOOKING_AWAY": 3, "HEAD_TURNED": 3, "LOOKING_DOWN": 3, "LIP_MOVEMENT": 3,
+-                   "PROHIBITED_OBJECT": 2, "PHONE_DETECTED": 2, "MULTIPLE_PERSONS": 2, "CAMERA_COVERED": 2}
++                   "PROHIBITED_OBJECT": 2, "PHONE_DETECTED": 2, "MULTIPLE_PERSONS": 2, "CAMERA_COVERED": 2,
++                   "NO_FACE_BODY": 6}          # competitive exams: face hidden but the person is still in view (head down over rough work)
+ # Object and person sightings FLICKER: a phone half hidden by a hand drops out of every other frame, a second person leans
+ # in and out of view. Requiring them in consecutive frames lets exactly that behaviour slip through, so these codes are
+ # confirmed by "N sightings within the last M frames" instead.
+ WINDOW_RULES = {"PHONE_DETECTED": (2, 4), "PROHIBITED_OBJECT": (2, 4), "MULTIPLE_PERSONS": (2, 4), "MULTIPLE_FACES": (2, 4)}
+ 
+ 
++def apply_exam_policy(findings, cfg: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
++    """Frame findings -> {debounce key: finding}, after the test's own rules.
++
++    Competitive-exam tests expect rough work on paper, so looking down is not a finding at all, and a face that
++    disappears while the person is still in view (head bent over the desk) must last ~6 frames instead of 2 before it
++    counts. Phones, other people, a covered camera, turning away or nobody being there are judged exactly as before."""
++    present: Dict[str, Dict[str, Any]] = {}
++    competitive = bool(cfg.get("competitive_exam"))
++    for f in findings:
++        key = f["code"]
++        if competitive and key == "LOOKING_DOWN":
++            continue
++        if competitive and key == "NO_FACE" and f.get("body_visible"):
++            key = "NO_FACE_BODY"
++        present[key] = f
++    return present
++
++
+ def debounce(state: Dict[str, Any], present) -> Dict[str, bool]:
+     """Advance the per-code frame history kept on the attempt by one frame.
+ 
+@@ -108,9 +128,10 @@ def _public_test(db: Session, exam: models.Exam, org: models.Organization) -> Di
+         "unavailable_reason": None if (state == "open" and not blocked) else (
+             "This test is not available right now. Please contact the organizer." if blocked else
+             {"closed": "This test is closed.", "not_started": "This test has not opened yet.", "ended": "The window for this test has ended."}[state]),
+-        "proctoring": {k: cfg[k] for k in ("webcam_required", "microphone_required", "fullscreen_required", "ai_monitoring", "id_verification")},
++        "proctoring": {k: cfg[k] for k in ("webcam_required", "microphone_required", "fullscreen_required", "ai_monitoring", "id_verification", "competitive_exam")},
+         "instructions": exam.instructions,
+         "is_sample": bool(exam.is_sample),
++        "omr_enabled": bool(exam.omr_enabled), "question_sets": exam.question_sets or 1, "calculator": exam.calculator or "off",
+         "requires_email_verification": settings.candidate_email_verification,
+         "email_domains": list(org.allowed_domains or []) if org.candidate_domain_lock and org.allowed_domains else [],
+     }
+@@ -164,7 +185,10 @@ def _state_payload(db: Session, ctx: AttemptCtx) -> Dict[str, Any]:
+         "test": {**_public_test(db, exam, org), "id": exam.id, "result_visibility": exam.result_visibility,
+                  "proctoring_config": _candidate_cfg(exam)},
+         "candidate": {"name": ctx.user.full_name, "email": ctx.user.email},
++        "paper_set": attempt.paper_set,
+     }
++    if exam.omr_enabled:
++        payload["omr"] = omr_service.live_header(attempt, exam, org, ctx.user)
+     if attempt.status == ATT_IN_PROGRESS:
+         payload.update(
+             questions=attempt.question_data or [], answers=attempt.answers or {}, flagged=attempt.flagged or [],
+@@ -323,6 +347,21 @@ def get_state(ctx: AttemptCtx = Depends(attempt_ctx), db: Session = Depends(get_
+     return _state_payload(db, ctx)
+ 
+ 
++@router.get("/omr.pdf")
++@limiter.limit("20/minute")
++def my_omr(request: Request, tz: Optional[str] = Query(default=None, max_length=64), ctx: AttemptCtx = Depends(attempt_ctx), db: Session = Depends(get_db)):
++    """The candidate's own OMR sheet (only when the organizer switched OMR on for the test). Never carries the answer key."""
++    attempt, exam = ctx.attempt, ctx.exam
++    if not exam.omr_enabled:
++        raise ApiError(403, "The organizer has not enabled the OMR sheet for this test.", "omr_disabled")
++    if not attempt.question_data:
++        raise conflict("Start the test first", "not_started")
++    org = db.get(models.Organization, exam.org_id)
++    sheet = omr_service.sheet_for_attempt(attempt, exam, org, ctx.user, evaluated=False, tz=tz)
++    return Response(omr_pdf.render([sheet]), media_type="application/pdf", headers={
++        "Cache-Control": "private, no-store", "Content-Disposition": f'attachment; filename="OMR-{omr_service.safe_filename(ctx.user.full_name)}.pdf"'})
++
++
+ @router.post("/start")
+ def start_attempt(request: Request, body: StartRequest, ctx: AttemptCtx = Depends(attempt_ctx), db: Session = Depends(get_db)):
+     attempt, exam = ctx.attempt, ctx.exam
+@@ -346,8 +385,20 @@ def start_attempt(request: Request, body: StartRequest, ctx: AttemptCtx = Depend
+     questions = db.query(models.Question).filter(models.Question.exam_id == exam.id).order_by(models.Question.position, models.Question.id).all()
+     if not questions and not exam.coding_problems:
+         raise bad_request("This test has no questions yet", "empty_test")
+-    question_data, answer_key = scoring.build_attempt_questions(
+-        questions, per_attempt=exam.questions_per_attempt, shuffle_questions=exam.shuffle_questions, shuffle_options=exam.shuffle_options)
++    n_sets = int(exam.question_sets or 1)
++    if n_sets > 1:
++        # Fixed papers: Set A, Set B ... Every candidate of a set gets the identical paper; sets are handed out evenly.
++        used: Dict[str, int] = {}
++        for other in db.query(models.Attempt).filter(models.Attempt.exam_id == exam.id, models.Attempt.status != ATT_VOIDED).all():
++            if other.paper_set and other.id != attempt.id:
++                used[other.paper_set] = used.get(other.paper_set, 0) + 1
++        index = scoring.pick_set(used, n_sets)
++        question_data, answer_key = scoring.build_set_paper(
++            questions, exam_id=exam.id, index=index, per_attempt=exam.questions_per_attempt, shuffle_options=bool(exam.shuffle_options))
++        attempt.paper_set = scoring.set_letter(index)
++    else:
++        question_data, answer_key = scoring.build_attempt_questions(
++            questions, per_attempt=exam.questions_per_attempt, shuffle_questions=exam.shuffle_questions, shuffle_options=exam.shuffle_options)
+ 
+     for kind, image in (("id", body.id_image), ("face", body.face_image)):
+         if image:
+@@ -359,7 +410,8 @@ def start_attempt(request: Request, body: StartRequest, ctx: AttemptCtx = Depend
+     attempt.status, attempt.started_at, attempt.consent_at = ATT_IN_PROGRESS, now, now
+     attempt.system_info = {k: str(v)[:200] for k, v in list((body.system_info or {}).items())[:20]}
+     attempt.last_heartbeat_at = now
+-    audit.log_event(db, "ATTEMPT_STARTED", user=ctx.user, entity_type="attempt", entity_id=attempt.id, details=f"exam={exam.id}", ip=auth.client_ip(request))
++    audit.log_event(db, "ATTEMPT_STARTED", user=ctx.user, entity_type="attempt", entity_id=attempt.id,
++                    details=f"exam={exam.id}" + (f" set={attempt.paper_set}" if attempt.paper_set else ""), ip=auth.client_ip(request))
+     webhooks.emit(db, attempt.org_id, "attempt.started", {"attempt_id": attempt.id, "test_id": exam.id, "test_title": exam.title,
+                                                           "candidate": {"name": ctx.user.full_name, "email": ctx.user.email}})
+     db.commit()
+@@ -462,16 +514,17 @@ def analyze(body: ImageIn, ctx: AttemptCtx = Depends(attempt_ctx), db: Session =
+         db.commit()
+         return empty
+ 
+-    present = {f["code"]: f for f in result["findings"]}
++    present = apply_exam_policy(result["findings"], cfg)
+     confirmed = debounce(state, set(present))
+     # evidence: the frame with every detection boxed when the AI produced one, otherwise the raw frame
+     evidence = result.get("evidence_image") or body.image
+     reported = []
+     outcomes = []
+-    for code, finding in present.items():
++    for key, finding in present.items():
++        code = finding["code"]
+         sev, _, label, _ = VIOLATION_CATALOG[code]
+-        reported.append({"code": code, "label": label, "severity": sev, "detail": finding.get("detail"), "confirmed": confirmed[code]})
+-        if confirmed[code]:
++        reported.append({"code": code, "label": label, "severity": sev, "detail": finding.get("detail"), "confirmed": confirmed[key]})
++        if confirmed[key]:
+             outcomes.append(proctor_rules.record_violation(db, attempt, exam, code, details=finding.get("detail"), image=evidence, source="ai"))
+             db.refresh(attempt)
+     reported.sort(key=lambda r: -r["severity"])          # the candidate's hint shows the most serious finding first
+diff --git a/backend/app/routers/omr.py b/backend/app/routers/omr.py
+new file mode 100644
+index 0000000..e28c571
+--- /dev/null
++++ b/backend/app/routers/omr.py
+@@ -0,0 +1,123 @@
++"""OMR sheet downloads for staff: one attempt, every attempt of a test (one PDF or a ZIP), and a blank template."""
++import io
++import zipfile
++from typing import List, Optional
++
++from fastapi import APIRouter, Depends, Query, Request
++from fastapi.responses import Response
++from app.mongo import Session
++
++from app import audit, auth, models, omr_pdf, omr_service, scoring, tenancy
++from app.constants import ATT_IN_PROGRESS, ATT_VOIDED, FINAL_ATTEMPT_STATUSES, ROLE_ADMIN
++from app.database import get_db
++from app.errors import bad_request, conflict, forbidden
++
++router = APIRouter(tags=["omr"])
++
++PDF_HEADERS = {"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"}
++
++
++def _pdf(data: bytes, filename: str) -> Response:
++    return Response(data, media_type="application/pdf", headers={**PDF_HEADERS, "Content-Disposition": f'attachment; filename="{filename}"'})
++
++
++def _check_evaluated(evaluated: bool, user: models.User) -> None:
++    if evaluated and user.role != ROLE_ADMIN:     # an evaluated copy carries the answer key, which reviewers never see
++        raise forbidden("Only an admin can download evaluated OMR sheets")
++
++
++def _set_filter(exam: models.Exam, letter: Optional[str]) -> Optional[str]:
++    if not letter:
++        return None
++    try:
++        scoring.set_index(letter)
++    except ValueError as exc:
++        raise bad_request(str(exc))
++    return letter.strip().upper()
++
++
++def _attempts(db: Session, exam: models.Exam, *, include_live: bool, letter: Optional[str]) -> List[models.Attempt]:
++    rows = db.query(models.Attempt).filter(models.Attempt.exam_id == exam.id, models.Attempt.status != ATT_VOIDED).all()
++    allowed = set(FINAL_ATTEMPT_STATUSES) | ({ATT_IN_PROGRESS} if include_live else set())
++    rows = [a for a in rows if a.status in allowed and a.question_data and (not letter or a.paper_set == letter)]
++    return rows
++
++
++def _sheets(db: Session, exam: models.Exam, attempts: List[models.Attempt], *, evaluated: bool, tz: Optional[str]) -> List[omr_pdf.OmrSheet]:
++    org = db.get(models.Organization, exam.org_id)
++    people = {u.id: u for u in db.query(models.User).filter(models.User.id.in_(list({a.candidate_id for a in attempts}))).all()} if attempts else {}
++    attempts = sorted(attempts, key=lambda a: (a.paper_set or "", (people[a.candidate_id].full_name or "").lower(), a.id))
++    return [omr_service.sheet_for_attempt(a, exam, org, people[a.candidate_id], evaluated=evaluated, tz=tz) for a in attempts]
++
++
++@router.get("/attempts/{attempt_id}/omr.pdf")
++def attempt_omr(attempt_id: int, request: Request, evaluated: bool = False, tz: Optional[str] = Query(default=None, max_length=64),
++                user: models.User = Depends(auth.require_org_staff), db: Session = Depends(get_db)):
++    """The OMR sheet of one candidate. ``evaluated=true`` (admins) colours right / wrong answers and prints the score."""
++    _check_evaluated(evaluated, user)
++    attempt = tenancy.get_attempt(db, attempt_id, user.org_id)
++    if not attempt.question_data:
++        raise conflict("This candidate has not started the test, so there is no answer sheet yet", "not_started")
++    exam = db.get(models.Exam, attempt.exam_id)
++    candidate = db.get(models.User, attempt.candidate_id)
++    sheet = omr_service.sheet_for_attempt(attempt, exam, db.get(models.Organization, exam.org_id), candidate, evaluated=evaluated, tz=tz)
++    audit.log_event(db, "OMR_DOWNLOADED", user=user, entity_type="attempt", entity_id=attempt.id, details=f"evaluated={evaluated}", ip=auth.client_ip(request))
++    db.commit()
++    return _pdf(omr_pdf.render([sheet]), f"OMR-{omr_service.safe_filename(candidate.full_name)}-{attempt.id}{'-evaluated' if evaluated else ''}.pdf")
++
++
++@router.get("/tests/{exam_id}/omr.pdf")
++def test_omr_pdf(exam_id: int, request: Request, evaluated: bool = False, set: Optional[str] = Query(default=None, max_length=1),
++                 include_live: bool = False, tz: Optional[str] = Query(default=None, max_length=64),
++                 user: models.User = Depends(auth.require_org_staff), db: Session = Depends(get_db)):
++    """Every candidate's OMR sheet in ONE PDF (each sheet starts on a new page), grouped by set then by name."""
++    _check_evaluated(evaluated, user)
++    exam = tenancy.get_exam(db, exam_id, user.org_id)
++    attempts = _attempts(db, exam, include_live=include_live, letter=_set_filter(exam, set))
++    if not attempts:
++        raise conflict("There are no submitted attempts to export yet", "nothing_to_export")
++    if len(attempts) > omr_service.MAX_SHEETS_PER_EXPORT:
++        raise bad_request(f"That is more than {omr_service.MAX_SHEETS_PER_EXPORT} sheets; filter by set or download them one set at a time")
++    sheets = _sheets(db, exam, attempts, evaluated=evaluated, tz=tz)
++    audit.log_event(db, "OMR_EXPORTED", user=user, entity_type="test", entity_id=exam.id, details=f"sheets={len(sheets)} evaluated={evaluated} set={set or 'all'}", ip=auth.client_ip(request))
++    db.commit()
++    return _pdf(omr_pdf.render(sheets), f"{omr_service.safe_filename(exam.title)}-OMR{'-evaluated' if evaluated else ''}{'-set-' + set.upper() if set else ''}.pdf")
++
++
++@router.get("/tests/{exam_id}/omr.zip")
++def test_omr_zip(exam_id: int, request: Request, evaluated: bool = False, set: Optional[str] = Query(default=None, max_length=1),
++                 include_live: bool = False, tz: Optional[str] = Query(default=None, max_length=64),
++                 user: models.User = Depends(auth.require_org_staff), db: Session = Depends(get_db)):
++    """The same sheets as separate PDF files in a ZIP, named ``001-Set-A-Jane-Doe.pdf``."""
++    _check_evaluated(evaluated, user)
++    exam = tenancy.get_exam(db, exam_id, user.org_id)
++    attempts = _attempts(db, exam, include_live=include_live, letter=_set_filter(exam, set))
++    if not attempts:
++        raise conflict("There are no submitted attempts to export yet", "nothing_to_export")
++    if len(attempts) > omr_service.MAX_SHEETS_PER_EXPORT:
++        raise bad_request(f"That is more than {omr_service.MAX_SHEETS_PER_EXPORT} sheets; filter by set or download them one set at a time")
++    sheets = _sheets(db, exam, attempts, evaluated=evaluated, tz=tz)
++    buf = io.BytesIO()
++    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
++        for n, sheet in enumerate(sheets, start=1):
++            name = f"{n:03d}-{'Set-' + sheet.set_letter + '-' if sheet.set_letter else ''}{omr_service.safe_filename(sheet.candidate_name, 'candidate')}.pdf"
++            z.writestr(name, omr_pdf.render([sheet]))
++    audit.log_event(db, "OMR_EXPORTED", user=user, entity_type="test", entity_id=exam.id, details=f"zip sheets={len(sheets)} evaluated={evaluated}", ip=auth.client_ip(request))
++    db.commit()
++    return Response(buf.getvalue(), media_type="application/zip", headers={
++        **PDF_HEADERS, "Content-Disposition": f'attachment; filename="{omr_service.safe_filename(exam.title)}-OMR{"-evaluated" if evaluated else ""}.zip"'})
++
++
++@router.get("/tests/{exam_id}/omr/blank.pdf")
++def test_omr_blank(exam_id: int, set: Optional[str] = Query(default=None, max_length=1), tz: Optional[str] = Query(default=None, max_length=64),
++                   user: models.User = Depends(auth.require_org_staff), db: Session = Depends(get_db)):
++    """A printable, empty OMR sheet for this test (one per set when the test has sets) to hand out on paper."""
++    exam = tenancy.get_exam(db, exam_id, user.org_id)
++    letter = _set_filter(exam, set)
++    if letter and scoring.set_index(letter) >= int(exam.question_sets or 1):
++        raise bad_request(f"This test has no Set {letter}")
++    questions = db.query(models.Question).filter(models.Question.exam_id == exam.id).order_by(models.Question.position, models.Question.id).all()
++    if not questions:
++        raise conflict("Add questions to the test first", "empty_test")
++    sheets = omr_service.blank_sheets(exam, db.get(models.Organization, exam.org_id), questions, set_letter=letter, tz=tz)
++    return _pdf(omr_pdf.render(sheets), f"{omr_service.safe_filename(exam.title)}-OMR-blank{'-set-' + letter if letter else ''}.pdf")
+diff --git a/backend/app/routers/results.py b/backend/app/routers/results.py
+index 4aec36a..3497eb5 100644
+--- a/backend/app/routers/results.py
++++ b/backend/app/routers/results.py
+@@ -65,7 +65,7 @@ def _row(a: models.Attempt, c: models.User, ranks: Dict[int, int]) -> Dict[str,
+     return {
+         "id": a.id, "exam_id": a.exam_id, "attempt_no": a.attempt_no,
+         "candidate": {"id": c.id, "name": c.full_name, "email": c.email, "phone": c.phone, "profile": a.profile or {}},
+-        "status": a.status, "started_at": a.started_at, "submitted_at": a.submitted_at, "time_taken_seconds": _time_taken(a),
++        "status": a.status, "paper_set": a.paper_set, "started_at": a.started_at, "submitted_at": a.submitted_at, "time_taken_seconds": _time_taken(a),
+         "score": a.score, "max_score": a.max_score, "percentage": a.percentage, "passed": a.passed,
+         "final_result": final_result(a), "rank": ranks.get(a.id),
+         "objective_score": a.objective_score, "coding_score": a.coding_score,
+@@ -241,14 +241,14 @@ def export_csv(exam_id: int, request: Request, user: models.User = Depends(auth.
+     field_labels = [f["label"] for f in (exam.candidate_fields or [])]
+     buf = io.StringIO()
+     w = csv.writer(buf)
+-    w.writerow(["Rank", "Name", "Email", "Phone", *field_labels, "Status", "Result", "Score", "Max score", "Percentage", "Objective score",
++    w.writerow(["Rank", "Name", "Email", "Phone", *field_labels, "Question set", "Status", "Result", "Score", "Max score", "Percentage", "Objective score",
+                 "Coding score", "Started (UTC)", "Submitted (UTC)", "Time taken (min)", "Violations", "Serious violations", "Risk score",
+                 "Risk level", "Review status", "Review note", "Auto-submitted"])
+     for a, c in rows:
+         taken = _time_taken(a)
+         w.writerow([_csv_safe(x) for x in [
+             ranks.get(a.id, ""), c.full_name, c.email, c.phone or "", *[(a.profile or {}).get(k, "") for k in field_keys],
+-            a.status, final_result(a) or "", a.score if a.score is not None else "", a.max_score if a.max_score is not None else "",
++            a.paper_set or "", a.status, final_result(a) or "", a.score if a.score is not None else "", a.max_score if a.max_score is not None else "",
+             a.percentage if a.percentage is not None else "", a.objective_score if a.objective_score is not None else "",
+             a.coding_score if a.coding_score is not None else "", a.started_at.isoformat() if a.started_at else "",
+             a.submitted_at.isoformat() if a.submitted_at else "", round(taken / 60, 1) if taken is not None else "",
+diff --git a/backend/app/routers/tests.py b/backend/app/routers/tests.py
+index 803e693..678b3a3 100644
+--- a/backend/app/routers/tests.py
++++ b/backend/app/routers/tests.py
+@@ -68,7 +68,8 @@ def create_test(
+         start_time=body.start_time, end_time=body.end_time, access_mode=body.access_mode,
+         access_password_hash=auth.hash_password(body.access_password) if body.access_password else None,
+         questions_per_attempt=body.questions_per_attempt, shuffle_questions=body.shuffle_questions,
+-        shuffle_options=body.shuffle_options, pass_percentage=body.pass_percentage, result_visibility=body.result_visibility,
++        shuffle_options=body.shuffle_options, question_sets=body.question_sets, omr_enabled=body.omr_enabled, calculator=body.calculator,
++        omr_institute=(body.omr_institute or '').strip() or None, omr_note=(body.omr_note or '').strip() or None, pass_percentage=body.pass_percentage, result_visibility=body.result_visibility,
+         proctoring=cfg, candidate_fields=[f.model_dump() for f in body.candidate_fields],
+     )
+     db.add(exam)
+@@ -118,6 +119,12 @@ def update_test(
+     if "duration_minutes" in data and data["duration_minutes"] != exam.duration_minutes and exam_service.has_live_attempts(db, exam.id):
+         raise conflict("Candidates are taking this test right now - the duration cannot change until they finish", "live_attempts")
+ 
++    if "question_sets" in data and data["question_sets"] != (exam.question_sets or 1) and exam_service.has_live_attempts(db, exam.id):
++        raise conflict("Candidates are taking this test right now - the number of question sets cannot change until they finish", "live_attempts")
++    for text_key in ("omr_institute", "omr_note"):
++        if text_key in data:
++            data[text_key] = (data[text_key] or "").strip() or None
++
+     warnings: List[str] = []
+     if data.pop("clear_schedule", False):
+         exam.start_time = exam.end_time = None
+diff --git a/backend/app/sample_tests.py b/backend/app/sample_tests.py
+index ce0edb5..50e4b9e 100644
+--- a/backend/app/sample_tests.py
++++ b/backend/app/sample_tests.py
+@@ -32,6 +32,74 @@ def _short(text, answers, section, explanation=None):
+     return {"question_type": "short_text", "question_text": text, "correct": answers, "section": section, "explanation": explanation, "difficulty": "easy"}
+ 
+ 
++
++def _apt(section, text, options, correct, explanation, difficulty="easy", kind="single"):
++    """One aptitude MCQ: 1 mark (-0.25 for a wrong answer); multi-select questions are 2 marks (-0.5)."""
++    multi = kind == "multiple"
++    return _mc(text, options, correct, section, marks=2 if multi else 1, negative=0.5 if multi else 0.25, difficulty=difficulty,
++               explanation=explanation, kind=kind)
++
++
++QA, LR, VA, DI = "Quantitative Aptitude", "Logical Reasoning", "Verbal Ability", "Data Interpretation"
++_SALES = "A company's quarterly sales (in Rs lakh): Q1 = 40, Q2 = 55, Q3 = 45, Q4 = 60.\n"
++
++APTITUDE_OMR_QUESTIONS: List[Dict[str, Any]] = [
++    # ---- Quantitative Aptitude (14)
++    _apt(QA, "A shopkeeper buys an article for Rs 800 and sells it for Rs 920. What is his profit percentage?", ["12%", "15%", "18%", "20%"], [1], "Profit = 120; 120 / 800 x 100 = 15%."),
++    _apt(QA, "What is the simple interest on Rs 5,000 at 8% per annum for 3 years?", ["Rs 1,000", "Rs 1,200", "Rs 1,400", "Rs 1,600"], [1], "SI = 5000 x 8 x 3 / 100 = Rs 1,200."),
++    _apt(QA, "A 150 m long train crosses a pole in 10 seconds. What is its speed?", ["45 km/h", "54 km/h", "60 km/h", "72 km/h"], [1], "150 / 10 = 15 m/s; 15 x 18/5 = 54 km/h.", "medium"),
++    _apt(QA, "Two numbers are in the ratio 3 : 5 and their sum is 160. What is the larger number?", ["60", "80", "100", "120"], [2], "5 / 8 x 160 = 100."),
++    _apt(QA, "The average of five numbers is 24. The sum of four of them is 90. What is the fifth number?", ["24", "28", "30", "36"], [2], "Total = 5 x 24 = 120; 120 - 90 = 30."),
++    _apt(QA, "A can finish a job in 12 days and B in 18 days. Working together, how long will they take?", ["6 days", "7.2 days", "7.5 days", "8 days"], [1], "Rate = 1/12 + 1/18 = 5/36 per day, so 36/5 = 7.2 days.", "medium"),
++    _apt(QA, "What is the compound interest on Rs 10,000 at 10% per annum for 2 years?", ["Rs 2,000", "Rs 2,100", "Rs 2,200", "Rs 2,400"], [1], "10,000 x 1.1 x 1.1 = 12,100; CI = 2,100.", "medium"),
++    _apt(QA, "The price of an item rises by 25% and then falls by 20%. What is the net change?", ["5% increase", "No change", "5% decrease", "10% increase"], [1], "1.25 x 0.80 = 1.00, so the price is back where it started.", "medium"),
++    _apt(QA, "Select ALL the perfect squares.", ["49", "50", "64", "72"], [0, 2], "49 = 7 x 7 and 64 = 8 x 8; 50 and 72 are not squares.", "easy", "multiple"),
++    _apt(QA, "If 40% of a number is 72, what is the number?", ["160", "180", "200", "288"], [1], "72 / 0.40 = 180."),
++    _apt(QA, "A boat goes 12 km/h in still water and the stream flows at 3 km/h. How long does it take to go 45 km downstream?", ["3 hours", "3.75 hours", "4 hours", "5 hours"], [0], "Downstream speed = 15 km/h; 45 / 15 = 3 hours.", "medium"),
++    _apt(QA, "What is the LCM of 12, 18 and 30?", ["90", "180", "360", "540"], [1], "12 = 2^2 x 3, 18 = 2 x 3^2, 30 = 2 x 3 x 5; LCM = 2^2 x 3^2 x 5 = 180.", "medium"),
++    _apt(QA, "Two fair dice are thrown. What is the probability that the sum is 7?", ["1/12", "1/9", "1/6", "5/36"], [2], "Six of the 36 outcomes sum to 7: 6/36 = 1/6.", "medium"),
++    _apt(QA, "If x + y = 10 and x - y = 4, what is x times y?", ["18", "21", "24", "28"], [1], "x = 7 and y = 3, so xy = 21.", "medium"),
++    # ---- Logical Reasoning (12)
++    _apt(LR, "Find the next number: 3, 6, 11, 18, 27, ?", ["36", "38", "40", "42"], [1], "The differences are 3, 5, 7, 9, so the next one is +11: 27 + 11 = 38.", "medium"),
++    _apt(LR, "Find the next number: 2, 6, 18, 54, ?", ["108", "148", "162", "216"], [2], "Each term is 3 times the previous one: 54 x 3 = 162."),
++    _apt(LR, "Which number is the odd one out? 8, 27, 64, 100, 125", ["27", "64", "100", "125"], [2], "8, 27, 64 and 125 are cubes; 100 is not."),
++    _apt(LR, "If letters are numbered A = 1, B = 2 ... then CAT = 3 + 1 + 20 = 24. What is the value of DOG?", ["24", "26", "28", "30"], [1], "D = 4, O = 15, G = 7; 4 + 15 + 7 = 26.", "medium"),
++    _apt(LR, "Asha walks 5 km north, then 3 km east, then 5 km south. How far is she from her starting point?", ["3 km", "5 km", "8 km", "13 km"], [0], "The north and south legs cancel, leaving 3 km east.", "medium"),
++    _apt(LR, "Pointing to a man, a woman says, \"He is the son of my mother's only son.\" How is the man related to the woman?", ["Brother", "Nephew", "Uncle", "Cousin"], [1], "Her mother's only son is her brother, so the man is her brother's son: her nephew.", "hard"),
++    _apt(LR, "Statements: All pens are books. Some books are bags.\nConclusions: I. Some pens are bags.  II. Some bags are books.", ["Only I follows", "Only II follows", "Both I and II follow", "Neither follows"], [1], "'Some books are bags' reverses to 'some bags are books' (II). Nothing links pens to bags (I).", "hard"),
++    _apt(LR, "What is the angle between the hour hand and the minute hand of a clock at 3:00?", ["60 degrees", "75 degrees", "90 degrees", "120 degrees"], [2], "Each hour mark is 30 degrees apart; 3 hours = 90 degrees."),
++    _apt(LR, "Today is Wednesday. What day of the week will it be after 10 days?", ["Friday", "Saturday", "Sunday", "Monday"], [1], "10 = 7 + 3; three days after Wednesday is Saturday.", "easy"),
++    _apt(LR, "Rahul ranks 12th from the top and 29th from the bottom in a class. How many students are in the class?", ["39", "40", "41", "42"], [1], "12 + 29 - 1 = 40.", "medium"),
++    _apt(LR, "Select ALL the numbers that are divisible by both 3 and 4.", ["24", "30", "36", "44"], [0, 2], "Divisible by 12: 24 and 36. 30 is not divisible by 4; 44 is not divisible by 3.", "medium", "multiple"),
++    _apt(LR, "Book : Reading :: Fork : ?", ["Eating", "Cooking", "Cutting", "Drawing"], [0], "A book is used for reading, a fork is used for eating."),
++    # ---- Verbal Ability (9)
++    _apt(VA, "Choose the word closest in meaning to ABUNDANT.", ["Scarce", "Plentiful", "Rare", "Meagre"], [1], "Abundant means existing in large quantities: plentiful."),
++    _apt(VA, "Choose the word opposite in meaning to BENEVOLENT.", ["Kind", "Generous", "Malevolent", "Gentle"], [2], "Benevolent means well-meaning; malevolent means wishing harm."),
++    _apt(VA, "Which sentence is grammatically correct?", ["She doesn't know where is the station.", "She doesn't know where the station is.", "She don't know where the station is.", "She doesn't knows where the station is."], [1], "In an indirect question the subject comes before the verb.", "medium"),
++    _apt(VA, "Fill in the blank: He has been working here ___ 2019.", ["for", "since", "from", "during"], [1], "'Since' goes with a point in time; 'for' goes with a length of time."),
++    _apt(VA, "Choose the correctly spelt word.", ["Acommodation", "Accomodation", "Accommodation", "Acomodation"], [2], "Accommodation has a double c and a double m."),
++    _apt(VA, "What does the idiom 'break the ice' mean?", ["To damage something fragile", "To start a conversation and ease the tension", "To end a friendship", "To feel very cold"], [1], "It means to make people feel comfortable at the start of a meeting."),
++    _apt(VA, "One word for 'a person who loves books':", ["Philanthropist", "Bibliophile", "Misanthrope", "Linguist"], [1], "A bibliophile is a lover and collector of books."),
++    _apt(VA, "Select ALL the words that are nouns.", ["Happiness", "Quickly", "Teacher", "Beautiful"], [0, 2], "Happiness and teacher are nouns; quickly is an adverb and beautiful an adjective.", "easy", "multiple"),
++    _apt(VA, "Change to passive voice: 'The chef cooked the meal.'", ["The meal is cooked by the chef.", "The meal was cooked by the chef.", "The meal has cooked the chef.", "The chef was cooked by the meal."], [1], "Past simple active becomes 'was + past participle' in the passive.", "medium"),
++    # ---- Data Interpretation (5)
++    _apt(DI, _SALES + "What were the total sales for the year?", ["Rs 190 lakh", "Rs 200 lakh", "Rs 210 lakh", "Rs 220 lakh"], [1], "40 + 55 + 45 + 60 = 200.", "easy"),
++    _apt(DI, _SALES + "By what percentage did sales grow from Q1 to Q2?", ["25%", "30%", "37.5%", "40%"], [2], "(55 - 40) / 40 x 100 = 37.5%.", "medium"),
++    _apt(DI, _SALES + "What was the average quarterly sales figure?", ["Rs 45 lakh", "Rs 50 lakh", "Rs 52.5 lakh", "Rs 55 lakh"], [1], "200 / 4 = 50.", "easy"),
++    _apt(DI, _SALES + "In which quarter did sales fall compared with the quarter before it?", ["Q1", "Q2", "Q3", "Q4"], [2], "Q3 (45) is lower than Q2 (55).", "easy"),
++    _apt(DI, _SALES + "Q4 sales are what percentage of the year's total?", ["25%", "28%", "30%", "33%"], [2], "60 / 200 x 100 = 30%.", "medium"),
++]
++
++_OMR_INSTRUCTIONS = (
++    "This sample shows the OMR feature. The 40 multiple-choice questions come in three fixed sets (A, B and C): each candidate "
++    "is given one set, and everyone in the same set sees the identical paper. Click an option, or click a bubble on the OMR "
++    "sheet (use the 'OMR sheet' button at the top), and both stay in sync. Some questions allow more than one answer: "
++    "mark all correct options. A wrong answer costs 0.25 marks (0.5 for multi-answer questions). Admins can download every "
++    "candidate's OMR sheet from the test's Results tab. Your camera is on and AI proctoring watches the whole camera view; this is a "
++    "competitive-style paper, so looking down at your rough work is allowed, but phones, other people and leaving the camera view are "
++    "still flagged. An on-screen scientific calculator is available from the Calculator button."
++)
++
+ SAMPLES: List[Dict[str, Any]] = [
+     {
+         "key": "trial-aptitude",
+@@ -98,6 +166,23 @@ SAMPLES: List[Dict[str, Any]] = [
+             },
+         ],
+     },
++    {
++        "key": "trial-aptitude-omr",
++        "title": "[Trial] Aptitude Test with OMR (Sets A, B, C)",
++        "description": "A 40-question aptitude paper (quantitative, logical, verbal, data interpretation) with single and multi-answer MCQs, "
++                       "fixed question sets A, B and C, and a live OMR answer sheet for candidates.",
++        "duration_minutes": 45,
++        "pass_percentage": 40,
++        "question_sets": 3,
++        "omr_enabled": True,
++        "calculator": "scientific",
++        # camera + AI monitoring on, as for a real exam; competitive mode lets candidates look down at rough work
++        "proctoring": {"webcam_required": True, "microphone_required": False, "ai_monitoring": True, "fullscreen_required": True,
++                       "competitive_exam": True},
++        "instructions": _OMR_INSTRUCTIONS,
++        "questions": APTITUDE_OMR_QUESTIONS,
++        "coding": [],
++    },
+ ]
+ 
+ 
+@@ -109,9 +194,10 @@ def install(db: Session, org: models.Organization, user: models.User) -> List[mo
+         if spec["key"] in have:
+             continue
+         exam = models.Exam(
+-            org_id=org.id, created_by=user.id, title=spec["title"], description=spec["description"], instructions=_INSTRUCTIONS,
++            org_id=org.id, created_by=user.id, title=spec["title"], description=spec["description"], instructions=spec.get("instructions", _INSTRUCTIONS),
+             code=exam_service.new_code(db), status=EXAM_PUBLISHED, published_at=utcnow(), duration_minutes=spec["duration_minutes"],
+-            pass_percentage=spec["pass_percentage"], proctoring=dict(SAMPLE_PROCTORING), is_sample=True, sample_key=spec["key"],
++            pass_percentage=spec["pass_percentage"], proctoring=dict(spec.get("proctoring") or SAMPLE_PROCTORING), is_sample=True, sample_key=spec["key"],
++            question_sets=spec.get("question_sets", 1), omr_enabled=bool(spec.get("omr_enabled", False)), calculator=spec.get("calculator", "off"),
+         )
+         db.add(exam)
+         db.flush()
+diff --git a/backend/app/schemas.py b/backend/app/schemas.py
+index 00d2603..38d373e 100644
+--- a/backend/app/schemas.py
++++ b/backend/app/schemas.py
+@@ -62,6 +62,7 @@ class ProctoringConfig(BaseModel):
+     block_right_click: bool = DEFAULT_PROCTORING["block_right_click"]
+     auto_terminate: bool = DEFAULT_PROCTORING["auto_terminate"]
+     ai_can_terminate: bool = DEFAULT_PROCTORING["ai_can_terminate"]
++    competitive_exam: bool = DEFAULT_PROCTORING["competitive_exam"]
+     max_level2_violations: int = Field(DEFAULT_PROCTORING["max_level2_violations"], ge=1, le=20)
+     snapshot_interval_seconds: int = Field(DEFAULT_PROCTORING["snapshot_interval_seconds"], ge=0, le=600)
+     analysis_interval_seconds: int = Field(DEFAULT_PROCTORING["analysis_interval_seconds"], ge=2, le=30)
+@@ -136,6 +137,11 @@ class ExamIn(BaseModel):
+     questions_per_attempt: Optional[int] = Field(default=None, ge=1)
+     shuffle_questions: bool = True
+     shuffle_options: bool = True
++    question_sets: int = Field(default=1, ge=1, le=6)
++    omr_enabled: bool = False
++    calculator: Literal["off", "basic", "scientific"] = "off"
++    omr_institute: Optional[str] = Field(default=None, max_length=160)
++    omr_note: Optional[str] = Field(default=None, max_length=300)
+     pass_percentage: float = Field(default=40.0, ge=0, le=100)
+     result_visibility: Literal["none", "score", "full"] = "score"
+     proctoring: ProctoringConfig = ProctoringConfig()
+@@ -157,6 +163,11 @@ class ExamPatch(BaseModel):
+     questions_per_attempt: Optional[int] = Field(default=None, ge=0)       # 0 clears it (= all questions)
+     shuffle_questions: Optional[bool] = None
+     shuffle_options: Optional[bool] = None
++    question_sets: Optional[int] = Field(default=None, ge=1, le=6)
++    omr_enabled: Optional[bool] = None
++    calculator: Optional[Literal["off", "basic", "scientific"]] = None
++    omr_institute: Optional[str] = Field(default=None, max_length=160)
++    omr_note: Optional[str] = Field(default=None, max_length=300)
+     pass_percentage: Optional[float] = Field(default=None, ge=0, le=100)
+     result_visibility: Optional[Literal["none", "score", "full"]] = None
+     proctoring: Optional[ProctoringConfig] = None
+diff --git a/backend/app/scoring.py b/backend/app/scoring.py
+index 5d35637..36f397e 100644
+--- a/backend/app/scoring.py
++++ b/backend/app/scoring.py
+@@ -12,33 +12,19 @@ def norm(text: Any) -> str:
+     return " ".join(str(text).strip().lower().split())
+ 
+ 
+-def build_attempt_questions(
+-    questions: Iterable[Any],
+-    *,
+-    per_attempt: Optional[int],
+-    shuffle_questions: bool,
+-    shuffle_options: bool,
+-    rng: Optional[random.Random] = None,
+-) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+-    """Pick and arrange the questions one candidate will see.
++SET_LETTERS = "ABCDEF"
+ 
+-    Returns (question_data, answer_key). question_data is safe to send to the browser;
+-    answer_key stays on the server.
+-    """
+-    rng = rng or random.Random()
+-    pool = list(questions)
+-    if per_attempt and per_attempt < len(pool):
+-        pool = rng.sample(pool, per_attempt)
+-        pool.sort(key=lambda q: (q.position, q.id))  # keep authored order unless shuffling below
+-    if shuffle_questions:
+-        rng.shuffle(pool)
+ 
++def _materialize(pool: List[Any], arrange_options) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
++    """Turn ordered Question rows into (question_data for the browser, answer_key for the server).
++
++    ``arrange_options(question, options)`` may reorder the option list in place."""
+     question_data: List[Dict[str, Any]] = []
+     answer_key: Dict[str, Dict[str, Any]] = {}
+     for q in pool:
+         options = list(q.options or [])
+-        if q.question_type in (Q_SINGLE, Q_MULTIPLE) and shuffle_options:
+-            rng.shuffle(options)
++        if q.question_type in (Q_SINGLE, Q_MULTIPLE):
++            arrange_options(q, options)
+         if q.question_type == Q_SHORT:
+             correct_texts = [str(a) for a in (q.correct or [])]
+         else:
+@@ -63,6 +49,107 @@ def build_attempt_questions(
+     return question_data, answer_key
+ 
+ 
++def build_attempt_questions(
++    questions: Iterable[Any],
++    *,
++    per_attempt: Optional[int],
++    shuffle_questions: bool,
++    shuffle_options: bool,
++    rng: Optional[random.Random] = None,
++) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
++    """Pick and arrange the questions one candidate will see.
++
++    Returns (question_data, answer_key). question_data is safe to send to the browser;
++    answer_key stays on the server.
++    """
++    rng = rng or random.Random()
++    pool = list(questions)
++    if per_attempt and per_attempt < len(pool):
++        pool = rng.sample(pool, per_attempt)
++        pool.sort(key=lambda q: (q.position, q.id))  # keep authored order unless shuffling below
++    if shuffle_questions:
++        rng.shuffle(pool)
++
++    def arrange(_q, options):
++        if shuffle_options:
++            rng.shuffle(options)
++
++    return _materialize(pool, arrange)
++
++
++# ---------------------------------------------------------------------------
++# Fixed question sets (Set A, Set B, ...)
++# ---------------------------------------------------------------------------
++def set_letter(index: int) -> str:
++    return SET_LETTERS[index]
++
++
++def set_index(letter: str) -> int:
++    letter = (letter or "").strip().upper()
++    if len(letter) != 1 or letter not in SET_LETTERS:
++        raise ValueError(f"Unknown question set '{letter}'")
++    return SET_LETTERS.index(letter)
++
++
++def pick_set(counts: Dict[str, int], n_sets: int) -> int:
++    """Index of the set to give the next candidate: the least-used one (ties go to the earlier letter), so the sets
++    stay evenly spread no matter how many people join."""
++    return min(range(n_sets), key=lambda i: (counts.get(SET_LETTERS[i], 0), i))
++
++
++def _subset(pool: List[Any], exam_id: int, per_attempt: Optional[int]) -> List[Any]:
++    """The same questions for every candidate of the exam (a set is one paper, so it cannot be a per-person draw)."""
++    if per_attempt and per_attempt < len(pool):
++        chosen = random.Random(f"{exam_id}|subset|{per_attempt}").sample(range(len(pool)), per_attempt)
++        return [pool[i] for i in sorted(chosen)]
++    return pool
++
++
++def set_order(pool: List[Any], exam_id: int, index: int) -> List[Any]:
++    """Question order of set ``index``. Set A (0) is the authored order. Every other set shuffles the questions
++    *inside* each section (section order is kept, as on a printed paper) and is guaranteed to differ from the earlier
++    sets whenever the questions allow it. Deterministic: the same exam always yields the same sets."""
++    if index == 0:
++        return list(pool)
++    groups: Dict[str, List[Any]] = {}
++    for q in pool:
++        groups.setdefault(q.section or "", []).append(q)
++    seen = {tuple(q.id for q in pool)}
++    order: List[Any] = list(pool)
++    for j in range(1, index + 1):
++        rng = random.Random(f"{exam_id}|set{j}|order")
++        for attempt in range(30):
++            order = []
++            for items in groups.values():
++                part = list(items)
++                rng.shuffle(part)
++                order.extend(part)
++            if tuple(q.id for q in order) not in seen:
++                break
++        seen.add(tuple(q.id for q in order))
++    return order
++
++
++def build_set_paper(
++    questions: Iterable[Any],
++    *,
++    exam_id: int,
++    index: int,
++    per_attempt: Optional[int],
++    shuffle_options: bool,
++) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
++    """The fixed paper of set ``index``: identical for every candidate who gets that set. Set A keeps the authored
++    option order; the other sets also shuffle each question's options when ``shuffle_options`` is on."""
++    pool = _subset(list(questions), exam_id, per_attempt)
++    ordered = set_order(pool, exam_id, index)
++
++    def arrange(q, options):
++        if shuffle_options and index > 0:
++            random.Random(f"{exam_id}|set{index}|opt|{q.id}").shuffle(options)
++
++    return _materialize(ordered, arrange)
++
++
+ def is_answered(answer: Any) -> bool:
+     if answer is None:
+         return False
+diff --git a/backend/requirements-dev.txt b/backend/requirements-dev.txt
+index 2b8d810..7cdb277 100644
+--- a/backend/requirements-dev.txt
++++ b/backend/requirements-dev.txt
+@@ -2,3 +2,4 @@
+ pytest>=8.0
+ pytest-cov>=5.0
+ mongomock>=4.1
++pypdf>=4.0                  # tests read generated PDFs back
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index b2b1835..3383111 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -13,3 +13,5 @@ httpx>=0.27
+ redis>=5.0
+ pymongo[srv]>=4.8
+ cloudinary>=1.40
++reportlab>=4.0              # OMR answer sheets (PDF)
++tzdata>=2024.1              # time zones for printed dates (Windows has no system tz database)
+diff --git a/backend/tests/test_competitive_and_calculator.py b/backend/tests/test_competitive_and_calculator.py
+new file mode 100644
+index 0000000..b16c519
+--- /dev/null
++++ b/backend/tests/test_competitive_and_calculator.py
+@@ -0,0 +1,137 @@
++"""Competitive-exam mode (rough work: looking down is allowed) and the per-test on-screen calculator setting."""
++import pytest
++
++from app import proctoring
++from app.routers import candidate as candidate_router
++from tests.test_proctoring_ai import TINY, ai_env, ai_test, recorded  # noqa: F401  (fixtures)
++
++
++def send(env, c, *findings, body=False):
++    items = []
++    for code in findings:
++        item = {"code": code, "detail": "d"}
++        if code == "NO_FACE" and body:
++            item["body_visible"] = True
++        items.append(item)
++    env.frames["next"] = {"available": True, "face_count": 0 if "NO_FACE" in findings else 1, "findings": items}
++    return env.client.post("/attempt/analyze", headers=c["headers"], json={"image": TINY}).json()
++
++
++# ---------------------------------------------------------------- the pure rule
++def test_policy_is_a_no_op_for_normal_exams():
++    f = [{"code": "LOOKING_DOWN"}, {"code": "NO_FACE", "body_visible": True}, {"code": "PHONE_DETECTED"}]
++    assert set(candidate_router.apply_exam_policy(f, {"competitive_exam": False})) == {"LOOKING_DOWN", "NO_FACE", "PHONE_DETECTED"}
++
++
++def test_competitive_exams_ignore_looking_down_but_nothing_else():
++    f = [{"code": "LOOKING_DOWN"}, {"code": "PHONE_DETECTED"}, {"code": "MULTIPLE_PERSONS"}, {"code": "HEAD_TURNED"},
++         {"code": "LOOKING_AWAY"}, {"code": "CAMERA_COVERED"}, {"code": "NO_FACE"}]
++    out = candidate_router.apply_exam_policy(f, {"competitive_exam": True})
++    assert "LOOKING_DOWN" not in out
++    assert set(out) == {"PHONE_DETECTED", "MULTIPLE_PERSONS", "HEAD_TURNED", "LOOKING_AWAY", "CAMERA_COVERED", "NO_FACE"}
++
++
++def test_a_hidden_face_with_the_body_still_in_view_gets_its_own_longer_streak():
++    out = candidate_router.apply_exam_policy([{"code": "NO_FACE", "body_visible": True}], {"competitive_exam": True})
++    assert list(out) == ["NO_FACE_BODY"] and out["NO_FACE_BODY"]["code"] == "NO_FACE"
++    # nobody in view at all is judged as always
++    assert list(candidate_router.apply_exam_policy([{"code": "NO_FACE"}], {"competitive_exam": True})) == ["NO_FACE"]
++
++
++def test_the_detector_tells_whether_a_body_is_still_in_view():
++    person = [{"name": "person", "box": (0.2, 0.2, 0.8, 0.9), "conf": 0.9}]
++    with_body = proctoring.build_findings([], person)["findings"]
++    assert with_body[0]["code"] == "NO_FACE" and with_body[0]["body_visible"] is True
++    nobody = proctoring.build_findings([], [])["findings"]
++    assert nobody[0]["code"] == "NO_FACE" and nobody[0]["body_visible"] is False
++
++
++# ---------------------------------------------------------------- through the API
++def test_looking_down_is_recorded_in_a_normal_exam(ai_env):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org)["code"])
++    for _ in range(3):
++        send(ai_env, c, "LOOKING_DOWN")
++    assert recorded(ai_env, org, c) == ["LOOKING_DOWN"]
++
++
++def test_looking_down_is_never_recorded_in_a_competitive_exam(ai_env):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org, competitive_exam=True)["code"])
++    for _ in range(12):
++        out = send(ai_env, c, "LOOKING_DOWN")
++    assert out["findings"] == [] and recorded(ai_env, org, c) == []
++
++
++def test_other_violations_still_count_in_a_competitive_exam(ai_env):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org, competitive_exam=True)["code"])
++    send(ai_env, c, "LOOKING_DOWN", "PHONE_DETECTED")
++    out = send(ai_env, c, "LOOKING_DOWN", "PHONE_DETECTED")
++    assert [f["code"] for f in out["findings"]] == ["PHONE_DETECTED"] and recorded(ai_env, org, c) == ["PHONE_DETECTED"]
++
++
++def test_a_face_hidden_over_rough_work_needs_about_six_frames(ai_env):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org, competitive_exam=True)["code"])
++    for _ in range(5):
++        send(ai_env, c, "NO_FACE", body=True)
++    assert recorded(ai_env, org, c) == []
++    out = send(ai_env, c, "NO_FACE", body=True)
++    assert out["findings"][0]["confirmed"] is True and recorded(ai_env, org, c) == ["NO_FACE"]
++    # a quick glance down that ends sooner is never recorded
++    c2 = ai_env.candidate(ai_test(ai_env, org, competitive_exam=True)["code"])
++    for _ in range(4):
++        send(ai_env, c2, "NO_FACE", body=True)
++    send(ai_env, c2)
++    for _ in range(4):
++        send(ai_env, c2, "NO_FACE", body=True)
++    assert recorded(ai_env, org, c2) == []
++
++
++def test_nobody_in_view_is_still_flagged_after_two_frames_in_a_competitive_exam(ai_env):
++    org = ai_env.make_org()
++    c = ai_env.candidate(ai_test(ai_env, org, competitive_exam=True)["code"])
++    send(ai_env, c, "NO_FACE", body=False)
++    send(ai_env, c, "NO_FACE", body=False)
++    assert recorded(ai_env, org, c) == ["NO_FACE"]
++
++
++def test_the_setting_is_saved_and_shown_to_candidates(env):
++    org = env.make_org()
++    t = env.make_test(org, proctoring={"webcam_required": True, "ai_monitoring": True, "competitive_exam": True})
++    assert t["proctoring"]["competitive_exam"] is True
++    assert env.make_test(org)["proctoring"]["competitive_exam"] is False
++    public = env.client.get(f"/public/tests/{t['code']}").json()
++    assert public["proctoring"]["competitive_exam"] is True
++    r = env.client.patch(f"/tests/{t['id']}", headers=org["headers"], json={"proctoring": {"webcam_required": True, "ai_monitoring": True, "competitive_exam": False}})
++    assert r.json()["proctoring"]["competitive_exam"] is False
++
++
++# ---------------------------------------------------------------- calculator
++def test_calculator_setting_round_trips_and_reaches_the_candidate(env):
++    org = env.make_org()
++    off = env.make_test(org)
++    assert off["calculator"] == "off" and env.client.get(f"/public/tests/{off['code']}").json()["calculator"] == "off"
++    t = env.make_test(org, calculator="scientific")
++    assert t["calculator"] == "scientific"
++    c = env.candidate(t["code"])
++    assert c["state"]["test"]["calculator"] == "scientific"
++    r = env.client.patch(f"/tests/{t['id']}", headers=org["headers"], json={"calculator": "basic"})
++    assert r.status_code == 200 and r.json()["calculator"] == "basic"
++    assert env.client.patch(f"/tests/{t['id']}", headers=org["headers"], json={"calculator": "graphing"}).status_code == 422
++    copy = env.client.post(f"/tests/{t['id']}/duplicate", headers=org["headers"]).json()
++    assert copy["calculator"] == "basic"
++
++
++def test_the_sample_aptitude_test_has_camera_ai_competitive_mode_and_a_calculator(env):
++    org = env.make_org()
++    env.client.post("/tests/samples", headers=org["headers"])
++    apt = next(t for t in env.client.get("/tests", headers=org["headers"]).json()["items"] if "OMR" in t["title"])
++    detail = env.client.get(f"/tests/{apt['id']}", headers=org["headers"]).json()
++    p = detail["proctoring"]
++    assert p["webcam_required"] and p["ai_monitoring"] and p["competitive_exam"] and p["fullscreen_required"]
++    assert p["ai_can_terminate"] is False                       # AI still only flags for a human to review
++    assert detail["calculator"] == "scientific"
++    public = env.client.get(f"/public/tests/{apt['code']}").json()
++    assert public["proctoring"]["webcam_required"] and public["proctoring"]["ai_monitoring"]
+diff --git a/backend/tests/test_omr_and_sets.py b/backend/tests/test_omr_and_sets.py
+new file mode 100644
+index 0000000..f838ead
+--- /dev/null
++++ b/backend/tests/test_omr_and_sets.py
+@@ -0,0 +1,350 @@
++"""Fixed question sets (A/B/C), the OMR answer sheet (live data, PDF downloads) and the sample aptitude test."""
++import io
++import zipfile
++from types import SimpleNamespace
++
++from pypdf import PdfReader
++
++from app import omr_pdf, sample_tests, scoring
++
++
++def pdf_text(data: bytes) -> str:
++    return "\n".join(page.extract_text() for page in PdfReader(io.BytesIO(data)).pages)
++
++
++def pages(data: bytes) -> int:
++    return len(PdfReader(io.BytesIO(data)).pages)
++
++
++def Q(i, section="S", options=("a", "b", "c", "d"), qtype="single", correct=(0,)):
++    return SimpleNamespace(id=i, position=i, question_type=qtype, question_text=f"Q{i}", options=list(options), correct=list(correct),
++                           marks=1, negative_marks=0, section=section, difficulty="easy", explanation=None)
++
++
++def sectioned(n=12):
++    return [Q(i, section="Maths" if i <= n // 2 else "Verbal") for i in range(1, n + 1)]
++
++
++# ------------------------------------------------------------------ pure set logic
++def test_set_a_is_the_authored_order_and_other_sets_are_different_papers():
++    qs = sectioned()
++    orders = []
++    for index in range(4):
++        data, _ = scoring.build_set_paper(qs, exam_id=7, index=index, per_attempt=None, shuffle_options=True)
++        orders.append([q["id"] for q in data])
++    assert orders[0] == [q.id for q in qs]
++    assert len({tuple(o) for o in orders}) == 4                                   # every set is a different paper
++
++
++def test_a_set_is_identical_every_time_and_keeps_sections_together():
++    qs = sectioned()
++    first, _ = scoring.build_set_paper(qs, exam_id=7, index=2, per_attempt=None, shuffle_options=True)
++    again, _ = scoring.build_set_paper(qs, exam_id=7, index=2, per_attempt=None, shuffle_options=True)
++    assert first == again                                                         # question order AND option order
++    sections = [q["section"] for q in first]
++    assert sections == sorted(sections, key=lambda s: ["Maths", "Verbal"].index(s))   # Maths block, then Verbal block
++
++
++def test_options_are_only_shuffled_in_later_sets_and_scoring_still_uses_text():
++    qs = [Q(i) for i in range(1, 9)]
++    a, key = scoring.build_set_paper(qs, exam_id=3, index=0, per_attempt=None, shuffle_options=True)
++    b, _ = scoring.build_set_paper(qs, exam_id=3, index=1, per_attempt=None, shuffle_options=True)
++    assert all(q["options"] == ["a", "b", "c", "d"] for q in a)
++    assert any(q["options"] != ["a", "b", "c", "d"] for q in b)
++    assert all(sorted(q["options"]) == ["a", "b", "c", "d"] for q in b)
++    assert key["1"]["correct"] == ["a"]
++    off, _ = scoring.build_set_paper(qs, exam_id=3, index=1, per_attempt=None, shuffle_options=False)
++    assert all(q["options"] == ["a", "b", "c", "d"] for q in off)
++
++
++def test_question_subset_is_the_same_in_every_set():
++    qs = [Q(i) for i in range(1, 21)]
++    ids = [{q["id"] for q in scoring.build_set_paper(qs, exam_id=9, index=i, per_attempt=8, shuffle_options=False)[0]} for i in range(3)]
++    assert len(ids[0]) == 8 and ids[0] == ids[1] == ids[2]
++
++
++def test_pick_set_keeps_sets_evenly_filled():
++    used, picked = {}, []
++    for _ in range(9):
++        i = scoring.pick_set(used, 3)
++        picked.append(scoring.set_letter(i))
++        used[scoring.set_letter(i)] = used.get(scoring.set_letter(i), 0) + 1
++    assert picked == list("ABCABCABC")
++    assert scoring.pick_set({"A": 3, "B": 1, "C": 2}, 3) == 1
++    assert scoring.set_index("c") == 2
++    try:
++        scoring.set_index("Z")
++        assert False
++    except ValueError:
++        pass
++
++
++# ------------------------------------------------------------------ API: sets
++def sets_test(env, org, n_sets=3, omr=True, **kw):
++    qs = [env.mcq(f"Q{i}?", ("w", "x", "y", "z"), i % 4, section="Maths" if i < 6 else "Verbal") for i in range(10)]
++    return env.make_test(org, questions=qs, question_sets=n_sets, omr_enabled=omr, shuffle_questions=False, **kw)
++
++
++def test_settings_round_trip(env):
++    org = env.make_org()
++    t = sets_test(env, org, omr_institute="Sconex Institute", omr_note="Hall 3")
++    assert t["question_sets"] == 3 and t["omr_enabled"] is True and t["omr_institute"] == "Sconex Institute" and t["omr_note"] == "Hall 3"
++    r = env.client.patch(f"/tests/{t['id']}", headers=org["headers"], json={"question_sets": 2, "omr_enabled": False, "omr_note": ""})
++    assert r.status_code == 200 and r.json()["question_sets"] == 2 and r.json()["omr_enabled"] is False and r.json()["omr_note"] is None
++    assert env.client.patch(f"/tests/{t['id']}", headers=org["headers"], json={"question_sets": 9}).status_code == 422
++    dup = env.client.post(f"/tests/{t['id']}/duplicate", headers=org["headers"]).json()
++    copy = env.client.get(f"/tests/{dup['id']}", headers=org["headers"]).json()
++    assert copy["question_sets"] == 2 and copy["omr_institute"] == "Sconex Institute"
++    default = env.make_test(org)
++    assert default["question_sets"] == 1 and default["omr_enabled"] is False
++
++
++def test_candidates_are_dealt_sets_evenly_and_a_set_is_one_identical_paper(env):
++    org = env.make_org()
++    t = sets_test(env, org)
++    cands = [env.candidate(t["code"]) for _ in range(6)]
++    letters = [c["state"]["paper_set"] for c in cands]
++    assert letters == list("ABCABC")
++    by_set = {}
++    for c in cands:
++        by_set.setdefault(c["state"]["paper_set"], []).append([(q["id"], q["options"]) for q in c["state"]["questions"]])
++    for letter, papers in by_set.items():
++        assert papers[0] == papers[1], letter                                      # same set, same paper, same option order
++    assert by_set["A"][0] != by_set["B"][0] != by_set["C"][0]
++    assert [q["id"] for q in cands[0]["state"]["questions"]] == sorted(q["id"] for q in cands[0]["state"]["questions"])   # set A = authored order
++    # reopening the exam does not re-deal
++    again = env.client.get("/attempt", headers=cands[1]["headers"]).json()
++    assert again["paper_set"] == "B" and again["questions"] == cands[1]["state"]["questions"]
++    # the staff list shows the set
++    row = env.client.get(f"/tests/{t['id']}/attempts", headers=org["headers"]).json()["items"][0]
++    assert row["paper_set"] in ("A", "B", "C")
++
++
++def test_every_set_scores_correctly_whatever_the_order(env):
++    org = env.make_org()
++    t = sets_test(env, org)
++    for _ in range(3):
++        c = env.candidate(t["code"])
++        answers = env.answer_all_correctly(org, t, c)
++        done = env.client.post("/attempt/submit", headers=c["headers"], json={"answers": answers}).json()
++        assert done["percentage"] == 100, c["state"]["paper_set"]
++
++
++def test_without_sets_nothing_changes(env):
++    org = env.make_org()
++    t = env.make_test(org, questions=[env.mcq(f"Q{i}?") for i in range(5)])
++    c = env.candidate(t["code"])
++    assert c["state"]["paper_set"] is None and "omr" not in c["state"]
++
++
++def test_changing_the_number_of_sets_is_blocked_while_candidates_are_live(env):
++    org = env.make_org()
++    t = sets_test(env, org)
++    env.candidate(t["code"])
++    r = env.client.patch(f"/tests/{t['id']}", headers=org["headers"], json={"question_sets": 2})
++    assert r.status_code == 409
++    assert env.client.patch(f"/tests/{t['id']}", headers=org["headers"], json={"omr_note": "ok"}).status_code == 200
++
++
++# ------------------------------------------------------------------ API: OMR
++def finish_with(env, t, answer_idx=None, **kw):
++    """Start a candidate, mark option ``answer_idx`` (or nothing) on every question, submit."""
++    c = env.candidate(t["code"], **kw)
++    answers = {}
++    if answer_idx is not None:
++        for q in c["state"]["questions"]:
++            answers[str(q["id"])] = q["options"][answer_idx]
++    env.client.post("/attempt/submit", headers=c["headers"], json={"answers": answers})
++    return c
++
++
++def test_state_carries_the_live_omr_header_when_enabled(env):
++    org = env.make_org(name="Sconex Org")
++    t = sets_test(env, org, omr_institute="Sconex Institute", candidate_fields=[{"key": "roll", "label": "Roll number", "required": True}])
++    c = env.candidate(t["code"], name="Asha Rao", fields={"roll": "R-42"}, phone="9999999999")
++    omr = c["state"]["omr"]
++    assert omr["enabled"] and omr["institute"] == "Sconex Institute" and omr["paper_set"] == "A" and omr["sets"] == "ABC"
++    assert omr["candidate"]["name"] == "Asha Rao" and omr["candidate"]["fields"] == [{"label": "Roll number", "value": "R-42"}]
++    assert omr["test_title"] == t["title"] and omr["started_at"]
++    assert "correct" not in str(c["state"])                                       # still no answer key anywhere
++
++
++def test_staff_download_a_candidate_omr(env):
++    org = env.make_org()
++    t = sets_test(env, org, omr_institute="Sconex Institute")
++    c = finish_with(env, t, 1, name="Asha Rao")
++    r = env.client.get(f"/attempts/{c['attempt_id']}/omr.pdf", headers=org["headers"])
++    assert r.status_code == 200 and r.headers["content-type"] == "application/pdf" and r.content.startswith(b"%PDF")
++    assert "attachment" in r.headers["content-disposition"] and "Asha-Rao" in r.headers["content-disposition"]
++    text = pdf_text(r.content)
++    assert "Sconex Institute" in text and "Asha Rao" in text and "OMR ANSWER SHEET" in text and "EVALUATED" not in text
++    assert pages(r.content) == 1
++
++
++def test_evaluated_copy_is_admin_only_and_shows_the_score(env):
++    org = env.make_org()
++    t = sets_test(env, org)
++    c = finish_with(env, t, 0)
++    reviewer = env.add_member(org, "reviewer")
++    url = f"/attempts/{c['attempt_id']}/omr.pdf?evaluated=true"
++    assert env.client.get(url, headers=reviewer["headers"]).status_code == 403
++    assert env.client.get(url.replace("?evaluated=true", ""), headers=reviewer["headers"]).status_code == 200      # blank-key copy is fine
++    r = env.client.get(url, headers=org["headers"])
++    assert r.status_code == 200
++    text = pdf_text(r.content)
++    assert "EVALUATED COPY" in text and ("PASS" in text or "FAIL" in text)
++    assert "CORRECT" in text.upper() and "WRONG" in text.upper()
++
++
++def test_one_pdf_with_every_candidate_zip_and_filters(env):
++    org = env.make_org()
++    t = sets_test(env, org)
++    for name in ("Zed Zane", "Amy Ames", "Bob Bell", "Cy Cole"):
++        finish_with(env, t, 1, name=name)
++    finish_with(env, t, 1, name="Voided Vic")
++    live = env.candidate(t["code"], name="Still Typing")
++    voided = env.client.get(f"/tests/{t['id']}/attempts", headers=org["headers"]).json()["items"]
++    vic = next(a for a in voided if a["candidate"]["name"] == "Voided Vic")
++    assert env.client.post(f"/attempts/{vic['id']}/void", headers=org["headers"]).status_code == 200
++
++    pdf = env.client.get(f"/tests/{t['id']}/omr.pdf", headers=org["headers"])
++    assert pdf.status_code == 200 and pages(pdf.content) == 4                      # voided + still-running are left out
++    text = pdf_text(pdf.content)
++    assert "Voided Vic" not in text and "Still Typing" not in text and "Amy Ames" in text
++    with_live = env.client.get(f"/tests/{t['id']}/omr.pdf?include_live=true", headers=org["headers"])
++    assert pages(with_live.content) == 5
++
++    set_a = env.client.get(f"/tests/{t['id']}/omr.pdf?set=A", headers=org["headers"])
++    assert set_a.status_code == 200 and 0 < pages(set_a.content) < 4
++    assert env.client.get(f"/tests/{t['id']}/omr.pdf?set=Q", headers=org["headers"]).status_code == 400
++
++    z = env.client.get(f"/tests/{t['id']}/omr.zip", headers=org["headers"])
++    assert z.status_code == 200 and z.headers["content-type"] == "application/zip"
++    names = zipfile.ZipFile(io.BytesIO(z.content)).namelist()
++    assert len(names) == 4 and all(n.endswith(".pdf") and "-Set-" in n for n in names)
++    assert any("Amy-Ames" in n for n in names)
++    assert env.client.get(f"/tests/{t['id']}/omr.zip?evaluated=true", headers=env.add_member(org, "reviewer")["headers"]).status_code == 403
++
++
++def test_nothing_to_export_and_not_started_are_clear_errors(env):
++    org = env.make_org()
++    t = sets_test(env, org)
++    assert env.client.get(f"/tests/{t['id']}/omr.pdf", headers=org["headers"]).status_code == 409
++    lobby = env.candidate(t["code"], start=False)
++    assert env.client.get(f"/attempts/{lobby['attempt_id']}/omr.pdf", headers=org["headers"]).status_code == 409
++
++
++def test_blank_template_per_set(env):
++    org = env.make_org()
++    t = sets_test(env, org, omr_institute="Sconex Institute")
++    every = env.client.get(f"/tests/{t['id']}/omr/blank.pdf", headers=org["headers"])
++    assert every.status_code == 200 and pages(every.content) == 3                 # one sheet per set
++    assert "BLANK TEMPLATE" in pdf_text(every.content)
++    one = env.client.get(f"/tests/{t['id']}/omr/blank.pdf?set=B", headers=org["headers"])
++    assert pages(one.content) == 1
++    assert env.client.get(f"/tests/{t['id']}/omr/blank.pdf?set=F", headers=org["headers"]).status_code == 400   # test only has A-C
++    plain = env.make_test(org, questions=[env.mcq()])
++    assert pages(env.client.get(f"/tests/{plain['id']}/omr/blank.pdf", headers=org["headers"]).content) == 1
++
++
++def test_omr_routes_are_tenant_scoped_and_staff_only(env):
++    a, b = env.make_org(), env.make_org()
++    t = sets_test(env, a)
++    c = finish_with(env, t, 1)
++    assert env.client.get(f"/attempts/{c['attempt_id']}/omr.pdf", headers=b["headers"]).status_code == 404
++    assert env.client.get(f"/tests/{t['id']}/omr.pdf", headers=b["headers"]).status_code == 404
++    assert env.client.get(f"/tests/{t['id']}/omr.pdf", headers=c["headers"]).status_code in (401, 403)   # a candidate is not staff
++    assert env.client.get(f"/tests/{t['id']}/omr.pdf").status_code == 401
++
++
++def test_candidate_can_download_only_their_own_sheet_and_only_when_enabled(env):
++    org = env.make_org()
++    on = sets_test(env, org, omr_institute="Sconex Institute")
++    c = env.candidate(on["code"], name="Asha Rao")
++    q = c["state"]["questions"][0]
++    env.client.put("/attempt/answers", headers=c["headers"], json={"answers": {str(q["id"]): q["options"][2]}})
++    r = env.client.get("/attempt/omr.pdf", headers=c["headers"])
++    assert r.status_code == 200 and r.content.startswith(b"%PDF") and "Asha Rao" in pdf_text(r.content)
++    off = sets_test(env, org, omr=False)
++    c2 = env.candidate(off["code"])
++    assert "omr" not in c2["state"]
++    r2 = env.client.get("/attempt/omr.pdf", headers=c2["headers"])
++    assert r2.status_code == 403 and r2.json()["code"] == "omr_disabled"
++    assert env.client.get("/attempt/omr.pdf").status_code == 401
++
++
++def test_csv_export_has_the_set_column(env):
++    org = env.make_org()
++    t = sets_test(env, org)
++    finish_with(env, t, 1)
++    header = env.client.get(f"/tests/{t['id']}/export.csv", headers=org["headers"]).text.lstrip("﻿").splitlines()[0]
++    assert "Question set" in header
++
++
++# ------------------------------------------------------------------ the sheet renderer itself
++def sheet(n=40, **kw):
++    qs = [omr_pdf.OmrQuestion(i, "single", list("ABCD"), [i % 4]) for i in range(1, n + 1)]
++    return omr_pdf.OmrSheet(institute="Inst", test_title="Test", questions=qs, candidate_name="Asha Rao", **kw)
++
++
++def test_renderer_paginates_and_handles_odd_content():
++    assert pages(omr_pdf.render([sheet(40)])) == 1
++    assert pages(omr_pdf.render([sheet(400)])) >= 3
++    assert pages(omr_pdf.render([sheet(40), sheet(40), sheet(40)])) == 3
++    six = omr_pdf.OmrSheet(institute="I", test_title="T", questions=[omr_pdf.OmrQuestion(i, "single", list("ABCDEF"), [5]) for i in range(1, 61)])
++    assert pages(omr_pdf.render([six])) == 1
++    mixed = sheet(10).questions + [omr_pdf.OmrQuestion(11, "short_text", text="150 minutes"), omr_pdf.OmrQuestion(12, "true_false", ["T", "F"], [0])]
++    out = omr_pdf.render([omr_pdf.OmrSheet(institute="I", test_title="T", questions=mixed)])
++    assert "WRITTEN ANSWERS" in pdf_text(out) and "150 minutes" in pdf_text(out)
++    weird = omr_pdf.OmrSheet(institute="X" * 300, test_title="Y" * 300, questions=sheet(3).questions, candidate_name="Ünïcode नाम ✓", note="n" * 500)
++    assert pages(omr_pdf.render([weird])) == 1                                     # long text is shrunk, non-Latin text cannot crash it
++    try:
++        omr_pdf.render([])
++        assert False
++    except ValueError:
++        pass
++
++
++# ------------------------------------------------------------------ the sample aptitude test
++def test_sample_aptitude_test_is_installed_with_sets_and_omr(env):
++    org = env.make_org()
++    r = env.client.post("/tests/samples", headers=org["headers"])
++    assert r.status_code == 201 and len(r.json()["created"]) == 3
++    rows = env.client.get("/tests", headers=org["headers"]).json()["items"]
++    apt = next(t for t in rows if "OMR" in t["title"])
++    assert apt["question_sets"] == 3 and apt["omr_enabled"] and apt["status"] == "published" and apt["question_count"] == 40
++    detail = env.client.get(f"/tests/{apt['id']}", headers=org["headers"]).json()
++    assert {q["section"] for q in detail["questions"]} == {"Quantitative Aptitude", "Logical Reasoning", "Verbal Ability", "Data Interpretation"}
++    assert {q["question_type"] for q in detail["questions"]} == {"single", "multiple"}
++    assert detail["total_marks"] == 43
++
++
++def test_every_set_of_the_sample_scores_full_marks_with_the_answer_key(env):
++    org = env.make_org()
++    env.client.post("/tests/samples", headers=org["headers"])
++    apt = next(t for t in env.client.get("/tests", headers=org["headers"]).json()["items"] if "OMR" in t["title"])
++    seen = {}
++    for _ in range(3):
++        c = env.candidate(apt["code"])
++        letter = c["state"]["paper_set"]
++        seen[letter] = [q["id"] for q in c["state"]["questions"]]
++        answers = env.answer_all_correctly(org, apt, c)
++        done = env.client.post("/attempt/submit", headers=c["headers"], json={"answers": answers}).json()
++        assert done["percentage"] == 100 and done["score"] == 43, letter
++        sheet_pdf = env.client.get(f"/attempts/{c['attempt_id']}/omr.pdf?evaluated=true", headers=org["headers"])
++        assert sheet_pdf.status_code == 200 and "43 / 43" in pdf_text(sheet_pdf.content).replace("43.0", "43")
++    assert sorted(seen) == ["A", "B", "C"] and len({tuple(v) for v in seen.values()}) == 3
++    # sections stay in their original order in every set
++    detail = env.client.get(f"/tests/{apt['id']}", headers=org["headers"]).json()
++    section_of = {q["id"]: q["section"] for q in detail["questions"]}
++    order = ["Quantitative Aptitude", "Logical Reasoning", "Verbal Ability", "Data Interpretation"]
++    for ids in seen.values():
++        idx = [order.index(section_of[i]) for i in ids]
++        assert idx == sorted(idx)
++
++
++def test_sample_answers_are_internally_consistent():
++    for q in sample_tests.APTITUDE_OMR_QUESTIONS:
++        assert q["marks"] in (1, 2) and (q["question_type"] == "multiple") == (q["marks"] == 2)
++        assert len(set(o.lower() for o in q["options"])) == len(q["options"]) and q["explanation"]
++        assert all(0 <= i < len(q["options"]) for i in q["correct"])
+diff --git a/backend/tests/test_org_domains_and_samples.py b/backend/tests/test_org_domains_and_samples.py
+index 449decf..02d226e 100644
+--- a/backend/tests/test_org_domains_and_samples.py
++++ b/backend/tests/test_org_domains_and_samples.py
+@@ -77,14 +77,14 @@ def test_candidate_domain_lock_restricts_who_can_join(env):
+ 
+ 
+ # ---------------------------------------------------------------- sample tests
+-def test_new_organizations_get_two_published_trial_tests(env):
++def test_new_organizations_get_three_published_trial_tests(env):
+     env.make_super()
+     r = _create(env, install_samples=True, admin_email="sai@sconexsoft.com", allowed_domains=[])
+     assert r.status_code == 201
+     admin = {"Authorization": "Bearer " + env.login("sai@sconexsoft.com")}
+     rows = env.client.get("/tests", headers=admin).json()["items"]
+-    assert len(rows) == 2 and all(t["is_sample"] and t["status"] == "published" and t["title"].startswith("[Trial]") for t in rows)
+-    assert sorted(t["coding_problem_count"] for t in rows) == [0, 2]
++    assert len(rows) == 3 and all(t["is_sample"] and t["status"] == "published" and t["title"].startswith("[Trial]") for t in rows)
++    assert sorted(t["coding_problem_count"] for t in rows) == [0, 0, 2]
+     # they are real: a candidate can join one
+     code = rows[0]["code"]
+     assert env.client.get(f"/public/tests/{code}").json()["is_sample"] is True
+@@ -99,7 +99,7 @@ def test_trial_tests_do_not_use_up_the_active_test_allowance(env):
+     db.commit()
+     db.close()
+     usage = env.client.get("/org", headers=org["headers"]).json()["usage"]
+-    assert usage["active_tests"] == 0 and usage["total_tests"] == 2
++    assert usage["active_tests"] == 0 and usage["total_tests"] == 3
+     t1, t2 = env.make_test(org, publish=False), env.make_test(org, publish=False)
+     assert env.client.post(f"/tests/{t1['id']}/publish", headers=org["headers"]).status_code == 200
+     assert env.client.post(f"/tests/{t2['id']}/publish", headers=org["headers"]).status_code == 200
+@@ -108,17 +108,17 @@ def test_trial_tests_do_not_use_up_the_active_test_allowance(env):
+ def test_installing_samples_is_idempotent_and_available_on_demand(env):
+     org = env.make_org()
+     first = env.client.post("/tests/samples", headers=org["headers"])
+-    assert first.status_code == 201 and len(first.json()["created"]) == 2
++    assert first.status_code == 201 and len(first.json()["created"]) == 3
+     again = env.client.post("/tests/samples", headers=org["headers"])
+     assert again.json()["created"] == []
+-    assert env.client.get("/tests", headers=org["headers"]).json()["total"] == 2
++    assert env.client.get("/tests", headers=org["headers"]).json()["total"] == 3
+ 
+ 
+ def test_sample_test_content_is_valid_and_scores_correctly(env):
+     org = env.make_org()
+     env.client.post("/tests/samples", headers=org["headers"])
+     rows = env.client.get("/tests", headers=org["headers"]).json()["items"]
+-    quiz = next(t for t in rows if t["coding_problem_count"] == 0)
++    quiz = next(t for t in rows if t["coding_problem_count"] == 0 and "OMR" not in t["title"])
+     detail = env.client.get(f"/tests/{quiz['id']}", headers=org["headers"]).json()
+     assert len(detail["questions"]) == 10 and {q["question_type"] for q in detail["questions"]} == {"single", "multiple", "true_false", "short_text"}
+     cand = env.candidate(quiz["code"])
+diff --git a/docs/AI_PROCTORING.md b/docs/AI_PROCTORING.md
+index 3cc7d72..d1955b7 100644
+--- a/docs/AI_PROCTORING.md
++++ b/docs/AI_PROCTORING.md
+@@ -19,6 +19,8 @@ The browser sends one frame every `analysis_interval_seconds` (default 3 s, mini
+ | `HEAD_TURNED` | head turned (nose position, or ≥ 35° from the 3-D pose) | minor | 3 in a row |
+ | `LIP_MOVEMENT` | mouth clearly open (jaw blendshape; falls back to lip gap relative to face height) | minor | 3 in a row |
+ 
++**Competitive-exam mode** (Settings → Proctoring → *Competitive exam*, needs AI monitoring): candidates do rough work on paper, so `LOOKING_DOWN` is never recorded, and a face that disappears while the person's body is still in view (head bent over the desk) must last about 6 checks in a row (~18 s at the default interval) instead of 2 before `NO_FACE` is recorded. Phones, extra people, a covered camera, turning away or nobody being in view are judged exactly as before.
++
+ Phones and people use a *sliding window* ("2 of the last 4 frames") rather than "2 in a row", because a phone half-hidden by a hand drops out of every other frame. Voice is detected in the browser from the microphone (adaptive to the room's noise level) when the test requires a microphone.
+ 
+ ## The whole camera is analysed, never a region
+diff --git a/docs/KNOWN_GAPS.md b/docs/KNOWN_GAPS.md
+index 40ef522..6c9dd60 100644
+--- a/docs/KNOWN_GAPS.md
++++ b/docs/KNOWN_GAPS.md
+@@ -11,6 +11,7 @@
+ - Live human proctoring video streaming; recordings are periodic snapshots only.
+ 
+ **Implemented but not verified in this build environment**
++- OMR sheets and question sets (see `docs/OMR_AND_SETS.md`): covered by automated tests and checked visually in a browser and as rendered PDFs, but never printed on paper, never scanned by an OMR machine, and not tried with Indic-script names (the PDF font is Latin only).
+ - AI proctoring (see `docs/AI_PROCTORING.md`). Phone / person detection was run against real YOLOv8 weights on sample photos (people, including overlapping and small ones) but **not on photos of phones or real exam-room footage**; the MediaPipe face path (face counting, gaze, head pose, blendshapes) is unit-tested with synthetic landmarks and fake models only, never against the real face model or a real webcam. All thresholds (phone 0.30, head-down 25°, ...) are starting points that need calibration on real footage. The Dockerfile model-download step was not built (no Docker daemon).
+ - Real e-mail delivery (Brevo, Resend and SMTP are tested against fakes only; send yourself a test invitation after deploy)
+ - The built-in code runner: verified here for Python, JavaScript, TypeScript, C, C++, Java, Go, Ruby, PHP, Perl and Bash. The other languages are wired but untested without their compilers.
+diff --git a/docs/OMR_AND_SETS.md b/docs/OMR_AND_SETS.md
+new file mode 100644
+index 0000000..1a48888
+--- /dev/null
++++ b/docs/OMR_AND_SETS.md
+@@ -0,0 +1,49 @@
++# Question sets and OMR answer sheets
++
++## Question sets (A, B, C ...)
++
++In **Settings → Questions** choose *Question sets*: 2 to 6 sets, or "No sets".
++
++- Each candidate is dealt one set when they start, evenly (the least-used set next, ties to the earlier letter).
++- A set is **one fixed paper**: everyone in Set B sees the same questions in the same order with the same option order. This is deterministic, so Set B is Set B every time and on every server.
++- **Set A** keeps the authored order and options. Sets B onward re-order the questions **inside each section** (section order is kept, as on a printed paper) and, if *Shuffle answer options* is on, give each question its own fixed option order. A later set is never identical to an earlier one when the questions allow it.
++- *Questions per candidate* still works: the subset is drawn once per test, so every set has the same questions.
++- Sets override *Shuffle question order*. Changing the number of sets is blocked while candidates are taking the test.
++- Scoring compares option **text**, never position, so every set scores identically.
++- The set appears on the candidate's screen and sheet, in the results table and in the CSV export ("Question set").
++
++## OMR answer sheet
++
++**Admin:** *Settings → OMR answer sheet*: switch it on, optionally set the institute name (default: the organization) and a line under it (address, centre ...).
++
++**Candidate (when switched on):** an **OMR sheet** button in the exam room opens a live sheet beside the questions: institute, test, date, candidate details (name, e-mail, phone, your extra fields such as roll number) and the set. Clicking an option on the question screen fills the bubble, and clicking a bubble answers the question: they are the same answers. A filled bubble clicked again is cleared. Clicking a question number jumps to it. The candidate can download the sheet as a PDF, also after submitting. It never contains the answer key.
++
++**Admin downloads (always available, switch or not):**
++
++| What | Where |
++|---|---|
++| All candidates in **one PDF** (a sheet per candidate, grouped by set then name) | Results → OMR sheets |
++| **ZIP** with one PDF per candidate (`001-Set-A-Jane-Doe.pdf`) | Results → OMR sheets |
++| **Blank template** to print (one per set) | Results → OMR sheets |
++| One candidate's sheet, and an **evaluated** copy | Candidate report → OMR sheet / Evaluated OMR |
++
++An *evaluated* copy colours each mark green (right) or red (wrong), rings the right option and prints score, percentage, correct / wrong / not attempted and PASS/FAIL. It carries the answer key, so only **admins** can get it; reviewers get the plain sheet. Voided attempts are never exported; running attempts only if you tick *include candidates still taking the test*.
++
++API: `GET /attempts/{id}/omr.pdf`, `GET /tests/{id}/omr.pdf`, `GET /tests/{id}/omr.zip`, `GET /tests/{id}/omr/blank.pdf` (query: `evaluated`, `set`, `include_live`, `tz`), and for candidates `GET /attempt/omr.pdf`.
++
++## Calculator and competitive-exam mode
++
++- **Settings → Candidate tools → On-screen calculator**: off, basic, or scientific (powers, roots, logs, trigonometry in degrees or radians, factorial, memory). Candidates get a draggable *Calculator* panel in the exam room; they can type or tap, `%` divides by 100 (`15%*240` = 36), and unclosed brackets close themselves.
++- **Settings → Proctoring → Competitive exam**: allows looking down for rough work (see `docs/AI_PROCTORING.md`).
++- The sample *[Trial] Aptitude Test with OMR* ships with camera required, AI monitoring on (findings are for human review only), competitive mode on and the scientific calculator.
++
++## Sheet layout
++
++A4 portrait, vector PDF. Corner alignment marks, institute header, details boxes, the set bubbles, instructions, then the bubble grid: questions numbered down each column in blocks of five rows, 4 columns (3 when a question has 6 options). The row height adapts to the number of questions and long tests continue on further pages with a running header. Multi-answer questions are marked `*`, true/false rows have T and F bubbles, short-answer questions are listed under "Written answers". Each sheet ends with candidate and invigilator signature boxes.
++
++## Known limits
++
++- The PDF uses a built-in Latin font: characters outside Latin-1 (for example Hindi or Telugu names) print as `?`. The live sheet on screen shows them correctly.
++- Dates on the PDF use the time zone of the browser that asked for the download.
++- The paper sheet is a faithful *printout* of the on-screen answers; it is not designed for optical scanning machines (no timing track or roll-number bubble grid).
++- A hosted-scale export is capped at 1,000 sheets per request: filter by set.
+diff --git a/frontend/src/lib/api.js b/frontend/src/lib/api.js
+index ce4293e..d6975b1 100644
+--- a/frontend/src/lib/api.js
++++ b/frontend/src/lib/api.js
+@@ -83,6 +83,14 @@ export const cand = {
+   get: (p, params) => request(p, { params, as: 'candidate' }),
+   post: (p, body, o) => request(p, { ...o, method: 'POST', body: body ?? {}, as: 'candidate' }),
+   put: (p, body) => request(p, { method: 'PUT', body, as: 'candidate' }),
++  // downloads a file (the candidate's own OMR sheet) with the candidate token
++  async download(path, filename, params) {
++    const res = await request(path, { raw: true, params, as: 'candidate' })
++    const url = URL.createObjectURL(await res.blob())
++    const a = Object.assign(document.createElement('a'), { href: url, download: filename })
++    document.body.appendChild(a); a.click(); a.remove()
++    setTimeout(() => URL.revokeObjectURL(url), 5000)
++  },
+ }
+ export const pub = {
+   get: (p, params) => request(p, { params, as: 'none' }),
+diff --git a/frontend/src/lib/calc.js b/frontend/src/lib/calc.js
+new file mode 100644
+index 0000000..1e8d922
+--- /dev/null
++++ b/frontend/src/lib/calc.js
+@@ -0,0 +1,77 @@
++// A tiny, safe expression evaluator for the exam calculator (no eval / Function). Supports + - * / ^ ( ) % !, constants
++// pi and e, and sin cos tan asin acos atan log ln sqrt cbrt abs exp. Implicit multiplication works: 2pi, 3(4+1), (2)(3).
++const FUNCS = {
++  sin: (x, d) => Math.sin(d ? (x * Math.PI) / 180 : x), cos: (x, d) => Math.cos(d ? (x * Math.PI) / 180 : x), tan: (x, d) => Math.tan(d ? (x * Math.PI) / 180 : x),
++  asin: (x, d) => (d ? (Math.asin(x) * 180) / Math.PI : Math.asin(x)), acos: (x, d) => (d ? (Math.acos(x) * 180) / Math.PI : Math.acos(x)), atan: (x, d) => (d ? (Math.atan(x) * 180) / Math.PI : Math.atan(x)),
++  log: (x) => Math.log10(x), ln: (x) => Math.log(x), sqrt: (x) => Math.sqrt(x), cbrt: (x) => Math.cbrt(x), abs: (x) => Math.abs(x), exp: (x) => Math.exp(x),
++}
++const CONSTS = { pi: Math.PI, e: Math.E }
++
++function tokenize(src) {
++  const s = src.replace(/×/g, '*').replace(/÷/g, '/').replace(/−/g, '-').replace(/π/g, 'pi').replace(/√/g, 'sqrt').replace(/\s+/g, '').toLowerCase()
++  const out = []
++  let i = 0
++  while (i < s.length) {
++    const ch = s[i]
++    if (/[0-9.]/.test(ch)) {
++      const m = /^(\d+\.?\d*|\.\d+)(e[+-]?\d+(?![a-z]))?/.exec(s.slice(i))
++      if (!m || s[i + m[0].length] === '.') throw new Error('number')
++      out.push({ t: 'n', v: Number(m[0]) }); i += m[0].length
++    } else if (/[a-z]/.test(ch)) {
++      const m = /^[a-z]+/.exec(s.slice(i))[0]
++      if (m in CONSTS) out.push({ t: 'n', v: CONSTS[m] }); else if (m in FUNCS) out.push({ t: 'f', v: m }); else throw new Error('name')
++      i += m.length
++    } else if ('+-*/^()%!'.includes(ch)) { out.push({ t: ch }); i++ } else throw new Error('char')
++  }
++  return out
++}
++
++export function evaluate(src, { degrees = true } = {}) {
++  const tk = tokenize(src)
++  let open = 0
++  for (const t of tk) { if (t.t === '(') open++; else if (t.t === ')' && --open < 0) throw new Error('paren') }
++  while (open-- > 0) tk.push({ t: ')' })          // like a pocket calculator, unclosed brackets close themselves
++  let p = 0
++  const peek = () => tk[p]
++  const eat = (t) => { if (peek()?.t === t) { p++; return true } return false }
++  function expr() { let v = term(); for (;;) { if (eat('+')) v += term(); else if (eat('-')) v -= term(); else return v } }
++  function term() {
++    let v = unary()
++    for (;;) {
++      if (eat('*')) v *= unary()
++      else if (eat('/')) { const d = unary(); if (d === 0) throw new Error('div0'); v /= d }
++      else if (peek() && (peek().t === 'n' || peek().t === 'f' || peek().t === '(')) v *= unary()    // implicit multiplication
++      else return v
++    }
++  }
++  function unary() { if (eat('-')) return -unary(); if (eat('+')) return unary(); return power() }
++  function power() { const b = postfix(); if (eat('^')) return Math.pow(b, unary()); return b }
++  function postfix() {
++    let v = primary()
++    for (;;) {
++      if (eat('%')) v /= 100
++      else if (eat('!')) { if (v < 0 || !Number.isInteger(v) || v > 170) throw new Error('fact'); let f = 1; for (let k = 2; k <= v; k++) f *= k; v = f }
++      else return v
++    }
++  }
++  function primary() {
++    const t = peek()
++    if (!t) throw new Error('end')
++    if (t.t === 'n') { p++; return t.v }
++    if (t.t === 'f') { p++; const arg = eat('(') ? (() => { const a = expr(); if (!eat(')')) throw new Error('paren'); return a })() : power(); return FUNCS[t.v](arg, degrees) }
++    if (eat('(')) { const v = expr(); if (!eat(')')) throw new Error('paren'); return v }
++    throw new Error('syntax')
++  }
++  const v = expr()
++  if (p !== tk.length) throw new Error('syntax')
++  if (!Number.isFinite(v)) throw new Error('range')
++  return v
++}
++
++// 12 significant digits, no floating-point dust (0.1 + 0.2 -> 0.3), exponent form only for very large / small values
++export function format(v) {
++  if (Object.is(v, -0)) return '0'
++  const r = Number(v.toPrecision(12))
++  const a = Math.abs(r)
++  return a !== 0 && (a >= 1e12 || a < 1e-9) ? r.toExponential(6).replace(/\.?0+e/, 'e') : String(r)
++}
+diff --git a/frontend/src/main.jsx b/frontend/src/main.jsx
+index 472c314..47fa778 100644
+--- a/frontend/src/main.jsx
++++ b/frontend/src/main.jsx
+@@ -7,6 +7,7 @@ import '@fontsource/ibm-plex-mono/600.css'
+ import './styles/app.css'
+ import './styles/pages.css'
+ import './styles/report.css'
++import './styles/omr.css'
+ import App from './App.jsx'
+ import { AuthProvider } from './lib/auth'
+ import { ThemeProvider } from './lib/theme'
+diff --git a/frontend/src/pages/admin/AttemptReport.jsx b/frontend/src/pages/admin/AttemptReport.jsx
+index b73fc53..14c42d3 100644
+--- a/frontend/src/pages/admin/AttemptReport.jsx
++++ b/frontend/src/pages/admin/AttemptReport.jsx
+@@ -1,6 +1,6 @@
+ import { useEffect, useMemo, useState } from 'react'
+ import { useNavigate, useParams } from 'react-router-dom'
+-import { Check, Clock, FileText, MessageSquare, Power, RotateCcw, X } from 'lucide-react'
++import { Check, Clock, FileText, Grid3x3, MessageSquare, Power, RotateCcw, X } from 'lucide-react'
+ import { api } from '../../lib/api'
+ import { duration, fmtDateTime, num, pct, toDate } from '../../lib/format'
+ import { useDocumentTitle } from '../../lib/hooks'
+@@ -44,6 +44,8 @@ export default function AttemptReport() {
+           <PageHeader title={a.candidate.name} crumbs={[{ label: 'Tests', to: '/app/tests' }, { label: a.test.title, to: `/app/tests/${a.test.id}/results` }, { label: a.candidate.name }]} subtitle={`${a.candidate.email}${a.attempt_no > 1 ? ` · attempt ${a.attempt_no}` : ''}`}>
+             <Badge status={a.status} dot />{a.final_result && <Badge status={a.final_result} />}
+             <Button icon={FileText} onClick={() => nav(`/app/attempts/${id}/report`)}>Download report</Button>
++            {a.questions?.length > 0 && <Button icon={Grid3x3} onClick={() => api.download(`/attempts/${id}/omr.pdf?tz=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`, `OMR-${a.candidate.name.replace(/[^\w]+/g, '-')}.pdf`).catch(error)}>OMR sheet</Button>}
++            {a.can_void && a.questions?.length > 0 && <Button icon={Grid3x3} onClick={() => api.download(`/attempts/${id}/omr.pdf?evaluated=true&tz=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)}`, `OMR-evaluated-${a.candidate.name.replace(/[^\w]+/g, '-')}.pdf`).catch(error)}>Evaluated OMR</Button>}
+             {live && <><Button icon={MessageSquare} onClick={() => setDlg('message')}>Message</Button><Button icon={Clock} onClick={() => setDlg('extend')}>Add time</Button><Button variant="danger" icon={Power} onClick={() => setDlg('terminate')}>End attempt</Button></>}
+             {a.can_void && a.status !== 'voided' && <Button icon={RotateCcw} onClick={async () => { if (await confirm({ title: 'Allow a retake?', message: 'This attempt is hidden from results and kept in the audit trail. The candidate can join again with the same code and e-mail.', confirmLabel: 'Allow retake', danger: true })) run(async () => { await api.post(`/attempts/${id}/void`); nav(`/app/tests/${a.test.id}/results`) }, 'Attempt voided') }}>Allow retake</Button>}
+           </PageHeader>
+diff --git a/frontend/src/pages/admin/Tests.jsx b/frontend/src/pages/admin/Tests.jsx
+index 0a1733c..785b46f 100644
+--- a/frontend/src/pages/admin/Tests.jsx
++++ b/frontend/src/pages/admin/Tests.jsx
+@@ -17,18 +17,18 @@ export default function Tests() {
+   const [busy, setBusy] = useState(false)
+   async function loadSamples() {
+     setBusy(true)
+-    try { const r = await api.post('/tests/samples'); toast(r.created?.length ? 'Trial tests added' : 'Trial tests are already there'); list.reload?.() } catch (e) { error(e) } finally { setBusy(false) }
++    try { const r = await api.post('/tests/samples'); toast(r.created?.length ? `${r.created.length} trial test${r.created.length === 1 ? '' : 's'} added` : 'Trial tests are already there'); list.reload?.() } catch (e) { error(e) } finally { setBusy(false) }
+   }
+   return (
+     <>
+-      <PageHeader title="Tests" subtitle="Each test has its own code. Candidates enter the code to sign in.">{isAdmin && <Link className="btn primary" to="/app/tests/new"><Plus size={16} />New test</Link>}</PageHeader>
++      <PageHeader title="Tests" subtitle="Each test has its own code. Candidates enter the code to sign in.">{isAdmin && list.items.length > 0 && <Button busy={busy} onClick={loadSamples}>Add trial tests</Button>}{isAdmin && <Link className="btn primary" to="/app/tests/new"><Plus size={16} />New test</Link>}</PageHeader>
+       <div className="toolbar">
+         <SearchBox value={list.filters.q} onChange={(v) => list.setFilter('q', v)} placeholder="Search tests" />
+         <select className="input" aria-label="Status" value={list.filters.status} onChange={(e) => list.setFilter('status', e.target.value)}><option value="">All statuses</option>{['draft', 'published', 'closed', 'archived'].map((s) => <option key={s} value={s}>{s[0].toUpperCase() + s.slice(1)}</option>)}</select>
+       </div>
+       <Panel flush>
+         {list.loading && !list.data ? <Loading /> : !list.items.length ? (
+-          <Empty title={list.filters.q || list.filters.status ? 'No tests match' : 'Create your first test'} action={isAdmin && !list.filters.q ? <span className="row"><Link className="btn primary" to="/app/tests/new">New test</Link><Button busy={busy} onClick={loadSamples}>Add the 2 trial tests</Button></span> : null}>
++          <Empty title={list.filters.q || list.filters.status ? 'No tests match' : 'Create your first test'} action={isAdmin && !list.filters.q ? <span className="row"><Link className="btn primary" to="/app/tests/new">New test</Link><Button busy={busy} onClick={loadSamples}>Add the 3 trial tests</Button></span> : null}>
+             {list.filters.q || list.filters.status ? 'Try a different search or status.' : 'Add questions, publish it, and share the generated code with candidates.'}</Empty>
+         ) : (
+           <div className="table-wrap"><table className="t"><thead><tr><th>Test</th><th>Code</th><th>Status</th><th className="num">Questions</th><th className="num">Minutes</th><th className="num">Attempts</th><th>Window</th></tr></thead><tbody>
+diff --git a/frontend/src/pages/admin/test/OmrDownloads.jsx b/frontend/src/pages/admin/test/OmrDownloads.jsx
+new file mode 100644
+index 0000000..3fb3e69
+--- /dev/null
++++ b/frontend/src/pages/admin/test/OmrDownloads.jsx
+@@ -0,0 +1,45 @@
++import { useState } from 'react'
++import { FileArchive, FileText, Printer } from 'lucide-react'
++import { api } from '../../../lib/api'
++import { useAuth } from '../../../lib/auth'
++import { Alert, Button, Modal, Select, useUI } from '../../../ui'
++
++const slug = (s) => (s || 'test').replace(/[^\w]+/g, '-').replace(/^-|-$/g, '').slice(0, 50)
++
++/* Admin dialog: every candidate's OMR sheet in one PDF, as a ZIP of single PDFs, or a blank template to print. */
++export default function OmrDownloads({ test: t, onClose }) {
++  const { user } = useAuth()
++  const { error, toast } = useUI()
++  const isAdmin = user.role === 'admin'
++  const sets = t.question_sets > 1 ? 'ABCDEF'.slice(0, t.question_sets).split('') : []
++  const [set, setSet] = useState('')
++  const [evaluated, setEvaluated] = useState(false)
++  const [live, setLive] = useState(false)
++  const [busy, setBusy] = useState('')
++  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone
++  const q = (extra = {}) => new URLSearchParams(Object.entries({ tz, set, evaluated: evaluated || '', include_live: live || '', ...extra }).filter(([, v]) => v)).toString()
++
++  async function go(kind, path, file) {
++    setBusy(kind)
++    try { await api.download(path, file); toast('Download started') } catch (e) { error(e) } finally { setBusy('') }
++  }
++  const base = `/tests/${t.id}`
++  const name = slug(t.title)
++  return (
++    <Modal title="OMR sheets" onClose={onClose} footer={<Button onClick={onClose}>Close</Button>}>
++      <div className="omr-dl">
++        <p className="muted-2">Each sheet has the candidate and institute details, the test, the date and the set, with the bubbles the candidate marked.</p>
++        {!t.omr_enabled && <Alert tone="info">Candidates are not shown a live OMR sheet for this test (turn it on in Settings). You can still download sheets here.</Alert>}
++        {sets.length > 0 && <Select label="Question set" value={set} onChange={(e) => setSet(e.target.value)}><option value="">All sets</option>{sets.map((s) => <option key={s} value={s}>Set {s}</option>)}</Select>}
++        {isAdmin && <label className="check"><input type="checkbox" checked={evaluated} onChange={(e) => setEvaluated(e.target.checked)} /><span>Evaluated copy<small>Colours right and wrong answers, rings the correct option and prints the score.</small></span></label>}
++        <label className="check"><input type="checkbox" checked={live} onChange={(e) => setLive(e.target.checked)} /><span>Include candidates who are still taking the test<small>Otherwise only submitted and ended attempts are included.</small></span></label>
++        <div className="actions">
++          <Button variant="primary" icon={FileText} busy={busy === 'pdf'} onClick={() => go('pdf', `${base}/omr.pdf?${q()}`, `${name}-OMR${evaluated ? '-evaluated' : ''}${set ? `-set-${set}` : ''}.pdf`)}>All sheets in one PDF</Button>
++          <Button icon={FileArchive} busy={busy === 'zip'} onClick={() => go('zip', `${base}/omr.zip?${q()}`, `${name}-OMR${evaluated ? '-evaluated' : ''}${set ? `-set-${set}` : ''}.zip`)}>ZIP, one PDF each</Button>
++          <Button icon={Printer} busy={busy === 'blank'} onClick={() => go('blank', `${base}/omr/blank.pdf?${q({ evaluated: '', include_live: '' })}`, `${name}-OMR-blank${set ? `-set-${set}` : ''}.pdf`)}>Blank template</Button>
++        </div>
++        <p className="muted-2" style={{ fontSize: 12.5 }}>Dates and times use your browser's time zone ({tz}).</p>
++      </div>
++    </Modal>
++  )
++}
+diff --git a/frontend/src/pages/admin/test/Results.jsx b/frontend/src/pages/admin/test/Results.jsx
+index a3d9cff..d2d4869 100644
+--- a/frontend/src/pages/admin/test/Results.jsx
++++ b/frontend/src/pages/admin/test/Results.jsx
+@@ -1,8 +1,10 @@
++import { useState } from 'react'
+ import { Link, useNavigate } from 'react-router-dom'
+-import { Download } from 'lucide-react'
++import { Download, Grid3x3 } from 'lucide-react'
+ import { api } from '../../../lib/api'
+ import { duration, pct, num } from '../../../lib/format'
+ import { usePaged } from '../../../lib/hooks'
++import OmrDownloads from './OmrDownloads'
+ import { Badge, Button, Empty, Loading, Pager, Panel, RiskMeter, SearchBox, useUI } from '../../../ui'
+ 
+ export function resultBadge(a) {
+@@ -15,6 +17,8 @@ export default function Results({ test: t }) {
+   const { error } = useUI()
+   const nav = useNavigate()
+   const list = usePaged(`/tests/${t.id}/attempts`, { q: '', status: '', review_status: '', sort: 'recent', min_risk: '' })
++  const [omr, setOmr] = useState(false)
++  const sets = t.question_sets > 1
+   return (
+     <>
+       <div className="toolbar">
+@@ -22,15 +26,17 @@ export default function Results({ test: t }) {
+         <select className="input" aria-label="Status" value={list.filters.status} onChange={(e) => list.setFilter('status', e.target.value)}><option value="">All statuses</option><option value="submitted">Submitted</option><option value="terminated">Terminated</option><option value="in_progress">In progress</option><option value="registered">In lobby</option></select>
+         <select className="input" aria-label="Review" value={list.filters.review_status} onChange={(e) => list.setFilter('review_status', e.target.value)}><option value="">Any review</option><option value="pending">Needs review</option><option value="cleared">Cleared</option><option value="suspicious">Suspicious</option><option value="disqualified">Disqualified</option></select>
+         <select className="input" aria-label="Sort" value={list.filters.sort} onChange={(e) => list.setFilter('sort', e.target.value)}><option value="recent">Newest first</option><option value="score">Highest score</option><option value="risk">Highest risk</option><option value="name">Name</option></select>
+-        <Button className="right" icon={Download} onClick={() => api.download(`/tests/${t.id}/export.csv`, `${t.title.replace(/[^\w]+/g, '-')}-results.csv`).catch(error)}>Export CSV</Button>
++        <Button className="right" icon={Grid3x3} onClick={() => setOmr(true)}>OMR sheets</Button>
++        <Button icon={Download} onClick={() => api.download(`/tests/${t.id}/export.csv`, `${t.title.replace(/[^\w]+/g, '-')}-results.csv`).catch(error)}>Export CSV</Button>
+       </div>
+       <Panel flush>
+         {list.loading && !list.data ? <Loading /> : !list.items.length ? <Empty title="No attempts match">Results appear here as candidates join and submit.</Empty> : (
+-          <div className="table-wrap"><table className="t"><thead><tr><th className="num">Rank</th><th>Candidate</th><th>Result</th><th className="num">Score</th><th className="num">Time</th><th>Risk</th><th>Review</th></tr></thead><tbody>
++          <div className="table-wrap"><table className="t"><thead><tr><th className="num">Rank</th><th>Candidate</th>{sets && <th>Set</th>}<th>Result</th><th className="num">Score</th><th className="num">Time</th><th>Risk</th><th>Review</th></tr></thead><tbody>
+             {list.items.map((a) => (
+               <tr key={a.id} className="click" onClick={() => nav(`/app/attempts/${a.id}`)}>
+                 <td className="num">{a.rank ?? '—'}</td>
+                 <td><Link className="name" to={`/app/attempts/${a.id}`} onClick={(e) => e.stopPropagation()}>{a.candidate.name}</Link>{a.attempt_no > 1 && <span className="sub"> · attempt {a.attempt_no}</span>}<div className="sub">{a.candidate.email}</div></td>
++                {sets && <td>{a.paper_set ? <span className="badge info">Set {a.paper_set}</span> : <span className="muted">—</span>}</td>}
+                 <td>{resultBadge(a)}{a.auto_submitted && <div className="sub">auto-submitted</div>}</td>
+                 <td className="num">{a.score == null ? '—' : <>{num(a.score)}/{num(a.max_score)} <span className="muted">({pct(a.percentage)})</span></>}</td>
+                 <td className="num muted">{duration(a.time_taken_seconds)}</td>
+@@ -39,6 +45,7 @@ export default function Results({ test: t }) {
+           </tbody></table></div>)}
+         <Pager page={list.page} pageSize={list.pageSize} total={list.total} onPage={list.setPage} />
+       </Panel>
++      {omr && <OmrDownloads test={t} onClose={() => setOmr(false)} />}
+     </>
+   )
+ }
+diff --git a/frontend/src/pages/admin/test/Settings.jsx b/frontend/src/pages/admin/test/Settings.jsx
+index e6cce79..cef1daa 100644
+--- a/frontend/src/pages/admin/test/Settings.jsx
++++ b/frontend/src/pages/admin/test/Settings.jsx
+@@ -12,6 +12,7 @@ export default function Settings({ test: t, reload }) {
+     title: t.title, description: t.description || '', instructions: t.instructions || '', duration_minutes: t.duration_minutes,
+     start_time: toLocalInput(t.start_time), end_time: toLocalInput(t.end_time), access_mode: t.access_mode, access_password: '', clear_password: false,
+     questions_per_attempt: t.questions_per_attempt || '', shuffle_questions: t.shuffle_questions, shuffle_options: t.shuffle_options,
++    question_sets: t.question_sets || 1, calculator: t.calculator || 'off', omr_enabled: !!t.omr_enabled, omr_institute: t.omr_institute || '', omr_note: t.omr_note || '',
+     pass_percentage: t.pass_percentage, result_visibility: t.result_visibility, proctoring: { ...t.proctoring }, candidate_fields: t.candidate_fields || [],
+   }))
+   const [busy, setBusy] = useState(false)
+@@ -25,7 +26,8 @@ export default function Settings({ test: t, reload }) {
+     const body = {
+       title: f.title.trim(), description: f.description, instructions: f.instructions, duration_minutes: Number(f.duration_minutes),
+       access_mode: f.access_mode, questions_per_attempt: f.questions_per_attempt ? Number(f.questions_per_attempt) : 0,
+-      shuffle_questions: f.shuffle_questions, shuffle_options: f.shuffle_options, pass_percentage: Number(f.pass_percentage), result_visibility: f.result_visibility,
++      shuffle_questions: f.shuffle_questions, shuffle_options: f.shuffle_options, question_sets: Number(f.question_sets), calculator: f.calculator, omr_enabled: f.omr_enabled,
++      omr_institute: f.omr_institute.trim(), omr_note: f.omr_note.trim(), pass_percentage: Number(f.pass_percentage), result_visibility: f.result_visibility,
+       proctoring: { ...P, max_level2_violations: Number(P.max_level2_violations), snapshot_interval_seconds: Number(P.snapshot_interval_seconds), analysis_interval_seconds: Number(P.analysis_interval_seconds) },
+       candidate_fields: f.candidate_fields.filter((c) => c.label.trim()).map((c) => ({ ...c, key: c.key || c.label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|^(\d)/, 'f$1').slice(0, 30) })),
+     }
+@@ -54,14 +56,33 @@ export default function Settings({ test: t, reload }) {
+         {t.has_password && <label className="check mb"><input type="checkbox" checked={f.clear_password} onChange={(e) => setF({ ...f, clear_password: e.target.checked, access_password: '' })} />Remove the access password</label>}
+       </Panel>
+       <Panel title="Questions" className="mt">
+-        <Toggle title="Shuffle question order" desc="Each candidate gets a different order." checked={f.shuffle_questions} onChange={(v) => setF({ ...f, shuffle_questions: v })} />
+-        <Toggle title="Shuffle answer options" desc="Option order differs per candidate. Scoring is unaffected." checked={f.shuffle_options} onChange={(v) => setF({ ...f, shuffle_options: v })} />
+-        <div style={{ paddingTop: 12 }}><Input label="Questions drawn per candidate" type="number" min="0" value={f.questions_per_attempt} onChange={set('questions_per_attempt')} hint={`Leave empty to give everyone all ${t.question_count} questions. A smaller number draws a random subset from the pool.`} /></div>
++        <Select label="Question sets" value={f.question_sets} onChange={(e) => setF({ ...f, question_sets: Number(e.target.value) })}
++          hint={f.question_sets > 1 ? `Candidates are dealt ${'ABCDEF'.slice(0, f.question_sets).split('').join(', ')} evenly. Everyone in a set gets the identical paper. Set A keeps your question order; the other sets are fixed re-orderings inside each section.` : 'One paper for everybody, arranged by the two shuffle switches below.'}>
++          <option value={1}>No sets (shuffle per candidate)</option>
++          {[2, 3, 4, 5, 6].map((n) => <option key={n} value={n}>{n} sets: {'ABCDEF'.slice(0, n).split('').join(', ')}</option>)}
++        </Select>
++        <Toggle title="Shuffle question order" desc={f.question_sets > 1 ? 'Not used while question sets are on: the sets already fix each paper.' : 'Each candidate gets a different order.'} checked={f.question_sets > 1 ? false : f.shuffle_questions} disabled={f.question_sets > 1} onChange={(v) => setF({ ...f, shuffle_questions: v })} />
++        <Toggle title="Shuffle answer options" desc={f.question_sets > 1 ? 'Sets B onward also get their own fixed option order. Scoring is unaffected.' : 'Option order differs per candidate. Scoring is unaffected.'} checked={f.shuffle_options} onChange={(v) => setF({ ...f, shuffle_options: v })} />
++        <div style={{ paddingTop: 12 }}><Input label="Questions drawn per candidate" type="number" min="0" value={f.questions_per_attempt} onChange={set('questions_per_attempt')} hint={`Leave empty to give everyone all ${t.question_count} questions. A smaller number draws a random subset from the pool${f.question_sets > 1 ? ' (the same subset in every set)' : ''}.`} /></div>
++      </Panel>
++      <Panel title="OMR answer sheet" className="mt">
++        <Toggle title="Show candidates a live OMR sheet" desc="Adds an OMR sheet next to the questions with the candidate's and your institute's details. Clicking an option or a bubble fills both, and candidates can download their own sheet. You can always download every sheet from the Results tab." checked={f.omr_enabled} onChange={(v) => setF({ ...f, omr_enabled: v })} />
++        <div className="grid c2" style={{ paddingTop: 12 }}>
++          <Input label="Institute name on the sheet" value={f.omr_institute} onChange={set('omr_institute')} maxLength={160} placeholder="Defaults to your organization name" />
++          <Input label="Line under the name (optional)" value={f.omr_note} onChange={set('omr_note')} maxLength={300} placeholder="Address, exam centre, session ..." />
++        </div>
++        <p className="muted-2" style={{ fontSize: 12.5 }}>The sheet also shows the candidate's name, e-mail, phone and any extra fields you ask for (roll number ...), the test, the date and the question set.</p>
++      </Panel>
++      <Panel title="Candidate tools" className="mt">
++        <Select label="On-screen calculator" value={f.calculator} onChange={set('calculator')} hint="A Calculator button appears in the exam room. Basic: + − × ÷ %. Scientific adds powers, roots, logs, trigonometry (degrees or radians), factorial and memory. Candidates cannot use anything else on the computer.">
++          <option value="off">Off: no calculator</option><option value="basic">Basic calculator</option><option value="scientific">Scientific calculator</option>
++        </Select>
+       </Panel>
+       <Panel title="Proctoring" className="mt">
+         {!aiAllowed && <Alert tone="warn">AI face monitoring is not part of your plan. Browser-based checks still work.</Alert>}
+         <Toggle title="Require webcam" desc="Candidates must allow the camera. Losing it is flagged." checked={P.webcam_required} onChange={px('webcam_required')} />
+         <Toggle title="AI face monitoring" desc="Detects no face, several faces, looking away, covered camera. Findings go to a human reviewer." checked={P.ai_monitoring && aiAllowed} disabled={!aiAllowed} onChange={px('ai_monitoring')} />
++        <Toggle title="Competitive exam: allow looking down for rough work" desc="Candidates write on paper, so looking down is not flagged and a face hidden over the desk (body still in view) needs about 6 checks in a row. Phones, other people, a covered camera and turning away are still flagged." checked={!!P.competitive_exam} disabled={!P.ai_monitoring || !aiAllowed} onChange={px('competitive_exam')} />
+         <Toggle title="Let AI findings end the exam" desc="Off by default: AI can be wrong, so by default it only flags for review." checked={P.ai_can_terminate} disabled={!aiAllowed || !P.ai_monitoring} onChange={px('ai_can_terminate')} />
+         <Toggle title="Require microphone" desc="Needed for voice detection." checked={P.microphone_required} onChange={px('microphone_required')} />
+         <Toggle title="Require fullscreen" desc="Leaving fullscreen is a serious flag." checked={P.fullscreen_required} onChange={px('fullscreen_required')} />
+diff --git a/frontend/src/pages/candidate/Calculator.jsx b/frontend/src/pages/candidate/Calculator.jsx
+new file mode 100644
+index 0000000..b62c0a4
+--- /dev/null
++++ b/frontend/src/pages/candidate/Calculator.jsx
+@@ -0,0 +1,79 @@
++import { useRef, useState } from 'react'
++import { X } from 'lucide-react'
++import { evaluate, format } from '../../lib/calc'
++
++/* On-screen calculator (the organizer switches it on per test). A draggable panel: type with the keyboard or tap the keys.
++   Expressions are evaluated by lib/calc.js (no eval). % divides by 100, so "15%*240" is 36. */
++
++const BASIC = [
++  ['C', 'clear', 'fn'], ['⌫', 'back', 'fn'], ['%', '%', 'fn'], ['÷', '/', 'op'],
++  ['7'], ['8'], ['9'], ['×', '*', 'op'],
++  ['4'], ['5'], ['6'], ['−', '-', 'op'],
++  ['1'], ['2'], ['3'], ['+', '+', 'op'],
++  ['±', 'neg', 'fn'], ['0'], ['.'], ['=', 'eq', 'eq'],
++]
++const SCI = [
++  ['sin', 'sin(', 'fn'], ['cos', 'cos(', 'fn'], ['tan', 'tan(', 'fn'], ['log', 'log(', 'fn'], ['ln', 'ln(', 'fn'],
++  ['asin', 'asin(', 'fn'], ['acos', 'acos(', 'fn'], ['atan', 'atan(', 'fn'], ['√', 'sqrt(', 'fn'], ['x²', '^2', 'fn'],
++  ['(', '(', 'fn'], [')', ')', 'fn'], ['xʸ', '^', 'fn'], ['n!', '!', 'fn'], ['1/x', 'inv', 'fn'],
++  ['π', 'pi', 'fn'], ['e', 'e', 'fn'], ['MC', 'mc', 'mem'], ['MR', 'mr', 'mem'], ['M+', 'm+', 'mem'],
++]
++
++export default function Calculator({ mode = 'basic', onClose }) {
++  const [expr, setExpr] = useState('')
++  const [shown, setShown] = useState('0')        // result / error line
++  const [degrees, setDegrees] = useState(true)
++  const [mem, setMem] = useState(0)
++  const [pos, setPos] = useState({ x: 24, y: 120 })
++  const drag = useRef(null)
++  const scientific = mode === 'scientific'
++
++  const calc = (text = expr) => {
++    if (!text.trim()) return null
++    try { const v = evaluate(text, { degrees }); return { ok: true, v, s: format(v) } } catch { return { ok: false } }
++  }
++  const press = (code) => {
++    if (code === 'clear') { setExpr(''); setShown('0'); return }
++    if (code === 'back') { setExpr((x) => x.slice(0, -1)); return }
++    if (code === 'eq') {
++      const r = calc()
++      if (!r) return
++      if (r.ok) { setShown(r.s); setExpr(r.s) } else setShown('Error')
++      return
++    }
++    if (code === 'neg') { setExpr((x) => (x.startsWith('-(') && x.endsWith(')') ? x.slice(2, -1) : x ? `-(${x})` : '-')); return }
++    if (code === 'inv') { setExpr((x) => (x ? `1/(${x})` : '1/')); return }
++    if (code === 'mc') { setMem(0); return }
++    if (code === 'mr') { setExpr((x) => x + format(mem)); return }
++    if (code === 'm+') { const r = calc(); if (r?.ok) setMem((m) => m + r.v); return }
++    setExpr((x) => (shown !== '0' && x === shown && /^[0-9.]/.test(code) ? code : x + code))      // typing a digit after "=" starts fresh
++    setShown('0')
++  }
++  const live = calc()
++  const line = shown !== '0' ? shown : live?.ok ? live.s : expr ? '' : '0'
++
++  const onKey = (e) => {
++    if (e.key === 'Enter') { e.preventDefault(); press('eq') }
++    else if (e.key === 'Escape') onClose()
++  }
++  const down = (e) => { drag.current = { dx: e.clientX - pos.x, dy: e.clientY - pos.y }; e.currentTarget.setPointerCapture(e.pointerId) }
++  const move = (e) => { if (drag.current) setPos({ x: Math.max(0, Math.min(window.innerWidth - 120, e.clientX - drag.current.dx)), y: Math.max(0, Math.min(window.innerHeight - 60, e.clientY - drag.current.dy)) }) }
++  const up = () => { drag.current = null }
++
++  return (
++    <div className={`calc ${scientific ? 'sci' : ''}`} style={{ left: pos.x, top: pos.y }} role="dialog" aria-label="Calculator">
++      <div className="calc-head" onPointerDown={down} onPointerMove={move} onPointerUp={up}>
++        <b>Calculator</b>
++        {scientific && <button type="button" className="calc-mode" onPointerDown={(e) => e.stopPropagation()} onClick={() => setDegrees((d) => !d)} aria-label="Angle unit" title="Angle unit for sin, cos, tan">{degrees ? 'DEG' : 'RAD'}</button>}
++        {mem !== 0 && <span className="calc-m" title="Something is in memory">M</span>}
++        <button type="button" className="calc-x" onPointerDown={(e) => e.stopPropagation()} onClick={onClose} aria-label="Close calculator"><X size={14} /></button>
++      </div>
++      <input className="calc-expr" value={expr} onChange={(e) => { setExpr(e.target.value); setShown('0') }} onKeyDown={onKey} placeholder="Type or tap" spellCheck={false} autoComplete="off" aria-label="Expression" />
++      <output className={`calc-out ${shown === 'Error' || (expr && !live?.ok && shown === '0') ? 'dim' : ''}`} aria-live="polite">{shown === 'Error' ? 'Error' : line}</output>
++      <div className="calc-keys">
++        {scientific && <div className="calc-sci">{SCI.map(([label, code, kind]) => <button type="button" key={label} className={`k ${kind}`} onClick={() => press(code)}>{label}</button>)}</div>}
++        <div className="calc-main">{BASIC.map(([label, code, kind]) => <button type="button" key={label} className={`k ${kind || ''}`} onClick={() => press(code || label)}>{label}</button>)}</div>
++      </div>
++    </div>
++  )
++}
+diff --git a/frontend/src/pages/candidate/ExamRoom.jsx b/frontend/src/pages/candidate/ExamRoom.jsx
+index 1a30b33..7845eeb 100644
+--- a/frontend/src/pages/candidate/ExamRoom.jsx
++++ b/frontend/src/pages/candidate/ExamRoom.jsx
+@@ -1,6 +1,6 @@
+ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+ import { Link } from 'react-router-dom'
+-import { Bell, ChevronLeft, ChevronRight, Flag, Maximize, Send, WifiOff } from 'lucide-react'
++import { Bell, Calculator as CalcIcon, ChevronLeft, ChevronRight, ClipboardList, Flag, Maximize, Send, WifiOff } from 'lucide-react'
+ import { ApiError, cand, candToken, setCandidateExpiredHandler } from '../../lib/api'
+ import { clock } from '../../lib/format'
+ import { Alert, Button, Loading, Modal } from '../../ui'
+@@ -9,7 +9,9 @@ import { CamTile, ProctorAlerts } from './ProctorHud'
+ import { CodeEntry } from '../public/Landing'
+ import CodingPanel from './CodingPanel'
+ import Finished from './Finished'
++import Calculator from './Calculator'
+ import Lobby from './Lobby'
++import OmrSheet from './OmrSheet'
+ import { useMedia, watchVoice } from './useMedia'
+ 
+ const FINAL = new Set(['submitted', 'terminated'])
+@@ -78,6 +80,11 @@ function Exam({ state, media, onDone }) {
+   const [hint, setHint] = useState('')
+   const [boxes, setBoxes] = useState([])                 // what the AI currently sees (phones, extra people), as fractions of the frame
+   const [gateErr, setGateErr] = useState('')
++  const omr = state.omr?.enabled && questions.length ? state.omr : null          // the organizer switched the OMR sheet on
++  const [omrOpen, setOmrOpen] = useState(() => !!omr && window.innerWidth >= 1100)
++  const [omrBusy, setOmrBusy] = useState(false)
++  const calcMode = state.test.calculator && state.test.calculator !== 'off' ? state.test.calculator : null     // organizer allows an on-screen calculator
++  const [calcOpen, setCalcOpen] = useState(false)
+ 
+   const clockRef = useRef({ remaining: state.attempt.remaining_seconds, at: performance.now() })
+   const [left, setLeft] = useState(state.attempt.remaining_seconds)
+@@ -233,6 +240,18 @@ function Exam({ state, media, onDone }) {
+ 
+   const q = questions[idx]
+   const setAnswer = (id, v) => setAnswers((a) => { const n = { ...a }; if (v === '' || v == null || (Array.isArray(v) && !v.length)) delete n[id]; else n[id] = v; return n })
++  // one place decides what clicking an option means; the question screen AND the OMR sheet both use it
++  const pickOption = (q, i) => setAnswers((a) => {
++    const n = { ...a }; const o = q.options[i]; const cur = n[q.id]
++    if (q.type === 'multiple') { const list = cur || []; const next = list.includes(o) ? list.filter((x) => x !== o) : [...list, o]; if (next.length) n[q.id] = next; else delete n[q.id] }
++    else if (cur === o) delete n[q.id]        // clicking a filled bubble again rubs it out
++    else n[q.id] = o
++    return n
++  })
++  async function downloadOmr() {
++    setOmrBusy(true)
++    try { await cand.download('/attempt/omr.pdf', 'OMR-sheet.pdf', { tz: Intl.DateTimeFormat().resolvedOptions().timeZone }) } catch (e) { setNotices((n) => [...n, { id: Date.now(), text: `Could not download the OMR sheet: ${e.message}`, tone: 'bad' }]) } finally { setOmrBusy(false) }
++  }
+   const answeredCount = questions.filter((x) => answers[x.id] != null).length
+   const sections = useMemo(() => { const g = []; questions.forEach((x, i) => { const s = x.section || ''; if (!g.length || g[g.length - 1].s !== s) g.push({ s, items: [] }); g[g.length - 1].items.push(i) }); return g }, [questions])
+ 
+@@ -250,6 +269,8 @@ function Exam({ state, media, onDone }) {
+     <div className="room">
+       <header className="room-top">
+         <div className="grow truncate"><b>{state.test.title}</b><span className="muted" style={{ marginLeft: 10, fontSize: 13 }}>{answeredCount}/{questions.length} answered</span></div>
++        {calcMode && <Button icon={CalcIcon} className={calcOpen ? 'primary' : ''} aria-pressed={calcOpen} onClick={() => setCalcOpen((o) => !o)}>Calculator</Button>}
++        {omr && view === 'questions' && <Button icon={ClipboardList} className={omrOpen ? 'primary' : ''} aria-pressed={omrOpen} onClick={() => setOmrOpen((o) => !o)}>OMR sheet</Button>}
+         <ThemeToggle />
+         <span className={`save ${save}`} role="status">{save === 'saved' ? 'All answers saved' : save === 'saving' ? 'Saving…' : <><WifiOff size={14} /> Offline — saved on this device</>}</span>
+         <div className={`timer ${urgent ? 'urgent' : low ? 'low' : ''}`} role="timer" aria-label={`Time left ${clock(left)}`}>{clock(left)}</div>
+@@ -263,7 +284,7 @@ function Exam({ state, media, onDone }) {
+ 
+       {questions.length > 0 && problems.length > 0 && <div className="tabs room-tabs"><button className={view === 'questions' ? 'active' : ''} onClick={() => setView('questions')}>Questions ({answeredCount}/{questions.length})</button><button className={view === 'coding' ? 'active' : ''} onClick={() => setView('coding')}>Coding ({problems.length})</button></div>}
+ 
+-      <div className="room-body">
++      <div className={`room-body${omr && omrOpen && view === 'questions' ? ' has-omr' : ''}`}>
+         <main className="room-main">
+           {view === 'questions' && q && (
+             <article className="question" key={q.id}>
+@@ -273,7 +294,7 @@ function Exam({ state, media, onDone }) {
+                 : <div className="options" role={q.type === 'multiple' ? 'group' : 'radiogroup'} aria-label="Answer options">
+                   {q.options.map((o, i) => {
+                     const multi = q.type === 'multiple'; const cur = answers[q.id]; const on = multi ? (cur || []).includes(o) : cur === o
+-                    return <label key={i} className={`option ${on ? 'on' : ''}`}><input type={multi ? 'checkbox' : 'radio'} name={`q${q.id}`} checked={on} onChange={() => multi ? setAnswer(q.id, on ? cur.filter((x) => x !== o) : [...(cur || []), o]) : setAnswer(q.id, o)} /><span className="key">{String.fromCharCode(65 + i)}</span><span>{o}</span></label>
++                    return <label key={i} className={`option ${on ? 'on' : ''}`}><input type={multi ? 'checkbox' : 'radio'} name={`q${q.id}`} checked={on} onChange={() => pickOption(q, i)} /><span className="key">{String.fromCharCode(65 + i)}</span><span>{o}</span></label>
+                   })}</div>}
+               {q.type === 'multiple' && <p className="hint">Select all that apply.</p>}
+               <div className="row between mt-lg" style={{ marginTop: 28 }}>
+@@ -287,14 +308,17 @@ function Exam({ state, media, onDone }) {
+           {view === 'coding' && <CodingPanel problems={problems} attemptId={attemptId} />}
+         </main>
+ 
+-        <aside className="room-side">
++        <aside className={`room-side${omr && omrOpen && view === 'questions' ? ' has-omr' : ''}`}>
+           {needCam && <CamTile video={video} camOn={media.cam} issue={hint} monitoring={!!cfg.ai_monitoring} boxes={boxes} />}
+-          {view === 'questions' && <nav aria-label="Question navigator">{sections.map((g, gi) => (
++          {omr && omrOpen && view === 'questions' && <OmrSheet omr={omr} questions={questions} answers={answers} current={idx} flagged={flagged} onPick={pickOption} onJump={(i) => setIdx(i)} onClose={() => setOmrOpen(false)} onDownload={downloadOmr} downloading={omrBusy} />}
++          {view === 'questions' && !(omr && omrOpen) && <nav aria-label="Question navigator">{sections.map((g, gi) => (
+             <div key={gi}>{g.s && <div className="nav-sec">{g.s}</div>}<div className="qgrid">{g.items.map((i) => { const id = questions[i].id; return <button key={id} className={`qn ${i === idx ? 'cur' : ''} ${answers[id] != null ? 'ans' : ''} ${flagged.includes(id) ? 'flag' : ''}`} aria-label={`Question ${i + 1}${answers[id] != null ? ', answered' : ''}${flagged.includes(id) ? ', flagged' : ''}`} onClick={() => { setIdx(i); setView('questions') }}>{i + 1}</button> })}</div></div>))}
+             <div className="legend mt"><span><i style={{ background: 'var(--accent)' }} />Answered</span><span><i style={{ background: 'var(--warn)' }} />Flagged</span><span><i style={{ background: 'var(--neutral-soft)' }} />Not answered</span></div></nav>}
+         </aside>
+       </div>
+ 
++      {calcMode && calcOpen && <Calculator mode={calcMode} onClose={() => setCalcOpen(false)} />}
++
+       {fsLost && cfg.fullscreen_required && (
+         <div className="overlay" style={{ zIndex: 150 }}><div className="modal" role="alertdialog" aria-label="Return to fullscreen"><div className="body" style={{ textAlign: 'center', padding: 28 }}>
+           <Maximize size={32} color="var(--bad)" /><h2 style={{ margin: '10px 0' }}>Return to fullscreen</h2><p className="muted-2 mb">You left fullscreen. This was recorded. The timer is still running.</p>
+diff --git a/frontend/src/pages/candidate/Finished.jsx b/frontend/src/pages/candidate/Finished.jsx
+index e0a3f3a..7545ce8 100644
+--- a/frontend/src/pages/candidate/Finished.jsx
++++ b/frontend/src/pages/candidate/Finished.jsx
+@@ -1,13 +1,21 @@
+-import { CheckCircle2, OctagonX } from 'lucide-react'
++import { useState } from 'react'
++import { CheckCircle2, Grid3x3, OctagonX } from 'lucide-react'
++import { cand } from '../../lib/api'
+ import { Link } from 'react-router-dom'
+ import { num, pct } from '../../lib/format'
+-import { Alert, Badge } from '../../ui'
++import { Alert, Badge, Button } from '../../ui'
+ import { Brand } from './Join'
+ 
+ export default function Finished({ state, result }) {
+   const r = result || state.result || {}
+   const terminated = r.status === 'terminated'
+   const hasScore = r.score != null
++  const [busy, setBusy] = useState(false)
++  const [omrErr, setOmrErr] = useState('')
++  async function omr() {
++    setBusy(true); setOmrErr('')
++    try { await cand.download('/attempt/omr.pdf', 'OMR-sheet.pdf', { tz: Intl.DateTimeFormat().resolvedOptions().timeZone }) } catch (e) { setOmrErr(e.message) } finally { setBusy(false) }
++  }
+   return (
+     <div className="cand-wrap">
+       <div className="cand-card wide" style={{ textAlign: 'center' }}>
+@@ -21,6 +29,7 @@ export default function Finished({ state, result }) {
+           <div className="scorebox"><div className="big">{num(r.score)}<span>/{num(r.max_score)}</span></div><div>{pct(r.percentage)}</div><div className="mt"><Badge status={r.passed ? 'pass' : 'fail'} /></div></div>
+         )}
+         {!hasScore && !terminated && <p className="mt">Thank you. Your answers were received{r.visibility === 'none' ? '. The organizer will share results with you.' : '.'}</p>}
++        {state.omr?.enabled && <div className="mt"><Button icon={Grid3x3} busy={busy} onClick={omr}>Download my OMR sheet</Button>{omrErr && <Alert tone="bad" className="mt">{omrErr}</Alert>}</div>}
+         {r.review && (
+           <div style={{ textAlign: 'left', marginTop: 24 }}><h3 className="mb">Answer review</h3>
+             {r.review.map((q, i) => (
+diff --git a/frontend/src/pages/candidate/Lobby.jsx b/frontend/src/pages/candidate/Lobby.jsx
+index fbe8ae4..2f6b39d 100644
+--- a/frontend/src/pages/candidate/Lobby.jsx
++++ b/frontend/src/pages/candidate/Lobby.jsx
+@@ -43,6 +43,9 @@ export default function Lobby({ state, media, onStarted }) {
+         <Brand org={t.organization} />
+         <h1>{t.title}</h1>
+         <p className="muted-2">Hello {state.candidate.name}. You have <b>{t.duration_minutes} minutes</b> once you press Start. The timer cannot be paused.</p>
++        {(t.calculator && t.calculator !== 'off') && <Alert tone="info" className="mb">A {t.calculator} calculator is available on screen during this test (Calculator button at the top). Please do not use any other device.</Alert>}
++        {cfg.competitive_exam && <Alert tone="info" className="mb">This test allows rough work on paper: looking down at your desk is fine. Phones, other people, notes you are not allowed and leaving the camera view are still flagged.</Alert>}
++        {(t.omr_enabled || t.question_sets > 1) && <Alert tone="info" className="mb">{t.question_sets > 1 ? `This test uses ${t.question_sets} question sets: you will be given one of them when you start. ` : ''}{t.omr_enabled ? 'You will get an OMR answer sheet next to the questions. Marking an option or a bubble fills both.' : ''}</Alert>}
+         {t.instructions && <div className="instructions"><h3>Instructions from the organizer</h3><p style={{ whiteSpace: 'pre-wrap' }}>{t.instructions}</p></div>}
+ 
+         <h3 className="mt-lg" style={{ marginTop: 22 }}>Before you start</h3>
+diff --git a/frontend/src/pages/candidate/OmrSheet.jsx b/frontend/src/pages/candidate/OmrSheet.jsx
+new file mode 100644
+index 0000000..c4b07c5
+--- /dev/null
++++ b/frontend/src/pages/candidate/OmrSheet.jsx
+@@ -0,0 +1,93 @@
++import { useMemo } from 'react'
++import { Download, X } from 'lucide-react'
++import { Button, IconButton } from '../../ui'
++
++/* A live OMR answer sheet. It is a second view of the same answers the question screen edits: filling a bubble here
++   answers the question there and vice versa. Bubble A is always the first option the candidate sees for that
++   question, so it matches the A/B/C/D keys shown beside each option. */
++
++const optionLabels = (q) => (q.type === 'true_false' ? ['T', 'F'] : q.options.map((_, i) => String.fromCharCode(65 + i)))
++
++const BLOCK = 10
++
++const stamp = (iso) => {
++  if (!iso) return { date: '—', time: '' }
++  const d = new Date(/[zZ]|[+-]\d\d:?\d\d$/.test(iso) ? iso : iso + 'Z')
++  return { date: d.toLocaleDateString(undefined, { day: '2-digit', month: 'short', year: 'numeric' }), time: d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) }
++}
++
++function Field({ label, value, wide }) {
++  return <div className={`omr-field${wide ? ' wide' : ''}`}><span>{label}</span><b title={value || ''}>{value || '—'}</b></div>
++}
++
++export default function OmrSheet({ omr, questions, answers, current, flagged = [], onPick, onJump, onClose, onDownload, downloading }) {
++  const when = stamp(omr.started_at)
++  const answered = questions.filter((q) => answers[q.id] != null).length
++  const blocks = useMemo(() => {
++    const out = []
++    for (let i = 0; i < questions.length; i += BLOCK) out.push(questions.slice(i, i + BLOCK).map((q, k) => ({ q, n: i + k })))
++    return out
++  }, [questions])
++
++  return (
++    <section className="omr" aria-label="OMR answer sheet">
++      <header className="omr-top">
++        <div className="omr-title">OMR answer sheet</div>
++        <span className="omr-count">{answered}/{questions.length} marked</span>
++        {onDownload && <Button size="sm" icon={Download} busy={downloading} onClick={onDownload}>PDF</Button>}
++        {onClose && <IconButton icon={X} label="Close OMR sheet" onClick={onClose} />}
++      </header>
++
++      <div className="omr-paper">
++        <div className="omr-inst">{omr.institute}</div>
++        {omr.note && <div className="omr-note">{omr.note}</div>}
++        <div className="omr-band">OMR ANSWER SHEET</div>
++        <div className="omr-test"><b>{omr.test_title}</b>{omr.test_code && <span>Code {omr.test_code}</span>}</div>
++
++        <div className="omr-fields">
++          <Field label="Candidate name" value={omr.candidate.name} wide />
++          <div className="omr-field setbox" aria-label={omr.paper_set ? `Question set ${omr.paper_set}` : undefined}>
++            <span>Question set</span>
++            {omr.sets ? <div className="omr-setrow">{omr.sets.split('').map((s) => <i key={s} className={`omr-bub sm${s === omr.paper_set ? ' on' : ''}`}>{s}</i>)}</div> : <b>—</b>}
++          </div>
++          <Field label="E-mail" value={omr.candidate.email} wide />
++          <Field label="Phone" value={omr.candidate.phone} />
++          {omr.candidate.fields.map((f) => <Field key={f.label} label={f.label} value={f.value} />)}
++          <Field label="Date" value={when.date} />
++          <Field label="Start time" value={when.time} />
++          <Field label="Duration" value={omr.duration_minutes ? `${omr.duration_minutes} minutes` : ''} />
++          <Field label="Questions" value={String(questions.length)} />
++        </div>
++
++        <p className="omr-help">Click a bubble to mark your answer, click it again to remove it. Questions marked <b>*</b> allow more than one answer. This sheet and the question screen always show the same answers.</p>
++
++        <div className="omr-grid">
++          {blocks.map((rows, bi) => (
++            <div className="omr-block" key={bi}>
++              {rows.map(({ q, n }) => {
++                const cur = answers[q.id]
++                const short = q.type === 'short_text'
++                const labels = optionLabels(q)
++                return (
++                  <div key={q.id} className={`omr-row${n === current ? ' cur' : ''}${flagged.includes(q.id) ? ' flag' : ''}${n % 10 < 5 ? ' alt' : ''}`}>
++                    <button type="button" className="omr-num" onClick={() => onJump(n)} aria-label={`Go to question ${n + 1}`}>{n + 1}{q.type === 'multiple' ? '*' : ''}</button>
++                    {short
++                      ? <span className="omr-written" title={cur || ''}>{cur ? `✎ ${cur}` : '✎ written answer'}</span>
++                      : labels.map((label, i) => {
++                        const opt = q.options[i]
++                        const on = q.type === 'multiple' ? (cur || []).includes(opt) : cur === opt
++                        return <button key={i} type="button" className={`omr-bub${on ? ' on' : ''}`} aria-pressed={on} aria-label={`Question ${n + 1}, option ${label}${q.type === 'true_false' ? ` (${opt})` : ''}`} onClick={() => onPick(q, i)}>{label}</button>
++                      })}
++                  </div>
++                )
++              })}
++            </div>
++          ))}
++        </div>
++
++        <div className="omr-legend"><span><i className="omr-bub sm on" />Marked</span><span><i className="omr-bub sm" />Not marked</span><span><i className="omr-cur" />Question on screen</span><span><i className="omr-flag" />Flagged</span></div>
++        <div className="omr-ref">{omr.attempt_ref}</div>
++      </div>
++    </section>
++  )
++}
+diff --git a/frontend/src/pages/public/Guide.jsx b/frontend/src/pages/public/Guide.jsx
+index 69fa438..46ea2d0 100644
+--- a/frontend/src/pages/public/Guide.jsx
++++ b/frontend/src/pages/public/Guide.jsx
+@@ -73,10 +73,10 @@ const GUIDES = {
+         'Link expired or lost? Use **Resend verification e-mail** in the banner. Still stuck? Ask the platform owner to verify you manually.',
+         'Your organization may only allow addresses from its own e-mail domains (for example `@yourcompany.com`). This applies to you and to every team member you add.',
+       ] },
+-      { title: 'Try the two trial tests', items: [
+-        'Every new organization starts with **two ready-made trial tests**: “[Trial] General Aptitude & Tech Basics” (10 questions, all question types) and “[Trial] Coding Challenge” (3 questions and 2 coding problems).',
++      { title: 'Try the trial tests', items: [
++        'Every new organization starts with **three ready-made trial tests**: “[Trial] General Aptitude & Tech Basics” (10 questions, all question types), “[Trial] Aptitude Test with OMR (Sets A, B, C)” (40 MCQs with a live OMR sheet and three fixed sets) and “[Trial] Coding Challenge” (3 questions and 2 coding problems).',
+         'Open **Tests**, copy a trial test’s code, and take it yourself in another browser window to see exactly what candidates see. Then open **Results** to see scoring and the proctoring report.',
+-        'Trial tests are labelled **Trial**, are already published, and do not count against your plan’s active-test limit. Edit or delete them freely. Missing? Press **Add the 2 trial tests** on the Tests page.',
++        'Trial tests are labelled **Trial**, are already published, and do not count against your plan’s active-test limit. Edit or delete them freely. Missing? Press **Add trial tests** on the Tests page.',
+       ] },
+       { title: 'Create a test', steps: [
+         'Go to **Tests → New test**. Enter a title, duration and passing score. A unique 8-character **test code** is created for you.',
+@@ -89,6 +89,17 @@ const GUIDES = {
+         '**From the question bank:** reuse questions you saved earlier, or the built-in starter library (Python, JavaScript, SQL, data structures, CS fundamentals, aptitude).',
+         '**CSV import:** download the template on the Questions tab, fill it in, upload. It is all-or-nothing and tells you which rows to fix.',
+         '**Questions per candidate** draws a random subset; **shuffle** mixes questions and options so neighbours see different orders.',
++        '**Question sets:** in **Settings → Questions** choose 2 to 6 sets (A, B, C ...). Each candidate is dealt one set, evenly, and everyone in a set gets the identical paper. Set A keeps your order; the others are fixed re-orderings inside each section.',
++      ] },
++      { title: 'Calculator and competitive exams', items: [
++        'In **Settings → Candidate tools** choose an on-screen **basic or scientific calculator**. Candidates get a draggable *Calculator* button in the exam room and cannot use anything else.',
++        'For competitive-style papers switch on **Settings → Proctoring → Competitive exam**: candidates may look down at rough work, so *looking down* is not flagged. Phones, other people, a covered camera and turning away are still flagged. Keep **Require webcam** and **AI face monitoring** on so the whole camera view is watched.',
++      ] },
++      { title: 'OMR answer sheets', items: [
++        'Turn on **Settings → OMR answer sheet** and candidates get an **OMR sheet** button in the exam room. The sheet shows your institute name, the candidate’s details, the test, the date and the set. Clicking an option or a bubble fills both, always in sync.',
++        'Candidates can download their own sheet as a PDF (also after submitting). Switch the toggle off and they see no OMR sheet.',
++        'On the test’s **Results** tab press **OMR sheets** to download every candidate’s sheet in one PDF, as a ZIP of single PDFs, or a **blank template** to print. Admins can also download **evaluated** copies that colour right and wrong answers and print the score. One sheet is also available on each candidate’s report.',
++        'Multi-answer questions are marked with `*`; true/false use T and F bubbles; short-answer questions are listed under “Written answers”. Names in non-Latin scripts print as `?` on the PDF.',
+       ] },
+       { title: 'Coding problems: by hand or from JSON', steps: [
+         'Open the test’s **Coding** tab. Press **Add problem** to type one in: title, statement, input/output format, points, time and memory limits, and test cases.',
+diff --git a/frontend/src/styles/omr.css b/frontend/src/styles/omr.css
+new file mode 100644
+index 0000000..991f098
+--- /dev/null
++++ b/frontend/src/styles/omr.css
+@@ -0,0 +1,86 @@
++/* Live OMR answer sheet (exam room) and its admin download dialog */
++.omr { display: grid; gap: 10px; }
++.omr-top { display: flex; align-items: center; gap: 8px; }
++.omr-title { font: 600 13px var(--font-body); flex: 1; }
++.omr-count { font: 600 12px var(--font-mono); color: var(--text-2); }
++
++.omr-paper { background: var(--surface); border: 1px solid var(--line-strong); border-radius: var(--radius-lg); padding: 14px; position: relative; }
++.omr-paper::before, .omr-paper::after { content: ''; position: absolute; width: 9px; height: 9px; background: var(--text); top: 6px; }
++.omr-paper::before { left: 6px; }
++.omr-paper::after { right: 6px; }
++.omr-inst { text-align: center; font: 700 16px/1.25 var(--font-display, var(--font-body)); padding: 2px 14px 0; overflow-wrap: anywhere; }
++.omr-note { text-align: center; font-size: 11.5px; color: var(--text-3); margin-top: 2px; overflow-wrap: anywhere; }
++.omr-band { margin: 10px 0 8px; background: var(--ink, #1f2937); color: #fff; text-align: center; font: 700 11px var(--font-body); letter-spacing: .12em; padding: 6px 0; border-radius: 5px; }
++.omr-test { display: flex; justify-content: space-between; gap: 8px; font-size: 12.5px; margin-bottom: 8px; }
++.omr-test b { overflow-wrap: anywhere; }
++.omr-test span { color: var(--text-3); font: 600 11.5px var(--font-mono); white-space: nowrap; }
++
++.omr-fields { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; }
++.omr-field { border: 1px solid var(--line-strong); border-radius: 5px; padding: 3px 6px 4px; min-width: 0; background: var(--surface); }
++.omr-field.wide { grid-column: span 2; }
++.omr-field span { display: block; font: 600 8.5px var(--font-body); letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); }
++.omr-field b { display: block; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
++.omr-setrow { display: flex; gap: 4px; margin-top: 2px; }
++.omr-help { font-size: 11.5px; color: var(--text-2); background: var(--neutral-soft); border-radius: 6px; padding: 7px 9px; margin: 9px 0; }
++
++.omr-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(188px, 1fr)); gap: 8px; }
++.omr-block { border: 1px solid var(--line-strong); border-radius: 7px; overflow: hidden; background: var(--surface); }
++.omr-row { display: flex; align-items: center; gap: 5px; padding: 3px 6px; min-height: 30px; }
++.omr-row.alt { background: var(--neutral-soft); }
++.omr-row.cur { box-shadow: inset 3px 0 0 var(--accent); background: var(--accent-soft); }
++.omr-row.flag .omr-num { text-decoration: underline wavy var(--warn); text-underline-offset: 3px; }
++.omr-num { width: 28px; flex: none; text-align: right; background: none; border: 0; padding: 0 4px 0 0; font: 700 12px var(--font-mono); color: var(--text); cursor: pointer; }
++.omr-num:hover { color: var(--accent); }
++.omr-written { font-size: 11.5px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++
++.omr-bub { width: 24px; height: 24px; flex: none; display: inline-grid; place-items: center; border-radius: 50%; border: 1.5px solid var(--line-strong); background: var(--surface); color: var(--text-3); font: 600 10.5px var(--font-mono); cursor: pointer; padding: 0; line-height: 1; transition: background .08s, color .08s, transform .08s; }
++button.omr-bub:hover { border-color: var(--text); transform: scale(1.08); }
++button.omr-bub:focus-visible { box-shadow: var(--focus); outline: none; }
++.omr-bub.on { background: var(--text); border-color: var(--text); color: var(--surface); font-weight: 700; }
++.omr-bub.sm { width: 17px; height: 17px; font-size: 9px; cursor: default; }
++i.omr-bub { font-style: normal; }
++
++.omr-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 11px; color: var(--text-2); margin-top: 10px; align-items: center; }
++.omr-legend span { display: inline-flex; align-items: center; gap: 5px; }
++.omr-cur { width: 3px; height: 14px; background: var(--accent); border-radius: 2px; }
++.omr-flag { width: 14px; height: 0; border-top: 2px dotted var(--warn); }
++.omr-ref { margin-top: 8px; text-align: right; font: 500 10px var(--font-mono); color: var(--text-3); }
++
++/* OMR docked in the side column while the exam room is open */
++.room-body.has-omr { grid-template-columns: minmax(0, 1fr) minmax(300px, 460px); }
++.room-side.has-omr { top: 70px; max-height: calc(100vh - 82px); overflow: auto; }
++@media (max-width: 900px) {
++  .room-body.has-omr { grid-template-columns: 1fr; }
++  /* on a phone / narrow window the sheet opens as a full-screen layer you can close */
++  .room-side.has-omr .omr { position: fixed; inset: 56px 0 0 0; z-index: 90; background: var(--bg, var(--surface)); padding: 10px; overflow: auto; }
++}
++
++/* admin download dialog */
++.omr-dl { display: grid; gap: 14px; }
++.omr-dl .opt { display: grid; gap: 4px; }
++.omr-dl .actions { display: flex; flex-wrap: wrap; gap: 8px; }
++@media print { .omr-top, .omr-help { display: none; } }
++
++/* exam-room calculator */
++.calc { position: fixed; z-index: 85; width: 252px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 12px; box-shadow: 0 12px 34px rgba(15, 23, 42, .28); padding: 8px; display: grid; gap: 6px; user-select: none; }
++.calc.sci { width: 318px; }
++.calc-head { display: flex; align-items: center; gap: 8px; cursor: grab; padding: 2px 2px 4px; touch-action: none; }
++.calc-head b { flex: 1; font-size: 12.5px; }
++.calc-head:active { cursor: grabbing; }
++.calc-mode { border: 1px solid var(--line-strong); background: var(--neutral-soft); border-radius: 5px; font: 700 10.5px var(--font-mono); padding: 2px 6px; cursor: pointer; color: var(--text); }
++.calc-m { font: 700 10px var(--font-mono); color: var(--accent); }
++.calc-x { border: 0; background: none; cursor: pointer; color: var(--text-2); display: grid; place-items: center; padding: 2px; }
++.calc-expr { width: 100%; border: 1px solid var(--line-strong); border-radius: 7px; padding: 7px 9px; font: 500 14px var(--font-mono); background: var(--surface); color: var(--text); user-select: text; }
++.calc-out { display: block; text-align: right; font: 700 22px/1.2 var(--font-mono); min-height: 28px; padding: 0 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.calc-out.dim { color: var(--text-3); }
++.calc-keys { display: grid; gap: 6px; }
++.calc-main { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
++.calc-sci { display: grid; grid-template-columns: repeat(5, 1fr); gap: 4px; }
++.calc .k { height: 34px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--neutral-soft); color: var(--text); font: 600 13px var(--font-mono); cursor: pointer; padding: 0; }
++.calc .k:hover { border-color: var(--text); }
++.calc .k:focus-visible, .calc-x:focus-visible, .calc-mode:focus-visible { box-shadow: var(--focus); outline: none; }
++.calc .k.op { background: var(--accent-soft); }
++.calc .k.eq { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
++.calc .k.mem { font-size: 11px; }
++.calc-sci .k { height: 30px; font-size: 11.5px; }
++@media (max-width: 480px) { .calc, .calc.sci { width: min(318px, calc(100vw - 16px)); } }

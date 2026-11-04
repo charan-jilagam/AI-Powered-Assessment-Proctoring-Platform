@@ -17,18 +17,18 @@ export default function Tests() {
   const [busy, setBusy] = useState(false)
   async function loadSamples() {
     setBusy(true)
-    try { const r = await api.post('/tests/samples'); toast(r.created?.length ? 'Trial tests added' : 'Trial tests are already there'); list.reload?.() } catch (e) { error(e) } finally { setBusy(false) }
+    try { const r = await api.post('/tests/samples'); toast(r.created?.length ? `${r.created.length} trial test${r.created.length === 1 ? '' : 's'} added` : 'Trial tests are already there'); list.reload?.() } catch (e) { error(e) } finally { setBusy(false) }
   }
   return (
     <>
-      <PageHeader title="Tests" subtitle="Each test has its own code. Candidates enter the code to sign in.">{isAdmin && <Link className="btn primary" to="/app/tests/new"><Plus size={16} />New test</Link>}</PageHeader>
+      <PageHeader title="Tests" subtitle="Each test has its own code. Candidates enter the code to sign in.">{isAdmin && list.items.length > 0 && <Button busy={busy} onClick={loadSamples}>Add trial tests</Button>}{isAdmin && <Link className="btn primary" to="/app/tests/new"><Plus size={16} />New test</Link>}</PageHeader>
       <div className="toolbar">
         <SearchBox value={list.filters.q} onChange={(v) => list.setFilter('q', v)} placeholder="Search tests" />
         <select className="input" aria-label="Status" value={list.filters.status} onChange={(e) => list.setFilter('status', e.target.value)}><option value="">All statuses</option>{['draft', 'published', 'closed', 'archived'].map((s) => <option key={s} value={s}>{s[0].toUpperCase() + s.slice(1)}</option>)}</select>
       </div>
       <Panel flush>
         {list.loading && !list.data ? <Loading /> : !list.items.length ? (
-          <Empty title={list.filters.q || list.filters.status ? 'No tests match' : 'Create your first test'} action={isAdmin && !list.filters.q ? <span className="row"><Link className="btn primary" to="/app/tests/new">New test</Link><Button busy={busy} onClick={loadSamples}>Add the 2 trial tests</Button></span> : null}>
+          <Empty title={list.filters.q || list.filters.status ? 'No tests match' : 'Create your first test'} action={isAdmin && !list.filters.q ? <span className="row"><Link className="btn primary" to="/app/tests/new">New test</Link><Button busy={busy} onClick={loadSamples}>Add the 3 trial tests</Button></span> : null}>
             {list.filters.q || list.filters.status ? 'Try a different search or status.' : 'Add questions, publish it, and share the generated code with candidates.'}</Empty>
         ) : (
           <div className="table-wrap"><table className="t"><thead><tr><th>Test</th><th>Code</th><th>Status</th><th className="num">Questions</th><th className="num">Minutes</th><th className="num">Attempts</th><th>Window</th></tr></thead><tbody>

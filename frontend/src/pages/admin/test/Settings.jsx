@@ -12,6 +12,7 @@ export default function Settings({ test: t, reload }) {
     title: t.title, description: t.description || '', instructions: t.instructions || '', duration_minutes: t.duration_minutes,
     start_time: toLocalInput(t.start_time), end_time: toLocalInput(t.end_time), access_mode: t.access_mode, access_password: '', clear_password: false,
     questions_per_attempt: t.questions_per_attempt || '', shuffle_questions: t.shuffle_questions, shuffle_options: t.shuffle_options,
+    question_sets: t.question_sets || 1, calculator: t.calculator || 'off', omr_enabled: !!t.omr_enabled, omr_institute: t.omr_institute || '', omr_note: t.omr_note || '',
     pass_percentage: t.pass_percentage, result_visibility: t.result_visibility, proctoring: { ...t.proctoring }, candidate_fields: t.candidate_fields || [],
   }))
   const [busy, setBusy] = useState(false)
@@ -25,7 +26,8 @@ export default function Settings({ test: t, reload }) {
     const body = {
       title: f.title.trim(), description: f.description, instructions: f.instructions, duration_minutes: Number(f.duration_minutes),
       access_mode: f.access_mode, questions_per_attempt: f.questions_per_attempt ? Number(f.questions_per_attempt) : 0,
-      shuffle_questions: f.shuffle_questions, shuffle_options: f.shuffle_options, pass_percentage: Number(f.pass_percentage), result_visibility: f.result_visibility,
+      shuffle_questions: f.shuffle_questions, shuffle_options: f.shuffle_options, question_sets: Number(f.question_sets), calculator: f.calculator, omr_enabled: f.omr_enabled,
+      omr_institute: f.omr_institute.trim(), omr_note: f.omr_note.trim(), pass_percentage: Number(f.pass_percentage), result_visibility: f.result_visibility,
       proctoring: { ...P, max_level2_violations: Number(P.max_level2_violations), snapshot_interval_seconds: Number(P.snapshot_interval_seconds), analysis_interval_seconds: Number(P.analysis_interval_seconds) },
       candidate_fields: f.candidate_fields.filter((c) => c.label.trim()).map((c) => ({ ...c, key: c.key || c.label.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|^(\d)/, 'f$1').slice(0, 30) })),
     }
@@ -54,14 +56,33 @@ export default function Settings({ test: t, reload }) {
         {t.has_password && <label className="check mb"><input type="checkbox" checked={f.clear_password} onChange={(e) => setF({ ...f, clear_password: e.target.checked, access_password: '' })} />Remove the access password</label>}
       </Panel>
       <Panel title="Questions" className="mt">
-        <Toggle title="Shuffle question order" desc="Each candidate gets a different order." checked={f.shuffle_questions} onChange={(v) => setF({ ...f, shuffle_questions: v })} />
-        <Toggle title="Shuffle answer options" desc="Option order differs per candidate. Scoring is unaffected." checked={f.shuffle_options} onChange={(v) => setF({ ...f, shuffle_options: v })} />
-        <div style={{ paddingTop: 12 }}><Input label="Questions drawn per candidate" type="number" min="0" value={f.questions_per_attempt} onChange={set('questions_per_attempt')} hint={`Leave empty to give everyone all ${t.question_count} questions. A smaller number draws a random subset from the pool.`} /></div>
+        <Select label="Question sets" value={f.question_sets} onChange={(e) => setF({ ...f, question_sets: Number(e.target.value) })}
+          hint={f.question_sets > 1 ? `Candidates are dealt ${'ABCDEF'.slice(0, f.question_sets).split('').join(', ')} evenly. Everyone in a set gets the identical paper. Set A keeps your question order; the other sets are fixed re-orderings inside each section.` : 'One paper for everybody, arranged by the two shuffle switches below.'}>
+          <option value={1}>No sets (shuffle per candidate)</option>
+          {[2, 3, 4, 5, 6].map((n) => <option key={n} value={n}>{n} sets: {'ABCDEF'.slice(0, n).split('').join(', ')}</option>)}
+        </Select>
+        <Toggle title="Shuffle question order" desc={f.question_sets > 1 ? 'Not used while question sets are on: the sets already fix each paper.' : 'Each candidate gets a different order.'} checked={f.question_sets > 1 ? false : f.shuffle_questions} disabled={f.question_sets > 1} onChange={(v) => setF({ ...f, shuffle_questions: v })} />
+        <Toggle title="Shuffle answer options" desc={f.question_sets > 1 ? 'Sets B onward also get their own fixed option order. Scoring is unaffected.' : 'Option order differs per candidate. Scoring is unaffected.'} checked={f.shuffle_options} onChange={(v) => setF({ ...f, shuffle_options: v })} />
+        <div style={{ paddingTop: 12 }}><Input label="Questions drawn per candidate" type="number" min="0" value={f.questions_per_attempt} onChange={set('questions_per_attempt')} hint={`Leave empty to give everyone all ${t.question_count} questions. A smaller number draws a random subset from the pool${f.question_sets > 1 ? ' (the same subset in every set)' : ''}.`} /></div>
+      </Panel>
+      <Panel title="OMR answer sheet" className="mt">
+        <Toggle title="Show candidates a live OMR sheet" desc="Adds an OMR sheet next to the questions with the candidate's and your institute's details. Clicking an option or a bubble fills both, and candidates can download their own sheet. You can always download every sheet from the Results tab." checked={f.omr_enabled} onChange={(v) => setF({ ...f, omr_enabled: v })} />
+        <div className="grid c2" style={{ paddingTop: 12 }}>
+          <Input label="Institute name on the sheet" value={f.omr_institute} onChange={set('omr_institute')} maxLength={160} placeholder="Defaults to your organization name" />
+          <Input label="Line under the name (optional)" value={f.omr_note} onChange={set('omr_note')} maxLength={300} placeholder="Address, exam centre, session ..." />
+        </div>
+        <p className="muted-2" style={{ fontSize: 12.5 }}>The sheet also shows the candidate's name, e-mail, phone and any extra fields you ask for (roll number ...), the test, the date and the question set.</p>
+      </Panel>
+      <Panel title="Candidate tools" className="mt">
+        <Select label="On-screen calculator" value={f.calculator} onChange={set('calculator')} hint="A Calculator button appears in the exam room. Basic: + − × ÷ %. Scientific adds powers, roots, logs, trigonometry (degrees or radians), factorial and memory. Candidates cannot use anything else on the computer.">
+          <option value="off">Off: no calculator</option><option value="basic">Basic calculator</option><option value="scientific">Scientific calculator</option>
+        </Select>
       </Panel>
       <Panel title="Proctoring" className="mt">
         {!aiAllowed && <Alert tone="warn">AI face monitoring is not part of your plan. Browser-based checks still work.</Alert>}
         <Toggle title="Require webcam" desc="Candidates must allow the camera. Losing it is flagged." checked={P.webcam_required} onChange={px('webcam_required')} />
         <Toggle title="AI face monitoring" desc="Detects no face, several faces, looking away, covered camera. Findings go to a human reviewer." checked={P.ai_monitoring && aiAllowed} disabled={!aiAllowed} onChange={px('ai_monitoring')} />
+        <Toggle title="Competitive exam: allow looking down for rough work" desc="Candidates write on paper, so looking down is not flagged and a face hidden over the desk (body still in view) needs about 6 checks in a row. Phones, other people, a covered camera and turning away are still flagged." checked={!!P.competitive_exam} disabled={!P.ai_monitoring || !aiAllowed} onChange={px('competitive_exam')} />
         <Toggle title="Let AI findings end the exam" desc="Off by default: AI can be wrong, so by default it only flags for review." checked={P.ai_can_terminate} disabled={!aiAllowed || !P.ai_monitoring} onChange={px('ai_can_terminate')} />
         <Toggle title="Require microphone" desc="Needed for voice detection." checked={P.microphone_required} onChange={px('microphone_required')} />
         <Toggle title="Require fullscreen" desc="Leaving fullscreen is a serious flag." checked={P.fullscreen_required} onChange={px('fullscreen_required')} />

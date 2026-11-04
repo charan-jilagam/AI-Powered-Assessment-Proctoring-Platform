@@ -83,6 +83,14 @@ export const cand = {
   get: (p, params) => request(p, { params, as: 'candidate' }),
   post: (p, body, o) => request(p, { ...o, method: 'POST', body: body ?? {}, as: 'candidate' }),
   put: (p, body) => request(p, { method: 'PUT', body, as: 'candidate' }),
+  // downloads a file (the candidate's own OMR sheet) with the candidate token
+  async download(path, filename, params) {
+    const res = await request(path, { raw: true, params, as: 'candidate' })
+    const url = URL.createObjectURL(await res.blob())
+    const a = Object.assign(document.createElement('a'), { href: url, download: filename })
+    document.body.appendChild(a); a.click(); a.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  },
 }
 export const pub = {
   get: (p, params) => request(p, { params, as: 'none' }),

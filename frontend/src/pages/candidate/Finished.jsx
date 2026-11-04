@@ -1,13 +1,21 @@
-import { CheckCircle2, OctagonX } from 'lucide-react'
+import { useState } from 'react'
+import { CheckCircle2, Grid3x3, OctagonX } from 'lucide-react'
+import { cand } from '../../lib/api'
 import { Link } from 'react-router-dom'
 import { num, pct } from '../../lib/format'
-import { Alert, Badge } from '../../ui'
+import { Alert, Badge, Button } from '../../ui'
 import { Brand } from './Join'
 
 export default function Finished({ state, result }) {
   const r = result || state.result || {}
   const terminated = r.status === 'terminated'
   const hasScore = r.score != null
+  const [busy, setBusy] = useState(false)
+  const [omrErr, setOmrErr] = useState('')
+  async function omr() {
+    setBusy(true); setOmrErr('')
+    try { await cand.download('/attempt/omr.pdf', 'OMR-sheet.pdf', { tz: Intl.DateTimeFormat().resolvedOptions().timeZone }) } catch (e) { setOmrErr(e.message) } finally { setBusy(false) }
+  }
   return (
     <div className="cand-wrap">
       <div className="cand-card wide" style={{ textAlign: 'center' }}>
@@ -21,6 +29,7 @@ export default function Finished({ state, result }) {
           <div className="scorebox"><div className="big">{num(r.score)}<span>/{num(r.max_score)}</span></div><div>{pct(r.percentage)}</div><div className="mt"><Badge status={r.passed ? 'pass' : 'fail'} /></div></div>
         )}
         {!hasScore && !terminated && <p className="mt">Thank you. Your answers were received{r.visibility === 'none' ? '. The organizer will share results with you.' : '.'}</p>}
+        {state.omr?.enabled && <div className="mt"><Button icon={Grid3x3} busy={busy} onClick={omr}>Download my OMR sheet</Button>{omrErr && <Alert tone="bad" className="mt">{omrErr}</Alert>}</div>}
         {r.review && (
           <div style={{ textAlign: 'left', marginTop: 24 }}><h3 className="mb">Answer review</h3>
             {r.review.map((q, i) => (

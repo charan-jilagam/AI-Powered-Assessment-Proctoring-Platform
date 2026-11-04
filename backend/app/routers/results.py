@@ -65,7 +65,7 @@ def _row(a: models.Attempt, c: models.User, ranks: Dict[int, int]) -> Dict[str, 
     return {
         "id": a.id, "exam_id": a.exam_id, "attempt_no": a.attempt_no,
         "candidate": {"id": c.id, "name": c.full_name, "email": c.email, "phone": c.phone, "profile": a.profile or {}},
-        "status": a.status, "started_at": a.started_at, "submitted_at": a.submitted_at, "time_taken_seconds": _time_taken(a),
+        "status": a.status, "paper_set": a.paper_set, "started_at": a.started_at, "submitted_at": a.submitted_at, "time_taken_seconds": _time_taken(a),
         "score": a.score, "max_score": a.max_score, "percentage": a.percentage, "passed": a.passed,
         "final_result": final_result(a), "rank": ranks.get(a.id),
         "objective_score": a.objective_score, "coding_score": a.coding_score,
@@ -241,14 +241,14 @@ def export_csv(exam_id: int, request: Request, user: models.User = Depends(auth.
     field_labels = [f["label"] for f in (exam.candidate_fields or [])]
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["Rank", "Name", "Email", "Phone", *field_labels, "Status", "Result", "Score", "Max score", "Percentage", "Objective score",
+    w.writerow(["Rank", "Name", "Email", "Phone", *field_labels, "Question set", "Status", "Result", "Score", "Max score", "Percentage", "Objective score",
                 "Coding score", "Started (UTC)", "Submitted (UTC)", "Time taken (min)", "Violations", "Serious violations", "Risk score",
                 "Risk level", "Review status", "Review note", "Auto-submitted"])
     for a, c in rows:
         taken = _time_taken(a)
         w.writerow([_csv_safe(x) for x in [
             ranks.get(a.id, ""), c.full_name, c.email, c.phone or "", *[(a.profile or {}).get(k, "") for k in field_keys],
-            a.status, final_result(a) or "", a.score if a.score is not None else "", a.max_score if a.max_score is not None else "",
+            a.paper_set or "", a.status, final_result(a) or "", a.score if a.score is not None else "", a.max_score if a.max_score is not None else "",
             a.percentage if a.percentage is not None else "", a.objective_score if a.objective_score is not None else "",
             a.coding_score if a.coding_score is not None else "", a.started_at.isoformat() if a.started_at else "",
             a.submitted_at.isoformat() if a.submitted_at else "", round(taken / 60, 1) if taken is not None else "",

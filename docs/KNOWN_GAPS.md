@@ -11,7 +11,8 @@
 - Live human proctoring video streaming; recordings are periodic snapshots only.
 
 **Implemented but not verified in this build environment**
-- AI proctoring with real MediaPipe/YOLO models and real webcams. Only landmark math and debouncing are unit-tested; head-turn and gaze thresholds are untuned and need calibration on real footage.
+- OMR sheets and question sets (see `docs/OMR_AND_SETS.md`): covered by automated tests and checked visually in a browser and as rendered PDFs, but never printed on paper, never scanned by an OMR machine, and not tried with Indic-script names (the PDF font is Latin only).
+- AI proctoring (see `docs/AI_PROCTORING.md`). Phone / person detection was run against real YOLOv8 weights on sample photos (people, including overlapping and small ones) but **not on photos of phones or real exam-room footage**; the MediaPipe face path (face counting, gaze, head pose, blendshapes) is unit-tested with synthetic landmarks and fake models only, never against the real face model or a real webcam. All thresholds (phone 0.30, head-down 25°, ...) are starting points that need calibration on real footage. The Dockerfile model-download step was not built (no Docker daemon).
 - Real e-mail delivery (Brevo, Resend and SMTP are tested against fakes only; send yourself a test invitation after deploy)
 - The built-in code runner: verified here for Python, JavaScript, TypeScript, C, C++, Java, Go, Ruby, PHP, Perl and Bash. The other languages are wired but untested without their compilers.
 - Real SMTP delivery (messages are verified to reach the outbox/SMTP client in tests).

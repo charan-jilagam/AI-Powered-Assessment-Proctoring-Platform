@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Bell, ChevronLeft, ChevronRight, Flag, Maximize, Send, WifiOff } from 'lucide-react'
+import { Bell, Calculator as CalcIcon, ChevronLeft, ChevronRight, ClipboardList, Flag, Maximize, Send, WifiOff } from 'lucide-react'
 import { ApiError, cand, candToken, setCandidateExpiredHandler } from '../../lib/api'
 import { clock } from '../../lib/format'
 import { Alert, Button, Loading, Modal } from '../../ui'
@@ -9,7 +9,9 @@ import { CamTile, ProctorAlerts } from './ProctorHud'
 import { CodeEntry } from '../public/Landing'
 import CodingPanel from './CodingPanel'
 import Finished from './Finished'
+import Calculator from './Calculator'
 import Lobby from './Lobby'
+import OmrSheet from './OmrSheet'
 import { useMedia, watchVoice } from './useMedia'
 
 const FINAL = new Set(['submitted', 'terminated'])
@@ -76,7 +78,13 @@ function Exam({ state, media, onDone }) {
   const [fsLost, setFsLost] = useState(false)
   const [ready, setReady] = useState(false)              // user gesture gate (camera / fullscreen) after a refresh
   const [hint, setHint] = useState('')
+  const [boxes, setBoxes] = useState([])                 // what the AI currently sees (phones, extra people), as fractions of the frame
   const [gateErr, setGateErr] = useState('')
+  const omr = state.omr?.enabled && questions.length ? state.omr : null          // the organizer switched the OMR sheet on
+  const [omrOpen, setOmrOpen] = useState(() => !!omr && window.innerWidth >= 1100)
+  const [omrBusy, setOmrBusy] = useState(false)
+  const calcMode = state.test.calculator && state.test.calculator !== 'off' ? state.test.calculator : null     // organizer allows an on-screen calculator
+  const [calcOpen, setCalcOpen] = useState(false)
 
   const clockRef = useRef({ remaining: state.attempt.remaining_seconds, at: performance.now() })
   const [left, setLeft] = useState(state.attempt.remaining_seconds)
@@ -205,14 +213,17 @@ function Exam({ state, media, onDone }) {
     let busy = false
     const id = setInterval(async () => {
       if (busy || finishing.current) return
-      const img = media.capture(video.current, 320, 0.5); if (!img) return
+      // The WHOLE camera frame at 960 px wide. (It used to be 320 px: a phone shrank to a few pixels before the AI saw it.)
+      const img = media.capture(video.current, 960, 0.72); if (!img) return
       busy = true
       try {
         const r = await cand.post('/attempt/analyze', { image: img })
         if (r.terminated) { finishing.current = true; onDone(); return }
         const live = r.findings || []
         setHint(r.available && live.length ? live[0].label : '')
-        if (r.outcome?.recorded) pushAlert(r.outcome, cfg.auto_terminate && cfg.ai_can_terminate)
+        setBoxes(r.available ? (r.boxes || []) : [])
+        const recorded = r.outcomes?.length ? r.outcomes : r.outcome?.recorded ? [r.outcome] : []
+        recorded.forEach((o) => pushAlert(o, cfg.auto_terminate && cfg.ai_can_terminate))
       } catch { /* skip this frame */ } finally { busy = false }
     }, cfg.analysis_interval_seconds * 1000)
     return () => clearInterval(id)
@@ -229,6 +240,18 @@ function Exam({ state, media, onDone }) {
 
   const q = questions[idx]
   const setAnswer = (id, v) => setAnswers((a) => { const n = { ...a }; if (v === '' || v == null || (Array.isArray(v) && !v.length)) delete n[id]; else n[id] = v; return n })
+  // one place decides what clicking an option means; the question screen AND the OMR sheet both use it
+  const pickOption = (q, i) => setAnswers((a) => {
+    const n = { ...a }; const o = q.options[i]; const cur = n[q.id]
+    if (q.type === 'multiple') { const list = cur || []; const next = list.includes(o) ? list.filter((x) => x !== o) : [...list, o]; if (next.length) n[q.id] = next; else delete n[q.id] }
+    else if (cur === o) delete n[q.id]        // clicking a filled bubble again rubs it out
+    else n[q.id] = o
+    return n
+  })
+  async function downloadOmr() {
+    setOmrBusy(true)
+    try { await cand.download('/attempt/omr.pdf', 'OMR-sheet.pdf', { tz: Intl.DateTimeFormat().resolvedOptions().timeZone }) } catch (e) { setNotices((n) => [...n, { id: Date.now(), text: `Could not download the OMR sheet: ${e.message}`, tone: 'bad' }]) } finally { setOmrBusy(false) }
+  }
   const answeredCount = questions.filter((x) => answers[x.id] != null).length
   const sections = useMemo(() => { const g = []; questions.forEach((x, i) => { const s = x.section || ''; if (!g.length || g[g.length - 1].s !== s) g.push({ s, items: [] }); g[g.length - 1].items.push(i) }); return g }, [questions])
 
@@ -246,6 +269,8 @@ function Exam({ state, media, onDone }) {
     <div className="room">
       <header className="room-top">
         <div className="grow truncate"><b>{state.test.title}</b><span className="muted" style={{ marginLeft: 10, fontSize: 13 }}>{answeredCount}/{questions.length} answered</span></div>
+        {calcMode && <Button icon={CalcIcon} className={calcOpen ? 'primary' : ''} aria-pressed={calcOpen} onClick={() => setCalcOpen((o) => !o)}>Calculator</Button>}
+        {omr && view === 'questions' && <Button icon={ClipboardList} className={omrOpen ? 'primary' : ''} aria-pressed={omrOpen} onClick={() => setOmrOpen((o) => !o)}>OMR sheet</Button>}
         <ThemeToggle />
         <span className={`save ${save}`} role="status">{save === 'saved' ? 'All answers saved' : save === 'saving' ? 'Saving…' : <><WifiOff size={14} /> Offline — saved on this device</>}</span>
         <div className={`timer ${urgent ? 'urgent' : low ? 'low' : ''}`} role="timer" aria-label={`Time left ${clock(left)}`}>{clock(left)}</div>
@@ -259,7 +284,7 @@ function Exam({ state, media, onDone }) {
 
       {questions.length > 0 && problems.length > 0 && <div className="tabs room-tabs"><button className={view === 'questions' ? 'active' : ''} onClick={() => setView('questions')}>Questions ({answeredCount}/{questions.length})</button><button className={view === 'coding' ? 'active' : ''} onClick={() => setView('coding')}>Coding ({problems.length})</button></div>}
 
-      <div className="room-body">
+      <div className={`room-body${omr && omrOpen && view === 'questions' ? ' has-omr' : ''}`}>
         <main className="room-main">
           {view === 'questions' && q && (
             <article className="question" key={q.id}>
@@ -269,7 +294,7 @@ function Exam({ state, media, onDone }) {
                 : <div className="options" role={q.type === 'multiple' ? 'group' : 'radiogroup'} aria-label="Answer options">
                   {q.options.map((o, i) => {
                     const multi = q.type === 'multiple'; const cur = answers[q.id]; const on = multi ? (cur || []).includes(o) : cur === o
-                    return <label key={i} className={`option ${on ? 'on' : ''}`}><input type={multi ? 'checkbox' : 'radio'} name={`q${q.id}`} checked={on} onChange={() => multi ? setAnswer(q.id, on ? cur.filter((x) => x !== o) : [...(cur || []), o]) : setAnswer(q.id, o)} /><span className="key">{String.fromCharCode(65 + i)}</span><span>{o}</span></label>
+                    return <label key={i} className={`option ${on ? 'on' : ''}`}><input type={multi ? 'checkbox' : 'radio'} name={`q${q.id}`} checked={on} onChange={() => pickOption(q, i)} /><span className="key">{String.fromCharCode(65 + i)}</span><span>{o}</span></label>
                   })}</div>}
               {q.type === 'multiple' && <p className="hint">Select all that apply.</p>}
               <div className="row between mt-lg" style={{ marginTop: 28 }}>
@@ -283,13 +308,16 @@ function Exam({ state, media, onDone }) {
           {view === 'coding' && <CodingPanel problems={problems} attemptId={attemptId} />}
         </main>
 
-        <aside className="room-side">
-          {needCam && <CamTile video={video} camOn={media.cam} issue={hint} monitoring={!!cfg.ai_monitoring} />}
-          {view === 'questions' && <nav aria-label="Question navigator">{sections.map((g, gi) => (
+        <aside className={`room-side${omr && omrOpen && view === 'questions' ? ' has-omr' : ''}`}>
+          {needCam && <CamTile video={video} camOn={media.cam} issue={hint} monitoring={!!cfg.ai_monitoring} boxes={boxes} />}
+          {omr && omrOpen && view === 'questions' && <OmrSheet omr={omr} questions={questions} answers={answers} current={idx} flagged={flagged} onPick={pickOption} onJump={(i) => setIdx(i)} onClose={() => setOmrOpen(false)} onDownload={downloadOmr} downloading={omrBusy} />}
+          {view === 'questions' && !(omr && omrOpen) && <nav aria-label="Question navigator">{sections.map((g, gi) => (
             <div key={gi}>{g.s && <div className="nav-sec">{g.s}</div>}<div className="qgrid">{g.items.map((i) => { const id = questions[i].id; return <button key={id} className={`qn ${i === idx ? 'cur' : ''} ${answers[id] != null ? 'ans' : ''} ${flagged.includes(id) ? 'flag' : ''}`} aria-label={`Question ${i + 1}${answers[id] != null ? ', answered' : ''}${flagged.includes(id) ? ', flagged' : ''}`} onClick={() => { setIdx(i); setView('questions') }}>{i + 1}</button> })}</div></div>))}
             <div className="legend mt"><span><i style={{ background: 'var(--accent)' }} />Answered</span><span><i style={{ background: 'var(--warn)' }} />Flagged</span><span><i style={{ background: 'var(--neutral-soft)' }} />Not answered</span></div></nav>}
         </aside>
       </div>
+
+      {calcMode && calcOpen && <Calculator mode={calcMode} onClose={() => setCalcOpen(false)} />}
 
       {fsLost && cfg.fullscreen_required && (
         <div className="overlay" style={{ zIndex: 150 }}><div className="modal" role="alertdialog" aria-label="Return to fullscreen"><div className="body" style={{ textAlign: 'center', padding: 28 }}>

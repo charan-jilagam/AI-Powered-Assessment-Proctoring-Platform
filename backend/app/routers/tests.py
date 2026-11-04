@@ -68,7 +68,8 @@ def create_test(
         start_time=body.start_time, end_time=body.end_time, access_mode=body.access_mode,
         access_password_hash=auth.hash_password(body.access_password) if body.access_password else None,
         questions_per_attempt=body.questions_per_attempt, shuffle_questions=body.shuffle_questions,
-        shuffle_options=body.shuffle_options, pass_percentage=body.pass_percentage, result_visibility=body.result_visibility,
+        shuffle_options=body.shuffle_options, question_sets=body.question_sets, omr_enabled=body.omr_enabled, calculator=body.calculator,
+        omr_institute=(body.omr_institute or '').strip() or None, omr_note=(body.omr_note or '').strip() or None, pass_percentage=body.pass_percentage, result_visibility=body.result_visibility,
         proctoring=cfg, candidate_fields=[f.model_dump() for f in body.candidate_fields],
     )
     db.add(exam)
@@ -117,6 +118,12 @@ def update_test(
     data = body.model_dump(exclude_unset=True)
     if "duration_minutes" in data and data["duration_minutes"] != exam.duration_minutes and exam_service.has_live_attempts(db, exam.id):
         raise conflict("Candidates are taking this test right now - the duration cannot change until they finish", "live_attempts")
+
+    if "question_sets" in data and data["question_sets"] != (exam.question_sets or 1) and exam_service.has_live_attempts(db, exam.id):
+        raise conflict("Candidates are taking this test right now - the number of question sets cannot change until they finish", "live_attempts")
+    for text_key in ("omr_institute", "omr_note"):
+        if text_key in data:
+            data[text_key] = (data[text_key] or "").strip() or None
 
     warnings: List[str] = []
     if data.pop("clear_schedule", False):

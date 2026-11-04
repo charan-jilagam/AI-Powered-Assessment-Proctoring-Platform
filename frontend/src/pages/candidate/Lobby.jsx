@@ -43,6 +43,9 @@ export default function Lobby({ state, media, onStarted }) {
         <Brand org={t.organization} />
         <h1>{t.title}</h1>
         <p className="muted-2">Hello {state.candidate.name}. You have <b>{t.duration_minutes} minutes</b> once you press Start. The timer cannot be paused.</p>
+        {(t.calculator && t.calculator !== 'off') && <Alert tone="info" className="mb">A {t.calculator} calculator is available on screen during this test (Calculator button at the top). Please do not use any other device.</Alert>}
+        {cfg.competitive_exam && <Alert tone="info" className="mb">This test allows rough work on paper: looking down at your desk is fine. Phones, other people, notes you are not allowed and leaving the camera view are still flagged.</Alert>}
+        {(t.omr_enabled || t.question_sets > 1) && <Alert tone="info" className="mb">{t.question_sets > 1 ? `This test uses ${t.question_sets} question sets: you will be given one of them when you start. ` : ''}{t.omr_enabled ? 'You will get an OMR answer sheet next to the questions. Marking an option or a bubble fills both.' : ''}</Alert>}
         {t.instructions && <div className="instructions"><h3>Instructions from the organizer</h3><p style={{ whiteSpace: 'pre-wrap' }}>{t.instructions}</p></div>}
 
         <h3 className="mt-lg" style={{ marginTop: 22 }}>Before you start</h3>
@@ -60,7 +63,7 @@ export default function Lobby({ state, media, onStarted }) {
             <div>
               {!media.cam || (cfg.microphone_required && !media.mic)
                 ? <><p className="mb">Allow camera{cfg.microphone_required ? ' and microphone' : ''} access so we can check your setup.</p><Button icon={Camera} variant="primary" onClick={() => media.request({ video: true, audio: cfg.microphone_required })}>Turn on camera</Button></>
-                : <Alert tone="ok">Camera{cfg.microphone_required ? ' and microphone are' : ' is'} working. Make sure your face is clearly visible and well lit.</Alert>}
+                : <Alert tone="ok">Camera{cfg.microphone_required ? ' and microphone are' : ' is'} working. Make sure your face is clearly visible and well lit. The whole camera view is monitored during the test, so keep phones, notes and other people out of the picture.</Alert>}
               {media.error && <Alert tone="bad" className="mt">{media.error}</Alert>}
               {cfg.id_verification && media.cam && (
                 <div className="mt"><h3 className="mb">Verify your identity</h3>
